@@ -1,0 +1,71 @@
+{
+  "recent": [
+    {
+      "kind": "external-app",
+      "path": "C:\\Users\\Art PC\\Desktop\\Codex-Local\\Virtual_Desktop\\untitled.blend",
+      "title": "untitled.blend",
+      "ts": 1759152719
+    },
+    {
+      "kind": "py_card",
+      "path": "C:\\Users\\Art PC\\Desktop\\Codex-Local\\Codex_Terminal.py",
+      "title": "Agent Virtual Desktop \u2014 Codex-Terminal",
+      "ts": 1759152681
+    },
+    {
+      "kind": "builtin",
+      "path": "(builtin:error-center)",
+      "title": "Error Center",
+      "ts": 1759081347
+    }
+  ],
+  "geom": {
+    "py_card:C:\\Users\\Art PC\\Desktop\\Codex-Local\\Codex_Terminal.py": {
+      "x": 1905,
+      "y": 345,
+      "w": 1036,
+      "h": 690,
+      "scale": 1.0
+    },
+    "external-app:C:\\Users\\Art PC\\Desktop\\Codex-Local\\Virtual_Desktop\\untitled.blend": {
+      "x": 272,
+      "y": 119,
+      "w": 2325,
+      "h": 975,
+      "scale": 1.0
+    },
+    "builtin:(builtin:error-center)": {
+      "x": 483,
+      "y": 281,
+      "w": 520,
+      "h": 394,
+      "scale": 1.0
+    }
+  },
+  "icon_pos": {
+    "C:\\Users\\Art PC\\Desktop\\Codex-Local\\Virtual_Desktop\\untitled.blend": [
+      126,
+      424
+    ]
+  },
+  "background": {
+    "mode": "solid",
+    "source": "",
+    "fit": "fill",
+    "loop": true,
+    "mute": true,
+    "playback_rate": 1.0
+  },
+  "icon_size": "medium",
+  "desktop_sort": "name",
+  "ui_scale": 1.0,
+  "taskbar_autohide": false,
+  "taskbar_side": "bottom",
+  "taskbar_pins": [],
+  "allow_external_browse": false,
+  "card_scale": 1.0,
+  "start_panel_close": {
+    "mode": "click",
+    "auto_delay_ms": 2000
+  }
+}

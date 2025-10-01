@@ -1,0 +1,20 @@
+2025-09-29 08:31:09,754 [INFO] Canvas synced to screen: 100x30
+2025-09-29 08:31:09,967 [INFO] Application exec()
+2025-09-29 08:31:09,972 [INFO] Canvas synced to screen: 3440x1400
+2025-09-29 08:31:09,974 [INFO] Window fit to monitor: 3440x1400 @ Sceptre O34
+2025-09-29 08:31:16,444 [INFO] Window fit to monitor: 3440x1400 @ Sceptre O34
+2025-09-29 08:31:21,826 [INFO] Load python as card: C:\Users\Art PC\Desktop\Codex-Local\Codex_Terminal.py
+2025-09-29 08:31:21,963 [INFO] Card added: Agent Virtual Desktop — Codex-Terminal (id=1)
+2025-09-29 08:31:21,964 [INFO] Card loaded: Agent Virtual Desktop — Codex-Terminal
+2025-09-29 08:31:56,588 [INFO] Window fit to monitor: 3440x1400 @ Sceptre O34
+2025-09-29 08:31:59,360 [INFO] Run process as card: ['C:\\Program Files\\Blender Foundation\\Blender 4.3\\blender-launcher.exe', 'C:\\Users\\Art PC\\Desktop\\Codex-Local\\Virtual_Desktop\\untitled.blend']
+2025-09-29 08:31:59,362 [INFO] [external-app] Launching: C:\Program Files\Blender Foundation\Blender 4.3\blender-launcher.exe C:\Users\Art PC\Desktop\Codex-Local\Virtual_Desktop\untitled.blend
+2025-09-29 08:31:59,377 [INFO] Card closed: Agent Virtual Desktop — Codex-Terminal
+2025-09-29 08:31:59,377 [INFO] Card closed: Agent Virtual Desktop — Codex-Terminal
+2025-09-29 08:31:59,389 [INFO] Card added: App — untitled.blend (id=2)
+2025-09-29 08:31:59,444 [INFO] [external-app] Process exited before embedding; continuing to poll for adoptable window.
+2025-09-29 08:32:00,385 [INFO] [external-app] Adopted HWND=0xa0c72 from PID 28224 via executable scan
+2025-09-29 08:32:20,748 [WARNING] [external-app] Forced termination for orphaned external app PID 28224. Terminated: 33448, 28104, 200, 28224
+2025-09-29 08:32:20,771 [INFO] Card added: Notice (id=3)
+2025-09-29 08:32:20,772 [INFO] Toast[warning]: Force closed external app after launcher exit.
+2025-10-01 15:34:14,109 [INFO] Codex Terminal starting up (pid=52660)
