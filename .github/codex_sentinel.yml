@@ -1,0 +1,13 @@
+version: 1
+notifications:
+  success: comment
+  failure: comment
+checks:
+  - name: logic-inbox-sanity
+    description: Ensure the logic inbox file is valid JSONL.
+    run: "python tools/logic_inbox.py validate memory/logic_inbox.jsonl"
+  - name: memory-schema
+    description: Confirm codex memory file matches expected schema.
+    run: "python tools/logic_inbox.py validate-memory memory/codex_memory.json"
+artifacts:
+  report_path: .codex/pr_sentinel_report.txt
