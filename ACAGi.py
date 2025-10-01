@@ -32,6 +32,7 @@ import argparse
 import base64
 import copy
 import ctypes
+import difflib
 import hashlib
 import importlib
 import importlib.util
@@ -52,13 +53,29 @@ import traceback
 import uuid
 import warnings
 import zipfile
-from collections import deque
+from collections import defaultdict, deque
 from functools import lru_cache
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import RLock
 from types import ModuleType
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
+
 import token_budget
 
 # Optional dependencies are resolved via runtime checks instead of guarded imports
@@ -89,46 +106,65 @@ from PySide6.QtCore import (
     QFileSystemWatcher,
 )
 from PySide6.QtGui import (
-    QAction, QCloseEvent, QColor, QCursor, QDesktopServices, QKeyEvent, QKeySequence,
-    QPainter, QPalette, QLinearGradient, QPainterPath, QImage, QPixmap, QIcon,
-    QTextCharFormat, QTextCursor,
+    QAction,
+    QCloseEvent,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QKeyEvent,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QBrush,
+    QIcon,
+    QImage,
+    QPixmap,
+    QTextCharFormat,
+    QTextCursor,
+    QMovie,
 )
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QFileDialog, QComboBox,
-    QSlider, QFormLayout, QGroupBox, QTabWidget, QScrollArea,
-    QToolButton, QCheckBox, QSpinBox, QSpacerItem, QSizePolicy, QInputDialog,
-    QMenu, QStyle, QListWidget, QListWidgetItem, QAbstractItemView,
+    QApplication,
+    QDialog,
+    QDockWidget,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QTextBrowser,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+    QFileDialog,
+    QComboBox,
+    QSlider,
+    QFormLayout,
+    QGroupBox,
+    QTabWidget,
+    QScrollArea,
+    QToolButton,
+    QCheckBox,
+    QSpinBox,
+    QSpacerItem,
+    QSizePolicy,
+    QInputDialog,
+    QMenu,
+    QStyle,
+    QListWidget,
+    QListWidgetItem,
+    QAbstractItemView,
 )
-
-from tasks import record_diff
-from tasks.bus import publish, subscribe, Subscription
-from tasks.drawer import TaskDrawer
-from tasks.models import (
-    Task,
-    TaskEvent,
-    append_event,
-    append_run_log,
-    append_run_output,
-    append_task,
-    update_task,
-)
-from error_console import ErrorConsole, StderrRedirector, log_exception
+from memory_manager import RepositoryIndex
 from safety import SafetyViolation, manager as safety_manager
 from image_pipeline import analyze_image, perform_ocr
 from prompt_loader import get_prompt_watcher, iter_prompt_definitions, prompt_text
-from background import (
-    BackgroundConfig,
-    BackgroundFit,
-    BackgroundManager,
-    BackgroundMode,
-    GifBg,
-    GLViewportBg,
-    StaticImageBg,
-    VideoBg,
-)
-from repo_reference_helper import RepoReference, RepoReferenceHelper
 
 VD_LOGGER_NAME = "VirtualDesktop"
 VD_LOG_FILENAME = "vd_system.log"
@@ -196,6 +232,2388 @@ def ensure_requests(feature: str) -> ModuleType:
     """Return the ``requests`` module or raise for the given feature context."""
 
     return ensure_dependency(_REQUESTS_MODULE_NAME, feature)
+
+
+# ============================================================================
+# Task Persistence and Eventing (Inlined from Dev_Logic/tasks)
+# ============================================================================
+"""Task data models, event bus, diff capture, and UI integration."""
+
+
+TASKS_DATA_ROOT = Path(__file__).resolve().parent / "Dev_Logic" / "datasets"
+TASKS_FILE = TASKS_DATA_ROOT / "tasks.jsonl"
+EVENTS_FILE = TASKS_DATA_ROOT / "task_events.jsonl"
+DIFFS_FILE = TASKS_DATA_ROOT / "diffs.jsonl"
+ERRORS_FILE = TASKS_DATA_ROOT / "errors.jsonl"
+_RUNS_SUBDIR = "runs"
+_RUN_LOG_FILENAME = "run.log"
+
+
+@dataclass(slots=True)
+class TaskDiffSummary:
+    """Summary of cumulative diff counts attached to a task."""
+
+    added: int = 0
+    removed: int = 0
+
+    def to_dict(self) -> Dict[str, int]:
+        return {"added": int(self.added), "removed": int(self.removed)}
+
+
+@dataclass(slots=True)
+class Task:
+    """Representation of a tracked task entry."""
+
+    id: str
+    title: str
+    status: str
+    created_ts: float
+    updated_ts: float
+    session_id: str
+    source: str
+    labels: List[str] = field(default_factory=list)
+    diffs: TaskDiffSummary = field(default_factory=TaskDiffSummary)
+    files: List[str] = field(default_factory=list)
+    run_log_path: Optional[str] = None
+    codex_conversation_id: Optional[str] = None
+    parent_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "status": self.status,
+            "created_ts": self.created_ts,
+            "updated_ts": self.updated_ts,
+            "session_id": self.session_id,
+            "source": self.source,
+            "labels": list(self.labels),
+            "diffs": self.diffs.to_dict(),
+            "files": list(self.files),
+            "run_log_path": self.run_log_path,
+            "codex_conversation_id": self.codex_conversation_id,
+            "parent_id": self.parent_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "Task":
+        diffs_payload = payload.get("diffs") or {}
+        summary = TaskDiffSummary(
+            added=int(diffs_payload.get("added", 0)),
+            removed=int(diffs_payload.get("removed", 0)),
+        )
+        return cls(
+            id=str(payload["id"]),
+            title=str(payload["title"]),
+            status=str(payload["status"]),
+            created_ts=float(payload["created_ts"]),
+            updated_ts=float(payload["updated_ts"]),
+            session_id=str(payload["session_id"]),
+            source=str(payload["source"]),
+            labels=list(payload.get("labels", [])),
+            diffs=summary,
+            files=list(payload.get("files", [])),
+            run_log_path=payload.get("run_log_path"),
+            codex_conversation_id=payload.get("codex_conversation_id"),
+            parent_id=payload.get("parent_id"),
+        )
+
+
+@dataclass(slots=True)
+class TaskEvent:
+    """Immutable event describing a change to a task."""
+
+    ts: float
+    task_id: str
+    event: str
+    by: Optional[str] = None
+    to: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "ts": self.ts,
+            "task_id": self.task_id,
+            "event": self.event,
+        }
+        if self.by is not None:
+            payload["by"] = self.by
+        if self.to is not None:
+            payload["to"] = self.to
+        if self.data is not None:
+            payload["data"] = self.data
+        return payload
+
+
+@dataclass(slots=True)
+class DiffSnapshot:
+    """Snapshot of diff statistics emitted during a task run."""
+
+    ts: float
+    task_id: str
+    added: int
+    removed: int
+    files: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ts": self.ts,
+            "task_id": self.task_id,
+            "added": int(self.added),
+            "removed": int(self.removed),
+            "files": list(self.files),
+        }
+
+
+@dataclass(slots=True)
+class ErrorRecord:
+    """Structured record describing a captured error event."""
+
+    ts: float
+    level: str
+    kind: str
+    msg: str
+    path: Optional[str] = None
+    task_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "ts": float(self.ts),
+            "level": str(self.level),
+            "kind": str(self.kind),
+            "msg": str(self.msg),
+        }
+        if self.path is not None:
+            payload["path"] = self.path
+        if self.task_id is not None:
+            payload["task_id"] = self.task_id
+        return payload
+
+
+def _ensure_datasets_dir() -> None:
+    TASKS_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    _ensure_datasets_dir()
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    items: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return items
+
+
+def _write_jsonl_atomic(path: Path, records: Iterable[Dict[str, Any]]) -> None:
+    _ensure_datasets_dir()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(tmp_path, path)
+
+
+def _dataset_root(candidate: Optional[Path]) -> Path:
+    return Path(candidate) if candidate else TASKS_DATA_ROOT
+
+
+def append_error_record(record: ErrorRecord) -> None:
+    """Persist ``record`` to the shared ``errors.jsonl`` dataset."""
+
+    _append_jsonl(ERRORS_FILE, record.to_dict())
+
+
+def resolve_run_log_path(task: Task, dataset_root: Optional[Path] = None) -> Tuple[Path, str]:
+    """Return absolute and relative run-log paths for ``task``."""
+
+    root = _dataset_root(dataset_root)
+    if task.run_log_path:
+        raw = Path(task.run_log_path)
+    else:
+        raw = Path(_RUNS_SUBDIR) / task.id / _RUN_LOG_FILENAME
+    absolute = raw if raw.is_absolute() else root / raw
+    relative = raw.as_posix()
+    return absolute, relative
+
+
+def append_run_log(
+    task: Task,
+    lines: Iterable[str] | str,
+    dataset_root: Optional[Path] = None,
+    *,
+    channel: Optional[str] = None,
+) -> Tuple[Path, str, bool]:
+    """Append ``lines`` to the task run log, creating directories as needed."""
+
+    absolute, relative = resolve_run_log_path(task, dataset_root)
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+
+    created = task.run_log_path is None
+
+    if isinstance(lines, str):
+        entries = [lines]
+    else:
+        entries = [str(line) for line in lines]
+
+    if entries:
+        prefix = f"[{channel}]" if channel else ""
+        with absolute.open("a", encoding="utf-8") as fh:
+            for entry in entries:
+                text = entry.rstrip("\n")
+                if prefix:
+                    text = f"{prefix} {text}" if text else prefix
+                fh.write((text + "\n") if text else "\n")
+    else:
+        absolute.touch(exist_ok=True)
+
+    if task.run_log_path is None:
+        task.run_log_path = relative
+
+    return absolute, relative, created
+
+
+def append_run_output(
+    task: Task,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    dataset_root: Optional[Path] = None,
+) -> Tuple[Path, str, bool]:
+    """Append captured stdout/stderr streams to the task run log."""
+
+    created = False
+    path: Optional[Path] = None
+    relative: Optional[str] = None
+
+    if stdout:
+        path, relative, created_stdout = append_run_log(
+            task,
+            stdout.splitlines(),
+            dataset_root,
+            channel="stdout",
+        )
+        created = created or created_stdout
+
+    if stderr:
+        path, relative, created_stderr = append_run_log(
+            task,
+            stderr.splitlines(),
+            dataset_root,
+            channel="stderr",
+        )
+        created = created or created_stderr
+
+    if path is None or relative is None:
+        path, relative = resolve_run_log_path(task, dataset_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+        if task.run_log_path is None:
+            task.run_log_path = relative
+            created = True
+
+    return path, relative, created
+
+
+def load_run_log_tail(
+    task: Task,
+    dataset_root: Optional[Path] = None,
+    *,
+    max_lines: int = 200,
+) -> List[str]:
+    """Return the last ``max_lines`` entries from the task run log."""
+
+    if max_lines <= 0:
+        return []
+    if not task.run_log_path:
+        return []
+
+    absolute, _ = resolve_run_log_path(task, dataset_root)
+    if not absolute.exists():
+        return []
+
+    tail: Deque[str] = deque(maxlen=int(max_lines))
+    with absolute.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            tail.append(line.rstrip("\n"))
+    return list(tail)
+
+
+def append_task(task: Task) -> None:
+    """Append a task entry to ``tasks.jsonl``."""
+
+    _append_jsonl(TASKS_FILE, task.to_dict())
+
+
+def update_task(task_id: str, **changes: Any) -> Task:
+    """Apply updates to a task entry and rewrite the dataset atomically."""
+
+    records = _read_jsonl(TASKS_FILE)
+    updated_record: Optional[Dict[str, Any]] = None
+    for record in records:
+        if record.get("id") == task_id:
+            record.update(changes)
+            updated_record = record
+            break
+    if updated_record is None:
+        raise ValueError(f"Task '{task_id}' does not exist")
+    _write_jsonl_atomic(TASKS_FILE, records)
+    return Task.from_dict(updated_record)
+
+
+def append_event(event: TaskEvent) -> None:
+    """Append a task event to ``task_events.jsonl``."""
+
+    _append_jsonl(EVENTS_FILE, event.to_dict())
+
+
+# -- Task event bus ---------------------------------------------------------
+
+Subscriber = Callable[[dict], None]
+
+TASK_TOPICS = {
+    "task.created",
+    "task.updated",
+    "task.status",
+    "task.diff",
+    "task.deleted",
+    "task.conversation",
+    "system.metrics",
+}
+_WILDCARD_TOPIC = "task.*"
+_BUS_LOGGER = logging.getLogger("tasks.bus")
+_SUBSCRIBERS: MutableMapping[str, List[Subscriber]] = defaultdict(list)
+_BUS_LOCK = RLock()
+
+
+class Subscription:
+    """Handle returned from :func:`subscribe` that can detach a listener."""
+
+    __slots__ = ("_topic", "_callback", "_active")
+
+    def __init__(self, topic: str, callback: Subscriber) -> None:
+        self._topic = topic
+        self._callback = callback
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def unsubscribe(self) -> None:
+        if not self._active:
+            return
+        with _BUS_LOCK:
+            listeners = _SUBSCRIBERS.get(self._topic)
+            if listeners is None:
+                self._active = False
+                return
+            try:
+                listeners.remove(self._callback)
+            except ValueError:
+                pass
+            else:
+                if not listeners:
+                    _SUBSCRIBERS.pop(self._topic, None)
+            self._active = False
+
+    def __call__(self) -> None:  # pragma: no cover - sugar
+        self.unsubscribe()
+
+
+def _validate_topic(topic: str, allow_wildcard: bool = False) -> None:
+    if topic in TASK_TOPICS:
+        return
+    if allow_wildcard and topic == _WILDCARD_TOPIC:
+        return
+    raise ValueError(f"Unsupported topic: {topic!r}")
+
+
+def subscribe(topic: str, callback: Subscriber) -> Subscription:
+    """Register ``callback`` for ``topic`` and return an unsubscribe handle."""
+
+    if not callable(callback):
+        raise TypeError("callback must be callable")
+    _validate_topic(topic, allow_wildcard=True)
+
+    with _BUS_LOCK:
+        _SUBSCRIBERS[topic].append(callback)
+    return Subscription(topic, callback)
+
+
+def publish(topic: str, payload: dict) -> None:
+    """Broadcast ``payload`` to subscribers registered for ``topic``."""
+
+    if not isinstance(payload, dict):
+        raise TypeError("payload must be a dictionary")
+    _validate_topic(topic)
+
+    with _BUS_LOCK:
+        listeners = list(_SUBSCRIBERS.get(topic, ()))
+        wildcard_listeners = list(_SUBSCRIBERS.get(_WILDCARD_TOPIC, ()))
+
+    for callback in (*listeners, *wildcard_listeners):
+        try:
+            callback(payload)
+        except Exception:  # pragma: no cover - defensive logging
+            _BUS_LOGGER.exception("Error dispatching %s to %r", topic, callback)
+
+
+# -- Diff capture -----------------------------------------------------------
+
+_SNAPSHOT_ROOT = TASKS_DATA_ROOT / _RUNS_SUBDIR
+
+
+@dataclass(slots=True)
+class _Target:
+    """Normalized representation of a candidate file path."""
+
+    abs_path: Path
+    rel_workspace: str
+    rel_repo: Optional[str] = None
+
+
+def record_diff(
+    task_id: str,
+    files: Optional[Iterable[str]] = None,
+    workspace_root: str | Path | None = None,
+    timestamp: float | None = None,
+) -> Optional[DiffSnapshot]:
+    """Capture diff statistics for ``task_id`` and persist the results."""
+
+    if not task_id:
+        raise ValueError("task_id is required")
+
+    workspace = Path(workspace_root or Path.cwd()).resolve()
+    ts = float(timestamp) if timestamp is not None else time.time()
+
+    targets = _normalize_targets(files, workspace)
+
+    repo_root = _detect_git_repo(workspace)
+    if repo_root:
+        for target in targets.values():
+            try:
+                rel_repo = target.abs_path.resolve().relative_to(repo_root)
+            except ValueError:
+                continue
+            target.rel_repo = rel_repo.as_posix()
+
+    git_added = git_removed = 0
+    git_files: List[str] = []
+    git_handled: Set[Path] = set()
+    if repo_root:
+        git_added, git_removed, git_files, git_handled = _git_numstat(
+            repo_root, workspace, targets
+        )
+
+    snapshot_added = snapshot_removed = 0
+    snapshot_files: List[str] = []
+    if targets:
+        snapshot_added, snapshot_removed, snapshot_files = _snapshot_diff(
+            task_id, targets, git_handled
+        )
+
+    total_added = git_added + snapshot_added
+    total_removed = git_removed + snapshot_removed
+    all_files = _unique(git_files + snapshot_files)
+
+    if (
+        not all_files
+        and not targets
+        and total_added == 0
+        and total_removed == 0
+    ):
+        return None
+
+    updated = update_task(
+        task_id,
+        diffs=TaskDiffSummary(added=total_added, removed=total_removed).to_dict(),
+        updated_ts=ts,
+    )
+
+    snapshot = DiffSnapshot(
+        ts=ts,
+        task_id=task_id,
+        added=total_added,
+        removed=total_removed,
+        files=all_files,
+    )
+    _append_diff_snapshot(snapshot)
+
+    publish(
+        "task.diff",
+        {
+            "id": updated.id,
+            "added": total_added,
+            "removed": total_removed,
+            "files": list(all_files),
+        },
+    )
+    return snapshot
+
+
+def _normalize_targets(files: Optional[Iterable[str]], workspace: Path) -> Dict[Path, _Target]:
+    if not files:
+        return {}
+
+    targets: Dict[Path, _Target] = {}
+    for entry in files:
+        if not entry:
+            continue
+        candidate = Path(entry)
+        abs_path = candidate if candidate.is_absolute() else (workspace / candidate)
+        abs_path = abs_path.resolve()
+        rel_workspace = _relative_to_workspace(abs_path, workspace)
+        targets[abs_path] = _Target(abs_path=abs_path, rel_workspace=rel_workspace)
+    return targets
+
+
+def _relative_to_workspace(path: Path, workspace: Path) -> str:
+    try:
+        rel = path.relative_to(workspace)
+        return rel.as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _detect_git_repo(start: Path) -> Optional[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    top = result.stdout.strip()
+    if not top:
+        return None
+    return Path(top).resolve()
+
+
+def _git_numstat(
+    repo_root: Path,
+    workspace: Path,
+    targets: Dict[Path, _Target],
+) -> Tuple[int, int, List[str], Set[Path]]:
+    paths = sorted({target.rel_repo for target in targets.values() if target.rel_repo})
+
+    cmd: List[str] = [
+        "git",
+        "-C",
+        str(repo_root),
+        "--no-optional-locks",
+        "diff",
+        "--numstat",
+    ]
+    if paths:
+        cmd.append("--")
+        cmd.extend(paths)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return 0, 0, [], set()
+    if result.returncode != 0:
+        return 0, 0, [], set()
+
+    added_total = removed_total = 0
+    files: List[str] = []
+    handled: Set[Path] = set()
+
+    for line in result.stdout.splitlines():
+        parsed = _parse_numstat_line(line)
+        if not parsed:
+            continue
+        added, removed, rel_path = parsed
+        abs_path = (repo_root / rel_path).resolve()
+        files.append(_relative_to_workspace(abs_path, workspace))
+        added_total += added
+        removed_total += removed
+        if abs_path in targets:
+            handled.add(abs_path)
+    return added_total, removed_total, _unique(files), handled
+
+
+def _parse_numstat_line(line: str) -> Optional[Tuple[int, int, str]]:
+    parts = line.strip().split("\t", 2)
+    if len(parts) != 3:
+        return None
+    added_str, removed_str, path_field = parts
+    added = _parse_int(added_str)
+    removed = _parse_int(removed_str)
+    normalized = _normalize_numstat_path(path_field)
+    if not normalized:
+        return None
+    return added, removed, normalized
+
+
+def _parse_int(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def _normalize_numstat_path(field: str) -> str:
+    field = field.strip()
+    if not field:
+        return ""
+    if " => " in field:
+        return _normalize_rename(field, " => ")
+    if "->" in field:
+        return _normalize_rename(field, "->")
+    return field
+
+
+def _normalize_rename(field: str, token: str) -> str:
+    cleaned = field.replace("{", "").replace("}", "")
+    parts = cleaned.split(token, 1)
+    if len(parts) != 2:
+        return cleaned.strip()
+    left, right = parts[0].strip(), parts[1].strip()
+    if "/" in left:
+        prefix = left.rsplit("/", 1)[0]
+        if prefix:
+            if right.startswith(prefix):
+                return right
+            return f"{prefix}/{right}"
+    return right
+
+
+def _snapshot_diff(
+    task_id: str,
+    targets: Dict[Path, _Target],
+    skip: Set[Path],
+) -> Tuple[int, int, List[str]]:
+    added_total = removed_total = 0
+    files: List[str] = []
+    for abs_path, target in targets.items():
+        if abs_path in skip:
+            continue
+        added, removed = _compute_snapshot_counts(task_id, abs_path, target.rel_workspace)
+        if added or removed:
+            files.append(target.rel_workspace)
+        added_total += added
+        removed_total += removed
+    return added_total, removed_total, _unique(files)
+
+
+def _compute_snapshot_counts(task_id: str, abs_path: Path, rel_path: str) -> Tuple[int, int]:
+    snapshot_file = _snapshot_file(task_id, rel_path)
+
+    previous_lines: List[str] = []
+    if snapshot_file.exists():
+        previous_lines = snapshot_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+    current_lines: List[str] = []
+    file_exists = abs_path.exists()
+    if file_exists:
+        current_lines = abs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+    added = removed = 0
+    for line in difflib.ndiff(previous_lines, current_lines):
+        if line.startswith("+ "):
+            added += 1
+        elif line.startswith("- "):
+            removed += 1
+
+    if file_exists:
+        snapshot_file.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_file.write_text(
+            "\n".join(current_lines),
+            encoding="utf-8",
+        )
+    elif snapshot_file.exists():
+        snapshot_file.unlink()
+
+    return added, removed
+
+
+def _snapshot_file(task_id: str, rel_path: str) -> Path:
+    safe_parts = [part for part in Path(rel_path).parts if part not in ("", ".", "..")] 
+    snapshot_root = _SNAPSHOT_ROOT / task_id / "snapshot"
+    return (snapshot_root / Path(*safe_parts)).resolve()
+
+
+def _append_diff_snapshot(snapshot: DiffSnapshot) -> None:
+    DIFFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with DIFFS_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(snapshot.to_dict(), ensure_ascii=False) + "\n")
+
+
+def _unique(values: Sequence[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+# -- Task panel and drawer --------------------------------------------------
+
+
+STATUS_ORDER = [
+    "all",
+    "open",
+    "merged",
+    "closed",
+    "cancelled",
+    "failed",
+    "deleted",
+]
+
+
+@dataclass(slots=True)
+class _TaskRowData:
+    task: Task
+    matches_filter: bool = True
+
+
+class _StatusPill(QLabel):
+    """High-contrast badge representing a task status."""
+
+    _PILL_STYLES = {
+        "open": ("#1b8a5a", "#ffffff"),
+        "merged": ("#6f42c1", "#ffffff"),
+        "closed": ("#c0392b", "#ffffff"),
+        "cancelled": ("#475061", "#ffffff"),
+    }
+
+    _TEXT_STYLES = {
+        "failed": "#ff6b6b",
+        "deleted": "#96a3bb",
+    }
+
+    def __init__(self, status: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        status_key = status.lower()
+        font = QFont("Segoe UI", 9)
+        font.setBold(True)
+        self.setFont(font)
+        if status_key in self._PILL_STYLES:
+            bg, fg = self._PILL_STYLES[status_key]
+            self.setText(status.capitalize())
+            self.setStyleSheet(
+                (
+                    "QLabel{{padding:2px 8px;border-radius:8px;font-weight:600;"
+                    "background:{bg};color:{fg};border:1px solid #0b1524;}}"
+                ).format(bg=bg, fg=fg)
+            )
+        else:
+            color = self._TEXT_STYLES.get(status_key, "#e9f3ff")
+            self.setText(status.capitalize())
+            self.setStyleSheet(
+                (
+                    "QLabel{{padding:0px;font-weight:600;"
+                    "color:{color};background:transparent;}}"
+                ).format(color=color)
+            )
+
+
+class _TaskRowWidget(QWidget):
+    """Widget rendered inside the list view for each task."""
+
+    def __init__(self, task: Task, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.task = task
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(10)
+
+        self.pill = _StatusPill(task.status, self)
+        layout.addWidget(self.pill)
+
+        self.title = QLabel(task.title, self)
+        self.title.setStyleSheet("color:#e9f3ff;font:600 10pt 'Segoe UI';")
+        self.title.setWordWrap(True)
+        layout.addWidget(self.title, 1)
+
+        diff_text = _format_diff(task)
+        self.diff = QLabel(diff_text, self)
+        self.diff.setStyleSheet("color:#bcd5ff;font:500 9pt 'Segoe UI';")
+        layout.addWidget(self.diff)
+
+        ts_label = QLabel(_format_timestamp(task.updated_ts), self)
+        ts_label.setStyleSheet("color:#8ea4c9;font:500 9pt 'Segoe UI';")
+        layout.addWidget(ts_label)
+
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        bg = QColor("#0c1320")
+        palette.setColor(QPalette.Window, bg)
+        self.setPalette(palette)
+
+
+def _format_diff(task: Task) -> str:
+    added = task.diffs.added if task.diffs else 0
+    removed = task.diffs.removed if task.diffs else 0
+    return f"+{added} \u2212{removed}"
+
+
+def _format_timestamp(ts: float) -> str:
+    try:
+        dt_obj = datetime.fromtimestamp(float(ts))
+    except (TypeError, ValueError, OSError):
+        return "--"
+    return dt_obj.strftime("%Y-%m-%d %H:%M")
+
+
+class TaskPanel(QDockWidget):
+    """Dockable Tasks panel shared by Terminal and Virtual Desktop."""
+
+    task_selected = Signal(str)
+    new_taskRequested = Signal(str)
+    status_changed = Signal(str, str)
+    load_conversationRequested = Signal(str, str)
+
+    def __init__(
+        self,
+        dataset_path: str | Path | None = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Tasks", parent)
+        self.setObjectName("TaskPanelDock")
+        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable)
+        self.dataset_path = Path(dataset_path) if dataset_path else TASKS_FILE
+        self._dataset_root = self.dataset_path.parent
+        self._tasks: List[_TaskRowData] = []
+        self._selected_task: Optional[Task] = None
+        self._log_placeholder = "No run log entries yet."
+        self._active_conversation_id: Optional[str] = None
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        container = QWidget(self)
+        container.setObjectName("TaskPanelContainer")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.filter_combo = QComboBox(container)
+        self.filter_combo.addItems([status.capitalize() for status in STATUS_ORDER])
+        self.filter_combo.currentIndexChanged.connect(self._apply_filters)
+        self.filter_combo.setStyleSheet(
+            "QComboBox{background:#0a111e;color:#eaf2ff;border:1px solid #1d2b3c;"
+            "border-radius:6px;padding:4px 8px;}"
+            "QComboBox QAbstractItemView{background:#0b1624;color:#eaf2ff;}"
+        )
+        header.addWidget(self.filter_combo)
+
+        self.search_edit = QLineEdit(container)
+        self.search_edit.setPlaceholderText("Search tasks…")
+        self.search_edit.textChanged.connect(self._apply_filters)
+        self.search_edit.setStyleSheet(
+            "QLineEdit{background:#0b1624;color:#e9f3ff;border:1px solid #203040;"
+            "border-radius:6px;padding:6px 10px;font:10pt 'Segoe UI';}"
+            "QLineEdit:focus{border:1px solid #2f72ff;}"
+        )
+        header.addWidget(self.search_edit, 1)
+
+        layout.addLayout(header)
+
+        self.list = QListWidget(container)
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.itemSelectionChanged.connect(self._on_item_selected)
+        self.list.setUniformItemSizes(False)
+        self.list.setSpacing(4)
+        self.list.setStyleSheet(
+            "QListWidget{background:#0c1320;color:#e9f3ff;border:1px solid #1f2b3a;"
+            "border-radius:8px;padding:4px;}"
+            "QListWidget::item{margin:2px;padding:2px;border-radius:6px;}"
+            "QListWidget::item:selected{background:#1f3a5b;}"
+        )
+        layout.addWidget(self.list, 1)
+
+        self.detail = QFrame(container)
+        self.detail.setFrameShape(QFrame.StyledPanel)
+        self.detail.setObjectName("TaskDetailPopover")
+        self.detail.setStyleSheet(
+            "QFrame#TaskDetailPopover{background:#0b1624;border:1px solid #25405f;"
+            "border-radius:10px;}"
+        )
+        detail_layout = QVBoxLayout(self.detail)
+        detail_layout.setContentsMargins(12, 12, 12, 12)
+        detail_layout.setSpacing(8)
+
+        self.detail_title = QLabel("Select a task to view details", self.detail)
+        self.detail_title.setStyleSheet("color:#eaf2ff;font:600 11pt 'Segoe UI';")
+        self.detail_title.setWordWrap(True)
+        detail_layout.addWidget(self.detail_title)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        status_label = QLabel("Status:", self.detail)
+        status_label.setStyleSheet("color:#bcd5ff;font:500 9pt 'Segoe UI';")
+        status_row.addWidget(status_label)
+
+        self.status_combo = QComboBox(self.detail)
+        for status in STATUS_ORDER[1:]:
+            self.status_combo.addItem(status.capitalize(), status)
+        self.status_combo.setStyleSheet(
+            "QComboBox{background:#0a111e;color:#eaf2ff;border:1px solid #1d2b3c;"
+            "border-radius:6px;padding:4px 8px;}"
+            "QComboBox QAbstractItemView{background:#0b1624;color:#eaf2ff;}"
+        )
+        status_row.addWidget(self.status_combo, 1)
+
+        self.status_apply = QPushButton("Update", self.detail)
+        self.status_apply.clicked.connect(self._emit_status_change)
+        self.status_apply.setStyleSheet(
+            "QPushButton{background:#1E5AFF;color:#ffffff;border-radius:6px;"
+            "padding:6px 12px;border:1px solid #1b3b73;font-weight:600;}"
+            "QPushButton:hover{background:#2f72ff;}"
+        )
+        status_row.addWidget(self.status_apply)
+        detail_layout.addLayout(status_row)
+
+        self.detail_diff = QLabel("+0 \u22120", self.detail)
+        self.detail_diff.setStyleSheet("color:#bcd5ff;font:500 9pt 'Segoe UI';")
+        detail_layout.addWidget(self.detail_diff)
+
+        self.detail_timestamps = QLabel("--", self.detail)
+        self.detail_timestamps.setStyleSheet("color:#8ea4c9;font:500 9pt 'Segoe UI';")
+        self.detail_timestamps.setWordWrap(True)
+        detail_layout.addWidget(self.detail_timestamps)
+
+        self.detail_labels = QLabel("", self.detail)
+        self.detail_labels.setStyleSheet("color:#8ea4c9;font:500 9pt 'Segoe UI';")
+        self.detail_labels.setWordWrap(True)
+        detail_layout.addWidget(self.detail_labels)
+
+        self.detail_log_label = QLabel("Run log", self.detail)
+        self.detail_log_label.setStyleSheet("color:#bcd5ff;font:600 9pt 'Segoe UI';")
+        detail_layout.addWidget(self.detail_log_label)
+
+        self.detail_log = QPlainTextEdit(self.detail)
+        self.detail_log.setReadOnly(True)
+        self.detail_log.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.detail_log.setFont(QFont("Consolas", 9))
+        self.detail_log.setStyleSheet(
+            "QPlainTextEdit{background:#07101c;color:#e9f3ff;border:1px solid #203040;"
+            "border-radius:6px;padding:8px;}"
+        )
+        self.detail_log.setFixedHeight(160)
+        self.detail_log.setPlainText(self._log_placeholder)
+        detail_layout.addWidget(self.detail_log)
+
+        self.load_conversation_btn = QPushButton("Load Conversation", self.detail)
+        self.load_conversation_btn.setEnabled(False)
+        self.load_conversation_btn.setStyleSheet(
+            "QPushButton{background:#1E5AFF;color:#ffffff;border-radius:6px;"
+            "padding:6px 12px;border:1px solid #1b3b73;font-weight:600;}"
+            "QPushButton:hover{background:#2f72ff;}"
+            "QPushButton:disabled{background:#1b2c44;color:#6c7a96;border:1px solid #1b2c44;}"
+        )
+        self.load_conversation_btn.clicked.connect(self._emit_load_conversation)
+        detail_layout.addWidget(self.load_conversation_btn, 0, Qt.AlignLeft)
+
+        layout.addWidget(self.detail)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
+        self.new_task_input = QLineEdit(container)
+        self.new_task_input.setPlaceholderText("Create new task…")
+        self.new_task_input.returnPressed.connect(self._on_new_task_requested)
+        self.new_task_input.setStyleSheet(
+            "QLineEdit{background:#0b1624;color:#e9f3ff;border:1px solid #203040;"
+            "border-radius:6px;padding:6px 10px;font:10pt 'Segoe UI';}"
+            "QLineEdit:focus{border:1px solid #2f72ff;}"
+        )
+        footer.addWidget(self.new_task_input, 1)
+        footer.addItem(QSpacerItem(12, 1, QSizePolicy.Fixed, QSizePolicy.Minimum))
+        layout.addLayout(footer)
+
+        container.setLayout(layout)
+        self.setWidget(container)
+
+        apply_palette(container)
+        apply_palette(self.list)
+        apply_palette(self.detail)
+        apply_palette(self.new_task_input)
+        apply_palette(self.search_edit)
+
+    def refresh(self) -> None:
+        if not self.dataset_path.exists():
+            self._tasks = []
+            self._apply_filters()
+            return
+        records: List[Task] = []
+        with self.dataset_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    records.append(Task.from_dict(payload))
+                except json.JSONDecodeError:
+                    continue
+        self.set_tasks(records)
+
+    def set_tasks(self, tasks: Iterable[Task]) -> None:
+        self._tasks = [_TaskRowData(task=task) for task in tasks]
+        self._apply_filters()
+
+    def update_task(self, task: Task) -> None:
+        for row in self._tasks:
+            if row.task.id == task.id:
+                row.task = task
+                break
+        else:
+            self._tasks.append(_TaskRowData(task=task))
+        self._apply_filters(preserve_selection=True)
+
+    def _apply_filters(self, preserve_selection: bool = False) -> None:
+        search_text = self.search_edit.text().strip().lower()
+        status_filter = STATUS_ORDER[self.filter_combo.currentIndex()]
+        selected_id = self._selected_task.id if (preserve_selection and self._selected_task) else None
+
+        self.list.blockSignals(True)
+        self.list.clear()
+        matched_task: Optional[Task] = None
+
+        for row in self._tasks:
+            task = row.task
+            matches_status = status_filter == "all" or task.status.lower() == status_filter
+            matches_search = not search_text or (
+                search_text in task.title.lower()
+                or search_text in task.id.lower()
+                or any(search_text in label.lower() for label in task.labels)
+            )
+            row.matches_filter = matches_status and matches_search
+            if not row.matches_filter:
+                continue
+            item = QListWidgetItem(self.list)
+            item.setData(Qt.UserRole, task.id)
+            widget = _TaskRowWidget(task, self.list)
+            self.list.addItem(item)
+            self.list.setItemWidget(item, widget)
+            if selected_id and task.id == selected_id:
+                item.setSelected(True)
+                matched_task = task
+
+        self.list.blockSignals(False)
+        if not preserve_selection or not matched_task:
+            self._selected_task = None
+            self.detail_title.setText("Select a task to view details")
+            self.status_combo.blockSignals(True)
+            self.status_combo.setCurrentIndex(0)
+            self.status_combo.blockSignals(False)
+            self.detail_diff.setText("+0 \u22120")
+            self.detail_timestamps.setText("--")
+            self.detail_labels.setText("")
+            self._update_log_view(None)
+            self._update_conversation_button(None)
+        else:
+            self._selected_task = matched_task
+            self._populate_detail(matched_task)
+
+    def _on_item_selected(self) -> None:
+        items = self.list.selectedItems()
+        if not items:
+            self._selected_task = None
+            self._apply_filters()
+            return
+        task_id = items[0].data(Qt.UserRole)
+        for row in self._tasks:
+            if row.task.id == task_id:
+                self._selected_task = row.task
+                self._populate_detail(row.task)
+                self.task_selected.emit(row.task.id)
+                break
+
+    def _populate_detail(self, task: Task) -> None:
+        self.detail_title.setText(task.title)
+        status_index = self.status_combo.findData(task.status)
+        self.status_combo.blockSignals(True)
+        if status_index >= 0:
+            self.status_combo.setCurrentIndex(status_index)
+        else:
+            self.status_combo.setCurrentIndex(0)
+        self.status_combo.blockSignals(False)
+        self.detail_diff.setText(_format_diff(task))
+        created = _format_timestamp(task.created_ts)
+        updated = _format_timestamp(task.updated_ts)
+        self.detail_timestamps.setText(f"Created: {created}\nUpdated: {updated}")
+        if task.labels:
+            labels = ", ".join(task.labels)
+            self.detail_labels.setText(f"Labels: {labels}")
+        else:
+            self.detail_labels.setText("")
+        self._update_log_view(task)
+        self._update_conversation_button(task)
+
+    def _emit_status_change(self) -> None:
+        if not self._selected_task:
+            return
+        status = self.status_combo.currentData()
+        if not status or status == self._selected_task.status:
+            return
+        self.status_changed.emit(self._selected_task.id, status)
+
+    def _on_new_task_requested(self) -> None:
+        text = self.new_task_input.text().strip()
+        if not text:
+            return
+        self.new_taskRequested.emit(text)
+        self.new_task_input.clear()
+
+    def _update_log_view(self, task: Optional[Task]) -> None:
+        if task is None:
+            self.detail_log.setPlainText(self._log_placeholder)
+            return
+        lines = load_run_log_tail(task, self._dataset_root, max_lines=200)
+        self.detail_log.setPlainText("\n".join(lines) if lines else self._log_placeholder)
+        scrollbar = self.detail_log.verticalScrollBar()
+        if scrollbar:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _update_conversation_button(self, task: Optional[Task]) -> None:
+        identifier: Optional[str] = None
+        if task is not None:
+            cid = (task.codex_conversation_id or "").strip()
+            identifier = cid or (task.session_id or "").strip()
+        self._active_conversation_id = identifier or None
+        if identifier:
+            self.load_conversation_btn.setEnabled(True)
+            self.load_conversation_btn.setToolTip("Load the linked Codex transcript into the chat window.")
+        else:
+            self.load_conversation_btn.setEnabled(False)
+            self.load_conversation_btn.setToolTip("No linked Codex conversation for this task.")
+
+    def _emit_load_conversation(self) -> None:
+        if not self._selected_task or not self._active_conversation_id:
+            return
+        self.load_conversationRequested.emit(self._selected_task.id, self._active_conversation_id)
+
+
+def apply_palette(widget: QWidget) -> None:
+    """Apply the high-contrast palette to the given widget."""
+
+    palette = widget.palette()
+    bg = QColor("#0c1320")
+    fg = QColor("#e9f3ff")
+    for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+        palette.setColor(group, QPalette.Window, bg)
+        palette.setColor(group, QPalette.WindowText, fg)
+        palette.setColor(group, QPalette.Base, QColor("#0b1624"))
+        palette.setColor(group, QPalette.Text, fg)
+        palette.setColor(group, QPalette.Button, QColor("#1E5AFF"))
+        palette.setColor(group, QPalette.ButtonText, QColor("#ffffff"))
+        palette.setColor(group, QPalette.Highlight, QColor("#1f3a5b"))
+        palette.setColor(group, QPalette.HighlightedText, QColor("#ffffff"))
+    widget.setPalette(palette)
+
+
+class TaskDrawer(QFrame):
+    """Right-aligned container that hosts the shared :class:`TaskPanel` UI."""
+
+    def __init__(
+        self,
+        session_id: str,
+        dataset_path: Optional[Path] = None,
+        source: str = "terminal",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("TaskDrawer")
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setStyleSheet(
+            "QFrame#TaskDrawer{background:#0a111e;border-left:1px solid #1d2b3c;}"
+        )
+
+        self._session_id = session_id or "terminal"
+        self._source = source or "terminal"
+        self._dataset_path = Path(dataset_path) if dataset_path else TASKS_FILE
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.panel = TaskPanel(self._dataset_path, self)
+        self.panel.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.panel.setTitleBarWidget(QWidget(self.panel))
+        layout.addWidget(self.panel)
+
+        width_hint = max(360, self.panel.sizeHint().width())
+        self.setFixedWidth(width_hint)
+
+        self.panel.new_taskRequested.connect(self._create_task)
+        self.panel.status_changed.connect(self._apply_status_change)
+        self.panel.load_conversationRequested.connect(self._publish_conversation_request)
+
+        self._subscriptions: List[Subscription] = [
+            subscribe("task.created", self._on_task_payload),
+            subscribe("task.updated", self._on_task_payload),
+        ]
+        self.destroyed.connect(lambda *_: self._teardown())
+
+    def refresh(self) -> None:
+        self.panel.refresh()
+
+    def _teardown(self) -> None:
+        for handle in self._subscriptions:
+            try:
+                handle.unsubscribe()
+            except Exception:  # pragma: no cover - defensive cleanup
+                logging.getLogger(__name__).exception(
+                    "Failed to unsubscribe task drawer handle"
+                )
+        self._subscriptions.clear()
+
+    def _create_task(self, title: str) -> None:
+        title = (title or "").strip()
+        if not title:
+            return
+        now = datetime.now(UTC).timestamp()
+        task_id = self._generate_task_id()
+        task = Task(
+            id=task_id,
+            title=title,
+            status="open",
+            created_ts=now,
+            updated_ts=now,
+            session_id=self._session_id,
+            source=self._source,
+            codex_conversation_id=self._session_id,
+        )
+        try:
+            append_task(task)
+            append_event(
+                TaskEvent(
+                    ts=now,
+                    task_id=task_id,
+                    event="created",
+                    by=self._source,
+                )
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to persist new task: %s", task_id
+            )
+            return
+
+        publish("task.created", task.to_dict())
+        publish("task.updated", task.to_dict())
+        self.panel.update_task(task)
+
+    def _publish_conversation_request(self, task_id: str, conversation_id: str) -> None:
+        conv = (conversation_id or "").strip()
+        if not conv:
+            return
+        payload = {
+            "id": task_id,
+            "conversation_id": conv,
+            "session_id": self._session_id,
+            "source": self._source,
+        }
+        try:
+            publish("task.conversation", payload)
+        except Exception:  # pragma: no cover - defensive guard
+            logging.getLogger(__name__).exception(
+                "Failed to publish task conversation request"
+            )
+
+    def _apply_status_change(self, task_id: str, status: str) -> None:
+        if not task_id or not status:
+            return
+        now = datetime.now(UTC).timestamp()
+        try:
+            updated = update_task(task_id, status=status, updated_ts=now)
+            append_event(
+                TaskEvent(
+                    ts=now,
+                    task_id=task_id,
+                    event="status",
+                    by=self._source,
+                    to=status,
+                )
+            )
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                "Task %s not found when applying status", task_id
+            )
+            self.panel.refresh()
+            return
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to update task status for %s", task_id
+            )
+            return
+
+        publish("task.status", {"id": updated.id, "status": updated.status})
+        publish("task.updated", updated.to_dict())
+        self.panel.update_task(updated)
+
+    def _on_task_payload(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            task = Task.from_dict(payload)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Skipping malformed task payload: %r", payload
+            )
+            self.panel.refresh()
+            return
+        self.panel.update_task(task)
+
+    def _generate_task_id(self) -> str:
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        return f"tsk_{stamp}_{uuid.uuid4().hex[:6]}"
+
+
+# ============================================================================
+# Error Console (Inlined from Dev_Logic/error_console.py)
+# ============================================================================
+"""Dockable error log surface and stderr redirector."""
+
+
+class ErrorConsole(QDockWidget):
+    """Dockable console to display and persist error messages."""
+
+    def __init__(
+        self,
+        errors_dir: Path | str = "errors",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Errors", parent)
+        self.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
+        self.setFeatures(QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable)
+        self._text = QTextEdit(self)
+        self._text.setReadOnly(True)
+        self.setWidget(self._text)
+        self.errors_dir = Path(errors_dir)
+        self.errors_dir.mkdir(parents=True, exist_ok=True)
+
+    def log(self, message: str) -> None:
+        """Append message to console and persist to timestamped file."""
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._text.append(f"[{ts}] {message}")
+        fname = self.errors_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+        with fname.open("a", encoding="utf-8") as fh:
+            if message.endswith("\n"):
+                fh.write(message)
+            else:
+                fh.write(f"{message}\n")
+        self.show()
+        self.raise_()
+
+
+class StderrRedirector(io.TextIOBase):
+    """File-like object that sends writes to the :class:`ErrorConsole`."""
+
+    def __init__(self, console: ErrorConsole, original: io.TextIOBase) -> None:
+        self.console = console
+        self.original = original
+        self._buffer = ""
+
+    def write(self, text: str) -> int:  # type: ignore[override]
+        self.original.write(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                self.console.log(line)
+        return len(text)
+
+    def flush(self) -> None:  # type: ignore[override]
+        if self._buffer.strip():
+            self.console.log(self._buffer)
+            self._buffer = ""
+        self.original.flush()
+
+
+def log_exception(console: ErrorConsole, exc_type, exc, tb) -> None:
+    """Format and log an exception using the provided console."""
+
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    console.log(text)
+
+
+# ============================================================================
+# Virtual Desktop Backgrounds (Inlined from Dev_Logic/background)
+# ============================================================================
+"""Background configuration, rendering layers, and live scripting viewport."""
+
+
+class BackgroundMode(str, Enum):
+    """Supported background layer types."""
+
+    SOLID = "solid"
+    STATIC = "image"
+    GIF = "gif"
+    VIDEO = "video"
+    GL = "gl"
+
+
+class BackgroundFit(str, Enum):
+    """Scaling strategies for image-backed backgrounds."""
+
+    FILL = "fill"
+    FIT = "fit"
+    CENTER = "center"
+    TILE = "tile"
+
+
+@dataclass
+class BackgroundConfig:
+    """Runtime configuration for a background layer."""
+
+    mode: BackgroundMode = BackgroundMode.SOLID
+    source: str = ""
+    fit: BackgroundFit = BackgroundFit.FILL
+    loop: bool = True
+    mute: bool = True
+    playback_rate: float = 1.0
+
+    @classmethod
+    def from_state(cls, raw: object) -> "BackgroundConfig":
+        if isinstance(raw, dict):
+            mode = raw.get("mode", BackgroundMode.SOLID)
+            source = raw.get("source", "")
+            fit = raw.get("fit", BackgroundFit.FILL)
+            loop = bool(raw.get("loop", True))
+            mute = bool(raw.get("mute", True))
+            try:
+                playback_rate = float(raw.get("playback_rate", 1.0))
+            except Exception:
+                playback_rate = 1.0
+        elif isinstance(raw, str) and raw:
+            mode = BackgroundMode.STATIC
+            source = raw
+            fit = BackgroundFit.FILL
+            loop = True
+            mute = True
+            playback_rate = 1.0
+        else:
+            mode = BackgroundMode.SOLID
+            source = ""
+            fit = BackgroundFit.FILL
+            loop = True
+            mute = True
+            playback_rate = 1.0
+
+        try:
+            mode = BackgroundMode(mode)
+        except Exception:
+            mode = BackgroundMode.SOLID
+        try:
+            fit = BackgroundFit(fit)
+        except Exception:
+            fit = BackgroundFit.FILL
+        return cls(mode=mode, source=source, fit=fit, loop=loop, mute=mute, playback_rate=playback_rate)
+
+    def to_state(self) -> Dict[str, object]:
+        return {
+            "mode": self.mode.value,
+            "source": self.source,
+            "fit": self.fit.value,
+            "loop": bool(self.loop),
+            "mute": bool(self.mute),
+            "playback_rate": float(self.playback_rate),
+        }
+
+
+class BackgroundLayer(QObject):
+    """Interface implemented by background layer engines."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.canvas = canvas
+
+    def start(self, config: BackgroundConfig) -> None:
+        """Activate the background using the provided configuration."""
+
+    def stop(self) -> None:
+        """Deactivate the background and release resources."""
+
+    def paint(self, painter: QPainter, rect) -> bool:  # pragma: no cover - thin wrapper
+        return False
+
+    def resize(self, size: QSize) -> None:
+        """Resize hook used by the canvas when it changes dimensions."""
+
+
+class BackgroundManager(QObject):
+    """Lifecycle coordinator for desktop background layers."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.canvas = canvas
+        self._factories: Dict[BackgroundMode, Callable[[object], BackgroundLayer]] = {}
+        self._instances: Dict[BackgroundMode, BackgroundLayer] = {}
+        self._active: Optional[BackgroundLayer] = None
+        self._active_mode: Optional[BackgroundMode] = None
+
+    def register(self, mode: BackgroundMode, factory: Callable[[object], BackgroundLayer]) -> None:
+        self._factories[mode] = factory
+
+    def apply(self, config: Optional[BackgroundConfig]) -> None:
+        if config is None:
+            self.clear()
+            return
+        if self._active and self._active_mode != config.mode:
+            self._active.stop()
+            self._active = None
+            self._active_mode = None
+        factory = self._factories.get(config.mode)
+        if factory is None:
+            self.clear()
+            return
+        layer = self._instances.get(config.mode)
+        if layer is None:
+            layer = factory(self.canvas)
+            self._instances[config.mode] = layer
+        self._active = layer
+        self._active_mode = config.mode
+        layer.start(config)
+        layer.resize(self.canvas.size())
+        self.canvas.update()
+
+    def clear(self) -> None:
+        if self._active:
+            self._active.stop()
+        self._active = None
+        self._active_mode = None
+        self.canvas.update()
+
+    def paint(self, painter: QPainter, rect) -> bool:
+        if self._active:
+            return bool(self._active.paint(painter, rect))
+        return False
+
+    def resize(self, size: QSize) -> None:
+        if self._active:
+            self._active.resize(size)
+
+    @property
+    def active_mode(self) -> Optional[BackgroundMode]:
+        return self._active_mode
+
+
+class StaticImageBg(BackgroundLayer):
+    """Render a still image as the desktop background."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._pixmap: Optional[QPixmap] = None
+        self._config: Optional[BackgroundConfig] = None
+
+    def start(self, config: BackgroundConfig) -> None:
+        self._config = config
+        if config.source and os.path.isfile(config.source):
+            pixmap = QPixmap(config.source)
+            self._pixmap = pixmap if not pixmap.isNull() else None
+        else:
+            self._pixmap = None
+
+    def stop(self) -> None:
+        self._pixmap = None
+
+    def paint(self, painter: QPainter, rect: QRect) -> bool:
+        if not self._pixmap or not self._config:
+            return False
+        fit = self._config.fit
+        if fit == BackgroundFit.TILE:
+            brush = QBrush(self._pixmap)
+            painter.fillRect(rect, brush)
+            return True
+        if fit == BackgroundFit.CENTER:
+            target = self._pixmap.rect()
+            target.moveCenter(rect.center())
+            painter.drawPixmap(target, self._pixmap)
+            return True
+        mode = Qt.KeepAspectRatio
+        if fit == BackgroundFit.FILL:
+            mode = Qt.KeepAspectRatioByExpanding
+        scaled = self._pixmap.scaled(rect.size(), mode, Qt.SmoothTransformation)
+        painter.drawPixmap(rect, scaled)
+        return True
+
+
+class GifBg(BackgroundLayer):
+    """Display an animated GIF behind desktop icons."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._label = QLabel(canvas)
+        self._label.setObjectName("DesktopGifBackground")
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._label.hide()
+        self._movie: Optional[QMovie] = None
+        self._config: Optional[BackgroundConfig] = None
+
+    def start(self, config: BackgroundConfig) -> None:
+        self._config = config
+        if self._movie:
+            self._movie.stop()
+        if not (config.source and os.path.isfile(config.source)):
+            self.stop()
+            return
+        movie = QMovie(config.source)
+        if not movie.isValid():
+            self.stop()
+            return
+        self._movie = movie
+        self._label.setMovie(movie)
+        self._label.show()
+        self._label.lower()
+        self.resize(self.canvas.size())
+        movie.start()
+
+    def stop(self) -> None:
+        if self._movie:
+            self._movie.stop()
+        self._movie = None
+        self._label.clear()
+        self._label.hide()
+
+    def resize(self, size: QSize) -> None:
+        self._label.setGeometry(0, 0, size.width(), size.height())
+        if not self._movie or not self._config:
+            return
+        fit = self._config.fit
+        if fit == BackgroundFit.CENTER:
+            self._label.setScaledContents(False)
+            self._label.setAlignment(Qt.AlignCenter)
+        else:
+            self._label.setScaledContents(True)
+            self._label.setAlignment(Qt.AlignCenter)
+            self._movie.setScaledSize(size)
+
+    def paint(self, *_args) -> bool:
+        return bool(self._movie)
+
+
+try:  # Multimedia stack is optional
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+except Exception:  # pragma: no cover - optional dependency guard
+    QAudioOutput = None  # type: ignore
+    QMediaPlayer = None  # type: ignore
+    QVideoWidget = None  # type: ignore
+
+
+class VideoBg(BackgroundLayer):
+    """Loop a muted video behind the desktop icons."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._player = None
+        self._audio = None
+        self._widget = None
+        self._config: Optional[BackgroundConfig] = None
+
+    def _ensure_stack(self) -> bool:
+        if QMediaPlayer is None or QVideoWidget is None or QAudioOutput is None:
+            return False
+        if self._player is None:
+            self._player = QMediaPlayer(self.canvas)
+            self._audio = QAudioOutput(self.canvas)
+            self._player.setAudioOutput(self._audio)
+            self._widget = QVideoWidget(self.canvas)
+            self._widget.setObjectName("DesktopVideoBackground")
+            self._widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self._widget.hide()
+            self._player.mediaStatusChanged.connect(self._handle_status)
+        return True
+
+    def start(self, config: BackgroundConfig) -> None:
+        self._config = config
+        if not (config.source and os.path.isfile(config.source)):
+            self.stop()
+            return
+        if not self._ensure_stack():
+            self.stop()
+            return
+        assert self._player and self._widget and self._audio
+        self._player.stop()
+        self._player.setSource(QUrl.fromLocalFile(config.source))
+        try:
+            loops = -1 if config.loop else 1
+            self._player.setLoops(loops)
+        except Exception:
+            pass
+        self._audio.setMuted(bool(config.mute))
+        self._player.setPlaybackRate(config.playback_rate or 1.0)
+        self._widget.show()
+        self._widget.lower()
+        self.resize(self.canvas.size())
+        self._player.play()
+
+    def stop(self) -> None:
+        if self._player:
+            self._player.stop()
+        if self._widget:
+            self._widget.hide()
+        self._config = None
+
+    def resize(self, size: QSize) -> None:
+        if self._widget:
+            self._widget.setGeometry(0, 0, size.width(), size.height())
+
+    def paint(self, *_args) -> bool:
+        return bool(self._widget and self._widget.isVisible())
+
+    def _handle_status(self, status) -> None:  # pragma: no cover - signal callback
+        if not self._player or not self._config or QMediaPlayer is None:
+            return
+        try:
+            end_status = QMediaPlayer.MediaStatus.EndOfMedia
+        except Exception:
+            end_status = getattr(QMediaPlayer, "EndOfMedia", None)
+        if getattr(self._config, "loop", True) and status == end_status:
+            self._player.setPosition(0)
+            self._player.play()
+
+
+LOGGER_GL = logging.getLogger("VirtualDesktop.GLBackground")
+
+
+class GLViewportBg(BackgroundLayer):
+    """Host a programmable OpenGL viewport as the background."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._viewport: Optional["LiveScriptViewport"] = None
+        self._config: Optional[BackgroundConfig] = None
+
+    def _ensure_viewport(self) -> bool:
+        if LiveScriptViewport is None:
+            LOGGER_GL.warning("Qt OpenGL widgets unavailable; GL background disabled")
+            return False
+        if self._viewport is None:
+            self._viewport = LiveScriptViewport(self.canvas)
+            self._viewport.setObjectName("DesktopGLViewport")
+            self._viewport.hide()
+        checker = self._resolve_heavy_checker()
+        if checker:
+            self._viewport.set_heavy_process_checker(checker)
+        return True
+
+    def start(self, config: BackgroundConfig) -> None:
+        self._config = config
+        if not (config.source and self._ensure_viewport()):
+            self.stop()
+            return
+        assert self._viewport is not None
+        try:
+            base_fps = LiveScriptViewport.DEFAULT_FPS if LiveScriptViewport else 60.0
+            playback = float(config.playback_rate or 1.0)
+            fps = max(
+                LiveScriptViewport.MIN_FPS,
+                min(LiveScriptViewport.MAX_FPS, base_fps * playback),
+            )
+        except Exception:
+            fps = LiveScriptViewport.DEFAULT_FPS if LiveScriptViewport else 60.0
+        self._viewport.set_fps_cap(fps)
+        self._viewport.set_script(config.source)
+        checker = self._resolve_heavy_checker()
+        if checker:
+            self._viewport.set_heavy_process_checker(checker)
+        self._viewport.show()
+        self._viewport.lower()
+        self.resize(self.canvas.size())
+        self._viewport.start()
+
+    def stop(self) -> None:
+        if self._viewport:
+            self._viewport.stop()
+            self._viewport.hide()
+        self._config = None
+
+    def resize(self, size: QSize) -> None:
+        if self._viewport:
+            self._viewport.setGeometry(0, 0, size.width(), size.height())
+
+    def paint(self, *_args) -> bool:
+        return bool(self._viewport and self._viewport.isVisible())
+
+    def _resolve_heavy_checker(self) -> Optional[Callable[[], bool]]:
+        if self.canvas is None or self.canvas.window() is None:
+            return None
+        window = self.canvas.window()
+        checker = getattr(window, "is_heavy_process_active", None)
+        if callable(checker):
+            return lambda: bool(checker())
+        return None
+
+
+@dataclass
+class ScriptHooks:
+    """Bundle of lifecycle hooks exposed by a background script."""
+
+    module: ModuleType
+    path: str
+    mtime: float
+
+    def invoke(self, name: str, *args) -> None:
+        func = getattr(self.module, name, None)
+        if callable(func):
+            func(*args)
+
+
+class LiveScriptController(QObject):
+    """Manage loading and hot-reloading of a background script module."""
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._hooks: Optional[ScriptHooks] = None
+        self._script_path: Optional[str] = None
+        self._missing_warned = False
+
+    @property
+    def module(self) -> Optional[ModuleType]:
+        return self._hooks.module if self._hooks else None
+
+    @property
+    def script_path(self) -> str:
+        return self._script_path or ""
+
+    def set_script(self, path: Optional[str]) -> None:
+        self._script_path = path or ""
+        self._missing_warned = False
+        if not self._script_path:
+            self._hooks = None
+            return
+        self._load(force=True)
+
+    def reload_if_changed(self) -> bool:
+        if not self._script_path:
+            return False
+        try:
+            mtime = os.path.getmtime(self._script_path)
+        except OSError:
+            if not self._missing_warned:
+                logging.getLogger("VirtualDesktop.LiveEngine").warning(
+                    "Live background script missing: %s", self._script_path
+                )
+                self._missing_warned = True
+            self._hooks = None
+            return False
+        if not self._hooks:
+            self._load(force=True)
+            return self._hooks is not None
+        if mtime <= self._hooks.mtime:
+            return False
+        self._load(force=True)
+        return self._hooks is not None and self._hooks.mtime == mtime
+
+    def _load(self, force: bool = False) -> None:
+        path = self._script_path
+        if not path:
+            self._hooks = None
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            if not self._missing_warned:
+                logging.getLogger("VirtualDesktop.LiveEngine").warning(
+                    "Live background script not found: %s", path
+                )
+                self._missing_warned = True
+            self._hooks = None
+            return
+        if not force and self._hooks and mtime <= self._hooks.mtime:
+            return
+        spec = importlib.util.spec_from_file_location("vdsk_live_background", path)
+        if not spec or not spec.loader:
+            logging.getLogger("VirtualDesktop.LiveEngine").error(
+                "Unable to create spec for live background script: %s", path
+            )
+            self._hooks = None
+            return
+        module = importlib.util.module_from_spec(spec)
+        try:
+            loader = spec.loader
+            assert loader is not None
+            loader.exec_module(module)  # type: ignore[union-attr]
+        except Exception:
+            logging.getLogger("VirtualDesktop.LiveEngine").exception(
+                "Live background script import failed"
+            )
+            self._hooks = None
+            return
+        sys.modules[spec.name] = module
+        self._hooks = ScriptHooks(module=module, path=path, mtime=mtime)
+        self._missing_warned = False
+
+    def call(self, name: str, *args) -> None:
+        if not self._hooks:
+            return
+        try:
+            self._hooks.invoke(name, *args)
+        except Exception:
+            logging.getLogger("VirtualDesktop.LiveEngine").exception(
+                "Live background script %s() failed", name
+            )
+
+
+try:  # Optional dependencies for OpenGL/psutil
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+except Exception:  # pragma: no cover - optional dependency guard
+    QOpenGLWidget = None  # type: ignore
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency guard
+    psutil = None  # type: ignore
+
+
+if QOpenGLWidget is None:  # pragma: no cover - executed when OpenGL widget missing
+    LiveScriptViewport = None  # type: ignore
+else:
+
+    class LiveScriptViewport(QOpenGLWidget):  # pragma: no cover - requires OpenGL context
+        """OpenGL viewport that executes scripted hooks at a capped frame rate."""
+
+        DEFAULT_FPS = 60.0
+        MIN_FPS = 5.0
+        MAX_FPS = 120.0
+        RESOURCE_POLL_INTERVAL = 1.0
+        CPU_THRESHOLD = 85.0
+        MEMORY_THRESHOLD = 90.0
+
+        def __init__(self, parent=None) -> None:
+            super().__init__(parent)
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self.setUpdateBehavior(QOpenGLWidget.PartialUpdate)
+            self._controller = LiveScriptController(self)
+            self._timer = QTimer(self)
+            self._timer.setTimerType(Qt.PreciseTimer)
+            self._timer.timeout.connect(self._tick)
+            self._fps_cap = self.DEFAULT_FPS
+            self._pending_dt = 0.0
+            self._last_frame_time: Optional[float] = None
+            self._needs_init = False
+            self._heavy_checker: Optional[Callable[[], bool]] = None
+            self._resource_flag = False
+            self._last_resource_poll = 0.0
+
+        def set_script(self, path: Optional[str]) -> None:
+            self._controller.set_script(path)
+            self._needs_init = True
+            self._last_frame_time = None
+            if path:
+                self._ensure_running()
+            else:
+                self.stop()
+
+        def set_fps_cap(self, fps: float) -> None:
+            fps = max(self.MIN_FPS, min(self.MAX_FPS, float(fps) if fps else self.DEFAULT_FPS))
+            self._fps_cap = fps
+            if self._timer.isActive():
+                self._ensure_running()
+
+        def set_heavy_process_checker(self, checker: Optional[Callable[[], bool]]) -> None:
+            self._heavy_checker = checker
+
+        def start(self) -> None:
+            if not self._timer.isActive():
+                self._ensure_running()
+
+        def stop(self) -> None:
+            self._timer.stop()
+
+        def initializeGL(self) -> None:
+            self._needs_init = True
+            self._last_frame_time = time.monotonic()
+
+        def resizeGL(self, w: int, h: int) -> None:
+            self._controller.call("resize", w, h)
+
+        def paintGL(self) -> None:
+            module = self._controller.module
+            if module is None:
+                return
+            if self._needs_init and self.isValid():
+                self._controller.call("init", self)
+                self._needs_init = False
+            dt = self._pending_dt
+            if dt < 0:
+                dt = 0.0
+            self._controller.call("update", dt)
+            self._controller.call("render", self)
+
+        def showEvent(self, event):  # pragma: no cover - thin Qt wrapper
+            super().showEvent(event)
+            self._ensure_running()
+
+        def hideEvent(self, event):  # pragma: no cover - thin Qt wrapper
+            super().hideEvent(event)
+            self.stop()
+
+        def _ensure_running(self) -> None:
+            if not self._controller.module and not self._controller.script_path:
+                return
+            interval_ms = int(max(1.0, 1000.0 / self._fps_cap))
+            self._timer.start(interval_ms)
+
+        def _tick(self) -> None:
+            changed = self._controller.reload_if_changed()
+            if self._controller.module is None:
+                return
+            if changed:
+                self._needs_init = True
+            if not self._should_render():
+                self._last_frame_time = None
+                return
+            now = time.monotonic()
+            if self._last_frame_time is None:
+                self._pending_dt = 0.0
+            else:
+                self._pending_dt = max(0.0, now - self._last_frame_time)
+            self._last_frame_time = now
+            self.update()
+
+        def _should_render(self) -> bool:
+            if not self.isVisible():
+                return False
+            window = self.window()
+            if window is not None:
+                if hasattr(window, "isMinimized") and window.isMinimized():
+                    return False
+                if not window.isVisible():
+                    return False
+            if self._heavy_checker and self._heavy_checker():
+                return False
+            now = time.monotonic()
+            if now - self._last_resource_poll >= self.RESOURCE_POLL_INTERVAL:
+                self._resource_flag = self._system_is_heavy()
+                self._last_resource_poll = now
+            if self._resource_flag:
+                return False
+            return True
+
+        def _system_is_heavy(self) -> bool:
+            if psutil is None:
+                return False
+            try:
+                cpu = psutil.cpu_percent(interval=None)
+                if cpu >= self.CPU_THRESHOLD:
+                    return True
+                mem = psutil.virtual_memory().percent
+                return mem >= self.MEMORY_THRESHOLD
+            except Exception:
+                return False
+
+
+# ============================================================================
+# Repository Reference Helper (Inlined from Dev_Logic/repo_reference_helper.py)
+# ============================================================================
+"""Repository indexing, suggestion APIs, and Qt-aware helper."""
+
+
+def _normalize_extra_roots(repo_root: Path, roots: Optional[Sequence[Path | str]]) -> List[Path]:
+    extras: List[Path] = []
+    if not roots:
+        return extras
+    try:
+        base = repo_root.resolve()
+    except Exception:
+        base = repo_root
+    seen: Set[Path] = {base}
+    for entry in roots:
+        if not entry:
+            continue
+        try:
+            candidate = Path(entry).expanduser().resolve()
+        except Exception:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        extras.append(candidate)
+    return extras
+
+
+@dataclass(frozen=True)
+class RepoReference:
+    """Lightweight reference describing a repository file or directory."""
+
+    absolute_path: Path
+    relative_path: str
+    kind: str  # "file" or "directory"
+
+    def display_label(self) -> str:
+        suffix = "/" if self.kind == "directory" else ""
+        return f"{self.relative_path}{suffix}"
+
+
+class RepoReferenceIndex:
+    """Maintain an in-memory list of repository file and directory references."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        repository_index: Optional[RepositoryIndex] = None,
+        extra_roots: Optional[Sequence[Path | str]] = None,
+    ) -> None:
+        self.repo_root = Path(repo_root).resolve()
+        self._extra_roots = _normalize_extra_roots(self.repo_root, extra_roots)
+        self._allowed_roots: List[Path] = [self.repo_root] + self._extra_roots
+        self.repository_index = repository_index or RepositoryIndex(
+            repo_root=self.repo_root,
+            extra_roots=self._extra_roots,
+        )
+        self._references: List[RepoReference] = []
+
+    def refresh(self) -> None:
+        references: List[RepoReference] = []
+        file_paths = self._gather_file_paths()
+        seen_dirs: Dict[Path, None] = {}
+
+        for file_path in sorted(file_paths):
+            rel = self._to_relative(file_path)
+            references.append(
+                RepoReference(absolute_path=file_path, relative_path=rel, kind="file")
+            )
+            for parent in file_path.parents:
+                if parent == self.repo_root:
+                    break
+                if parent in seen_dirs:
+                    continue
+                seen_dirs[parent] = None
+                references.append(
+                    RepoReference(
+                        absolute_path=parent,
+                        relative_path=self._to_relative(parent),
+                        kind="directory",
+                    )
+                )
+
+        references.sort(key=lambda ref: (0 if ref.kind == "file" else 1, ref.relative_path.lower()))
+        self._references = references
+
+    def suggestions(self, query: str, limit: int = 5) -> List[RepoReference]:
+        text = (query or "").strip().lower()
+        if not text:
+            return []
+
+        matches: List[tuple[int, int, RepoReference]] = []
+        for ref in self._references:
+            rel_lower = ref.relative_path.lower()
+            name_lower = ref.absolute_path.name.lower()
+            if text in rel_lower or text in name_lower:
+                prefix_match = 0 if rel_lower.startswith(text) or name_lower.startswith(text) else 1
+                matches.append((prefix_match, len(rel_lower), ref))
+
+        matches.sort()
+        return [ref for _, _, ref in matches[:limit]]
+
+    def entries(self) -> List[RepoReference]:
+        return list(self._references)
+
+    def _to_relative(self, path: Path) -> str:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        for root in self._allowed_roots:
+            try:
+                rel = resolved.relative_to(root)
+            except ValueError:
+                continue
+            rel_text = rel.as_posix()
+            if root == self.repo_root:
+                return rel_text
+            prefix = root.name or root.as_posix()
+            return f"{prefix}/{rel_text}" if rel_text else prefix
+        return resolved.as_posix()
+
+    def _match_allowed_root(self, value: object) -> Optional[Path]:
+        if not value:
+            return None
+        try:
+            candidate = Path(str(value)).expanduser().resolve()
+        except Exception:
+            return None
+        for root in self._allowed_roots:
+            if candidate == root:
+                return root
+        return None
+
+    def _resolve_segment_path(self, base_root: Path, relative_path: str) -> Optional[Path]:
+        try:
+            candidate = Path(relative_path)
+        except Exception:
+            return None
+        try:
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+            else:
+                resolved = (base_root / candidate).resolve()
+        except Exception:
+            return None
+        try:
+            resolved.relative_to(base_root)
+        except ValueError:
+            return None
+        return resolved
+
+    def _gather_file_paths(self) -> List[Path]:
+        paths: Set[Path] = set()
+        segments: Iterable[Dict[str, object]] = []
+
+        try:
+            self.repository_index.load()
+            segments = list(self.repository_index.iter_segments())
+        except Exception:
+            segments = []
+
+        if not segments:
+            try:
+                self.repository_index.rebuild()
+                self.repository_index.load()
+                segments = list(self.repository_index.iter_segments())
+            except Exception as exc:  # pragma: no cover - logged for visibility
+                logging.getLogger(__name__).debug(
+                    "RepoReferenceIndex rebuild failed: %s", exc
+                )
+                segments = []
+
+        allowed_set = {root for root in self._allowed_roots}
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            path_str = str(segment.get("path") or "")
+            if not path_str:
+                continue
+            metadata = segment.get("metadata")
+            base_root = None
+            if isinstance(metadata, dict):
+                base_root = self._match_allowed_root(metadata.get("scan_root"))
+            if base_root is None:
+                base_root = self.repo_root
+            if base_root not in allowed_set:
+                continue
+            resolved = self._resolve_segment_path(base_root, path_str)
+            if resolved is None:
+                continue
+            if resolved.is_file():
+                paths.add(resolved)
+
+        if not paths:
+            for root in self._allowed_roots:
+                if not root.exists():
+                    continue
+                for file_path in root.rglob("*"):
+                    if file_path.is_file():
+                        try:
+                            resolved = file_path.resolve()
+                        except Exception:
+                            continue
+                        paths.add(resolved)
+
+        return list(paths)
+
+
+class RepoReferenceHelper(QObject):
+    """Qt-aware helper that refreshes repository references as the workspace changes."""
+
+    refreshed = Signal()
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        parent: Optional[QObject] = None,
+        repository_index: Optional[RepositoryIndex] = None,
+        embed_contents: bool = True,
+        case_sensitive: bool = False,
+        token_guard: bool = True,
+        extra_roots: Optional[Sequence[Path | str]] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repo_root = Path(repo_root).resolve()
+        self._extra_roots = _normalize_extra_roots(self.repo_root, extra_roots)
+        self.index = RepoReferenceIndex(
+            self.repo_root,
+            repository_index=repository_index,
+            extra_roots=self._extra_roots,
+        )
+        self.index.refresh()
+
+        self.embed_contents = bool(embed_contents)
+        self.case_sensitive = bool(case_sensitive)
+        self.token_guard = bool(token_guard)
+
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.directoryChanged.connect(self._schedule_refresh)
+        self._watcher.fileChanged.connect(self._schedule_refresh)
+
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self.refresh)
+
+        self._register_watch_paths()
+
+    def refresh(self) -> None:
+        self.index.refresh()
+        self.refreshed.emit()
+
+    def suggestions(self, query: str, limit: int = 5) -> List[RepoReference]:
+        return self.index.suggestions(query, limit)
+
+    def _register_watch_paths(self) -> None:
+        for root in [self.repo_root] + self._extra_roots:
+            if not root.exists():
+                continue
+            try:
+                self._watcher.addPath(str(root))
+            except Exception as exc:  # pragma: no cover - watcher limitations
+                logging.getLogger(__name__).debug(
+                    "Failed to watch repo root %s: %s", root, exc
+                )
+
+        index_path = getattr(self.index.repository_index, "index_path", None)
+        if index_path:
+            path_obj = Path(index_path)
+            if path_obj.exists():
+                try:
+                    self._watcher.addPath(str(path_obj))
+                except Exception as exc:  # pragma: no cover - watcher limitations
+                    logging.getLogger(__name__).debug(
+                        "Failed to watch index %s: %s", path_obj, exc
+                    )
+
+    def _schedule_refresh(self, _path: str) -> None:
+        self._debounce.start()
 
 
 def pillow_available() -> bool:
