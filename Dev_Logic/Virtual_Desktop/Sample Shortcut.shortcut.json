@@ -1,0 +1,6 @@
+{
+  "target": "Codex_Terminal.py",
+  "args": [],
+  "working_dir": "..",
+  "notes": "Example shortcut: update target/args to point at scripts inside the workspace."
+}
