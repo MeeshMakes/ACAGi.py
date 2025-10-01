@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.3] - 2025-10-03
+### Changed
+- Inlined task persistence, event bus, UI, error console, background engines, and repository reference helper directly into `ACAGi.py`, preserving existing behavior with new section headers for maintainability.
+- Updated governance utilities by validating the logic inbox and ensuring dependency-aware multimedia and OpenGL guards live within the monolithic file.
+
 ## [0.1.2] - 2025-10-02
 ### Changed
 - Refactored optional dependency handling so `requests` and Pillow are imported normally while runtime capability checks manage warnings and graceful degradation.

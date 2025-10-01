@@ -16,6 +16,11 @@
       "title": "Runtime Optional Dependency Checks",
       "summary": "Handle optional libraries by importing them normally and relying on runtime capability helpers to emit user-facing warnings when dependencies are missing.",
       "applies_to": "python-optional-deps"
+    },
+    {
+      "title": "ACAGi Monolithic Ownership",
+      "summary": "Core task management, background rendering, error console, and repository helper logic now live directly in ACAGi.py; future changes should edit the single file sections instead of Dev_Logic modules.",
+      "applies_to": "acagi-architecture"
     }
   ],
   "procedures": [
