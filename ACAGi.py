@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Agent Virtual Desktop — Codex-Terminal (All-in-One)
-- Virtual Desktop canvas (bright blue), draggable chat/terminal card
-- Local-first Chat (Ollama-only) + OCR/Vision pipeline
-- Dataset persistence (JSONL + embeddings) + user-memory (lightweight)
-- **Codex Rust CLI bridge for Windows**:
-    • Download/verify/launch Codex CLI
-    • Mirror CMD output (snapshots)
-    • Inject text to CMD
-    • **Press Enter reliably** (WriteConsoleInputW + SendInput fallback)
-    • Start/Stop/Show/Hide controls
-    • Tri-state LED (red/yellow/green) for bridge health
+"""ACAGi — unified single-file integration for the autonomous desktop stack.
 
-Requires: PySide6>=6.6, requests, Pillow (optional), local ollama, Windows 10+ for bridge.
+This module is the authoritative integration point: the virtual desktop, chat,
+memory, bridge, and safety subsystems previously maintained as separate scripts
+are now embedded here unless a component is explicitly documented elsewhere.
+Requirements: PySide6>=6.6, requests, Pillow (optional), local ollama, and
+Windows 10+ for the bridge runtime.
 """
 
 from __future__ import annotations
 
-# --- DPI policy MUST be set before QApplication is created ---
+# --- Single-file ACAGi sets DPI policy before QApplication instantiation ---
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import Qt
 
@@ -64,7 +57,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 import token_budget
 
-# Optional deps
+# Optional deps remain co-located within this single-script stack
 try:
     import requests  # type: ignore
 except Exception:
@@ -193,7 +186,7 @@ def install_global_exception_handler(logger: Optional[logging.Logger] = None):
 
     def _hook(exc_type, exc, tb):
         shared_logger.error(
-            "Unhandled exception in Codex Terminal",
+            "Unhandled exception in ACAGi",
             exc_info=(exc_type, exc, tb),
         )
         for handler in shared_logger.handlers:
@@ -5487,7 +5480,7 @@ class TerminalDesktopCanvas(VirtualCanvas):
         self._create_text_file("New Python File", ".py", "#!/usr/bin/env python3\n\n\"\"\"New script.\"\"\"\n\n")
 
     def _new_powershell_desktop(self) -> None:
-        self._create_text_file("New PowerShell Script", ".ps1", "Write-Host 'Hello from Codex Terminal'\n")
+        self._create_text_file("New PowerShell Script", ".ps1", "Write-Host 'Hello from ACAGi'\n")
 
     def _new_zip_desktop(self) -> None:
         try:
@@ -6252,7 +6245,7 @@ def locate_styles_json() -> str:
 def main():
     shared_logger = configure_shared_logger()
     install_global_exception_handler(shared_logger)
-    shared_logger.info("Codex Terminal starting up (pid=%s)", os.getpid())
+    shared_logger.info("ACAGi starting up (pid=%s)", os.getpid())
     for handler in shared_logger.handlers:
         try:
             handler.flush()
