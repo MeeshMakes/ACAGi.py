@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.2] - 2025-10-02
+### Changed
+- Refactored optional dependency handling so `requests` and Pillow are imported normally while runtime capability checks manage warnings and graceful degradation.
+
 ## [0.1.1] - 2025-10-02
 ### Changed
 - Clarified ACAGi's single-file positioning in the module docstring and refreshed status/error messaging to use the ACAGi name.

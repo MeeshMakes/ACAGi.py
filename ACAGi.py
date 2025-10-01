@@ -33,6 +33,8 @@ import base64
 import copy
 import ctypes
 import hashlib
+import importlib
+import importlib.util
 import io
 import json
 import logging
@@ -45,29 +47,33 @@ import shutil
 import subprocess
 import sys
 import threading
-import traceback
 import time
 import traceback
 import uuid
+import warnings
 import zipfile
 from collections import deque
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 import token_budget
 
-# Optional deps remain co-located within this single-script stack
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # surfaced in UI
+# Optional dependencies are resolved via runtime checks instead of guarded imports
+_REQUESTS_MODULE_NAME = "requests"
+_PILLOW_MODULE_NAME = "PIL.Image"
 
-try:
-    from PIL import Image  # type: ignore
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
+if importlib.util.find_spec(_REQUESTS_MODULE_NAME):
+    import requests  # type: ignore  # noqa: F401
+else:
+    requests = None  # type: ignore[assignment]
+
+if importlib.util.find_spec(_PILLOW_MODULE_NAME):
+    from PIL import Image  # type: ignore  # noqa: F401
+else:
+    Image = None  # type: ignore[assignment]
 
 from PySide6.QtCore import (
     QRect,
@@ -127,6 +133,92 @@ from repo_reference_helper import RepoReference, RepoReferenceHelper
 VD_LOGGER_NAME = "VirtualDesktop"
 VD_LOG_FILENAME = "vd_system.log"
 VD_LOG_PATH = Path(__file__).resolve().with_name(VD_LOG_FILENAME)
+
+_DEPENDENCY_LABELS: Dict[str, str] = {
+    _REQUESTS_MODULE_NAME: "requests",
+    _PILLOW_MODULE_NAME: "Pillow",
+}
+_DEPENDENCY_WARNINGS_EMITTED: Set[str] = set()
+
+
+class OptionalDependencyError(RuntimeError):
+    """Raised when an optional module required for a feature is unavailable."""
+
+    def __init__(self, module_name: str, feature: str):
+        self.module_name = module_name
+        self.feature = feature
+        dependency = _DEPENDENCY_LABELS.get(module_name, module_name)
+        message = f"{dependency} not installed"
+        if feature:
+            message = f"{dependency} not installed — required for {feature}"
+        super().__init__(message)
+        self.dependency = dependency
+
+    @property
+    def user_message(self) -> str:
+        """Return the human-readable notification for UI surfaces."""
+
+        return str(self)
+
+
+@lru_cache(maxsize=None)
+def _load_optional_dependency(module_name: str) -> Optional[ModuleType]:
+    """Attempt to import a module, caching the result to avoid repeated probes."""
+
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        return None
+
+
+def dependency_available(module_name: str) -> bool:
+    """Return ``True`` when the optional dependency can be imported."""
+
+    return _load_optional_dependency(module_name) is not None
+
+
+def ensure_dependency(module_name: str, feature: str) -> ModuleType:
+    """Return the imported module or raise :class:`OptionalDependencyError`."""
+
+    module = _load_optional_dependency(module_name)
+    if module is None:
+        raise OptionalDependencyError(module_name, feature)
+    return module
+
+
+def requests_available() -> bool:
+    """Check whether the ``requests`` HTTP client is usable."""
+
+    return dependency_available(_REQUESTS_MODULE_NAME)
+
+
+def ensure_requests(feature: str) -> ModuleType:
+    """Return the ``requests`` module or raise for the given feature context."""
+
+    return ensure_dependency(_REQUESTS_MODULE_NAME, feature)
+
+
+def pillow_available() -> bool:
+    """Check whether Pillow image utilities are usable."""
+
+    return dependency_available(_PILLOW_MODULE_NAME)
+
+
+def ensure_pillow(feature: str) -> ModuleType:
+    """Return the ``PIL.Image`` module or raise for the given feature context."""
+
+    return ensure_dependency(_PILLOW_MODULE_NAME, feature)
+
+
+def notify_dependency_missing(error: OptionalDependencyError) -> None:
+    """Log and warn when an optional module is unavailable for a feature."""
+
+    if error.module_name in _DEPENDENCY_WARNINGS_EMITTED:
+        return
+    logger = logging.getLogger(VD_LOGGER_NAME)
+    logger.warning(error.user_message)
+    warnings.warn(error.user_message, RuntimeWarning, stacklevel=3)
+    _DEPENDENCY_WARNINGS_EMITTED.add(error.module_name)
 
 
 def _shared_log_handler_attached(logger: logging.Logger) -> bool:
@@ -765,24 +857,35 @@ class OllamaClient:
         self.host = host.rstrip("/")
 
     def _http(self) -> bool:
-        return requests is not None
+        return requests_available()
 
     def health(self) -> Tuple[bool, str]:
-        if not self._http():
-            return False, "requests not installed"
         try:
-            r = requests.get(self.host, timeout=3)
+            http = ensure_requests("Ollama HTTP health check")
+        except OptionalDependencyError as exc:
+            notify_dependency_missing(exc)
+            return False, exc.user_message
+        try:
+            r = http.get(self.host, timeout=3)
             return (r.ok, "OK" if r.ok else f"{r.status_code}")
         except Exception as e:
             return False, str(e)
 
     def list_models(self) -> Tuple[bool, List[str], str]:
-        if self._http():
+        try:
+            http = ensure_requests("Ollama model listing")
+        except OptionalDependencyError as exc:
+            notify_dependency_missing(exc)
+        else:
             try:
-                r = requests.get(f"{self.host}/api/tags", timeout=5)
+                r = http.get(f"{self.host}/api/tags", timeout=5)
                 if r.ok:
                     data = r.json()
-                    names = [m.get("name") or m.get("model") for m in data.get("models", []) if m.get("name") or m.get("model")]
+                    names = [
+                        m.get("name") or m.get("model")
+                        for m in data.get("models", [])
+                        if m.get("name") or m.get("model")
+                    ]
                     return True, sorted(set(n for n in names if n)), ""
             except Exception:
                 pass
@@ -796,11 +899,16 @@ class OllamaClient:
             return True, [], ""
 
     def embeddings(self, model: str, text: str) -> Tuple[bool, List[float], str]:
-        if not self._http():
-            return False, [], "requests not installed"
+        try:
+            http = ensure_requests("Ollama embeddings API")
+        except OptionalDependencyError as exc:
+            notify_dependency_missing(exc)
+            return False, [], exc.user_message
         try:
             payload = {"model": model, "input": text}
-            r = requests.post(f"{self.host}/api/embeddings", json=payload, timeout=120)
+            r = http.post(
+                f"{self.host}/api/embeddings", json=payload, timeout=120
+            )
             if not r.ok:
                 return False, [], f"{r.status_code} {r.text[:200]}"
             obj = r.json()
@@ -812,8 +920,11 @@ class OllamaClient:
             return False, [], str(e)
 
     def chat(self, model: str, messages: List[Dict[str, Any]], images: Optional[List[str]] = None) -> Tuple[bool, str, str]:
-        if not self._http():
-            return False, "", "requests not installed"
+        try:
+            http = ensure_requests("Ollama chat API")
+        except OptionalDependencyError as exc:
+            notify_dependency_missing(exc)
+            return False, "", exc.user_message
         try:
             body: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
             if images:
@@ -821,7 +932,12 @@ class OllamaClient:
                     if msg.get("role") == "user":
                         msg["images"] = images
                         break
-            r = requests.post(f"{self.host}/api/chat", json=body, timeout=600, headers={"Content-Type": "application/json"})
+            r = http.post(
+                f"{self.host}/api/chat",
+                json=body,
+                timeout=600,
+                headers={"Content-Type": "application/json"},
+            )
             if not r.ok:
                 return False, "", f"{r.status_code} {r.text[:200]}"
             try:
@@ -3070,24 +3186,32 @@ class ChatInput(QTextEdit):
     def insertFromMimeData(self, source: QMimeData):
         if source.hasImage():
             img = source.imageData()
-            if PIL_AVAILABLE and img:
+            if img:
                 name = f"paste_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
                 out = agent_images_dir() / name
                 ensure_dir(out.parent)
                 try:
-                    if isinstance(img, QImage):
-                        buf = QImage(img).convertToFormat(QImage.Format_RGBA8888)
-                        ptr = buf.constBits()
-                        ptr.setsize(buf.sizeInBytes())
-                        pil = Image.frombytes("RGBA", (buf.width(), buf.height()), bytes(ptr))
-                    else:
-                        raise RuntimeError("Unsupported image type from clipboard")
-                    pil = pil.convert("RGBA")
-                    pil.save(out, "PNG", optimize=True)
-                    self.imagesReady.emit([out])
-                    return
-                except Exception as e:
-                    QMessageBox.warning(self, "Paste Image", f"Failed to paste image: {e}")
+                    image_module = ensure_pillow("clipboard image paste")
+                except OptionalDependencyError as exc:
+                    notify_dependency_missing(exc)
+                    QMessageBox.warning(self, "Paste Image", exc.user_message)
+                else:
+                    try:
+                        if isinstance(img, QImage):
+                            buf = QImage(img).convertToFormat(QImage.Format_RGBA8888)
+                            ptr = buf.constBits()
+                            ptr.setsize(buf.sizeInBytes())
+                            pil_image = image_module.frombytes(
+                                "RGBA", (buf.width(), buf.height()), bytes(ptr)
+                            )
+                        else:
+                            raise RuntimeError("Unsupported image type from clipboard")
+                        pil_image = pil_image.convert("RGBA")
+                        pil_image.save(out, "PNG", optimize=True)
+                        self.imagesReady.emit([out])
+                        return
+                    except Exception as e:
+                        QMessageBox.warning(self, "Paste Image", f"Failed to paste image: {e}")
         if source.hasUrls():
             imgs: List[Path] = []
             for url in source.urls():
@@ -3997,11 +4121,15 @@ class ChatCard(QFrame):
     def _convert_to_png(self, p: Path) -> Path:
         out = agent_images_dir() / (slug(p.stem) + ".png")
         ensure_dir(out.parent)
-        if PIL_AVAILABLE:
-            with Image.open(p) as im:
-                im = im.convert("RGBA"); im.save(out, "PNG", optimize=True)
-        else:
+        try:
+            image_module = ensure_pillow("image conversion")
+        except OptionalDependencyError as exc:
+            notify_dependency_missing(exc)
             shutil.copy2(p, out)
+        else:
+            with image_module.open(p) as im:
+                im = im.convert("RGBA")
+                im.save(out, "PNG", optimize=True)
         return out
 
     # ----- local reply flow -----

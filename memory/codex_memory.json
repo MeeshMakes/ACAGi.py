@@ -11,6 +11,11 @@
       "title": "Session Logging Discipline",
       "summary": "Every working session must produce a log in logs/session_<date>.md capturing objectives, context, and follow-up prompts.",
       "applies_to": "workflow"
+    },
+    {
+      "title": "Runtime Optional Dependency Checks",
+      "summary": "Handle optional libraries by importing them normally and relying on runtime capability helpers to emit user-facing warnings when dependencies are missing.",
+      "applies_to": "python-optional-deps"
     }
   ],
   "procedures": [
