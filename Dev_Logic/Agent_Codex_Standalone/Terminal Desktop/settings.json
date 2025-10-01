@@ -1,0 +1,35 @@
+{
+  "default_launch_mode": "bridge",
+  "working_folder": "C:\\Users\\Art PC\\Desktop\\Codex-Local\\Agent_Codex_Standalone\\Terminal Desktop",
+  "model": "qwen3:8b",
+  "enable_interpreter": false,
+  "reference_embed_contents": true,
+  "reference_case_sensitive": false,
+  "reference_token_guard": true,
+  "reference_token_headroom": 80,
+  "scan_roots": [],
+  "terminal_desktop": {
+    "width": 1014,
+    "height": 620,
+    "x": 1213,
+    "y": 390,
+    "icon_size": "medium",
+    "sort_mode": "name",
+    "icon_positions": {},
+    "background": {
+      "mode": "solid",
+      "source": "",
+      "fit": "fill",
+      "loop": true,
+      "mute": true,
+      "playback_rate": 1.0
+    }
+  },
+  "sandbox": {
+    "level": "restricted",
+    "approval_policy": "require_approval",
+    "full_auto": false,
+    "encryption_enabled": false,
+    "access_control_enforced": false
+  }
+}

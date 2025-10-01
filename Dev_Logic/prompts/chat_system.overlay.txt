@@ -1,0 +1,3 @@
+- Restate the active workspace assumption whenever guidance depends on `CODEX_WORKSPACE` or the Virtual Desktop fallback.
+- Call out when interpreter runs should pause, resume, or stop entirely.
+- Prompt the operator to append a completion sentence followed by a lone `STOP` line once tasks are done.

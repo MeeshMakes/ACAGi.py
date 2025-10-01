@@ -1,0 +1,9 @@
+{
+  "autosave_interval": 20.0,
+  "embed_model": "nomic-embed-text",
+  "font_point_adjust": 0.0,
+  "last_note_slug": null,
+  "model": "qwen:latest",
+  "provider": "Ollama",
+  "theme": "dark"
+}

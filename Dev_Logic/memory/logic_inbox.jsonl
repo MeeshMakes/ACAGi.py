@@ -1,0 +1,70 @@
+{"timestamp":"2025-09-30T18:00:00Z","status":"done","summary":"Implemented Error Center log tail with per-tab filtering and task links."}
+{"timestamp":"2025-09-30T19:00:00Z","status":"done","summary":"Reviewed architecture doc and added Editor logic summarizer with markdown export."}
+{"timestamp":"2025-09-30T20:30:00Z","status":"done","summary":"Rewrapped regression test lines to satisfy flake8 and confirmed validation suite."}
+{"timestamp":"2025-10-01T00:00:00Z","status":"done","summary":"Upgraded Editor card with chat, notes, syntax highlighting, and Virtual Desktop storage wiring."}
+{"timestamp":"2025-09-17T01:49:10.825165Z","status":"done","summary":"Implement Virtual Desktop card centering, taskbar icon grouping, Start search facets, containment guard, and Explorer thumbnails."}
+{"timestamp":"2025-09-17T02:03:11.952241Z","status":"done","summary":"Implemented Virtual Desktop card centering, taskbar icon grouping, Start search facets, containment guard, and Explorer thumbnails."}
+{"timestamp":"2025-10-04T00:00:00Z","status":"done","summary":"Implemented Virtual Desktop background manager with selectable image/GIF/video/GL layers and updated settings/context menu."}
+{"timestamp":"2025-10-05T00:00:00Z","status":"done","summary":"Added desktop New templates, sort controls, and settings-section focus links."}
+{"timestamp":"2025-10-06T00:00:00Z","status":"done","summary":"Built LiveScript GL viewport with hot reload/FPS cap, added controller tests, documented design."}
+{"timestamp":"2025-10-07T00:00:00Z","status":"done","summary":"Persisted Error Center records into datasets/errors.jsonl with category metadata."}
+{"timestamp":"2025-10-08T00:00:00Z","status":"done","summary":"Added terminal safety guardrails with confirmation prompts and Error Center logging."}
+{"timestamp":"2025-10-09T00:00:00Z","status":"done","summary":"Audited governance assets; verified sentinel/watch workflows and memory files remain present."}
+{"timestamp":"2025-10-10T00:00:00Z","status":"done","summary":"Implemented repository indexing CLI with embeddings and regression tests."}
+{"timestamp":"2025-10-10T12:00:00Z","status":"done","summary":"Implemented session-aware conversation log archival with rollover metadata."}
+{"timestamp":"2025-10-10T18:00:00Z","status":"done","summary":"Externalized agent prompts with overlay loader and settings access."}
+{"timestamp":"2025-10-11T00:00:00Z","status":"done","summary":"Added system metrics collector, SQLite persistence, and scheduled refresh publication."}
+{"timestamp":"2025-10-11T12:00:00Z","status":"done","summary":"Refactored system metrics persistence through metrics_manager with runtime scoring and tests."}
+{"timestamp":"2025-10-11T18:00:00Z","status":"done","summary":"Added Virtual Desktop System Overview card with metrics filters, charts, Start launch, and auto-refresh hooks."}
+{"timestamp":"2025-10-12T00:00:00Z","status":"done","summary":"Pinned the System Overview launcher in Start and ensured the desktop core opens the metrics card with persistence."}
+{"timestamp":"2025-10-12T12:00:00Z","status":"done","summary":"Adjust Codex Terminal to skip its desktop when embedded, create Terminal Desktop workspace folder, and add regression coverage."}
+{"timestamp":"2025-10-12T18:00:00Z","status":"done","summary":"Enabled resizable Terminal Desktop with persistent geometry and expanded chat card minimums for the Tasks drawer."}
+{"timestamp": "2025-10-13T00:00:00Z", "status": "done", "summary": "Refactored ChatCard to use a themed ConversationView that renders inline think content, attachments, and Codex bridge statuses while keeping logging intact."}
+{"timestamp":"2025-10-14T00:00:00Z","status":"done","summary":"Implemented Codex approval prompt parser and widget with regression tests."}
+{"timestamp":"2025-10-15T00:00:00Z","status":"done","summary":"Added sandbox defaults and Settings dialog sandbox card with persisted selections."}
+{"timestamp":"2025-10-16T00:00:00Z","status":"done","summary":"Added global card scaling controls with settings UI and geometry persistence updates."}
+{"timestamp": "2025-09-17T11:13:48.210527+00:00", "status": "done", "summary": "Refined Settings dialog tab styling to improve tab legibility."}
+{"timestamp": "2025-09-17T11:25:12Z", "status": "done", "summary": "Aligned terminal desktop geometry restore with centered fallback and regression coverage."}
+{"timestamp":"2025-10-20T00:00:00Z","status":"done","summary":"Persisted Virtual Desktop taskbar side, updated docking/Start panel geometry, added Windows offset helper, scaffolded Dev_Logic ledger folders, and wrote geometry tests."}
+{"timestamp":"2025-10-21T00:00:00Z","status":"done","summary":"Adjusted StartPanel search reset to rebuild placeholder labels per run; noted PySide6 missing so Qt-dependent tests fail."}
+{"timestamp":"2025-10-22T00:00:00Z","status":"done","summary":"Rewired Virtual Desktop SettingsPanel close button to call VirtualDesktopCore._close_settings directly."}
+{"timestamp":"2025-10-23T00:00:00Z","status":"done","summary":"Updated Settings dialog group box titles and labels to share the light theme foreground."}
+{"timestamp": "2025-09-18T16:25:22+00:00", "status": "done", "summary": "Persisted interpreter toggle across settings, surfaced runtime slider controls, and documented PySide6 test gaps."}
+{"timestamp": "2025-10-25T00:00:00Z", "status": "done", "summary": "Extended interpreter toggle regression coverage to ensure offline tooltip copy and disabled state."}
+{"timestamp": "2025-10-26T00:00:00+00:00", "status": "done", "summary": "Linked Tasks panel load action to conversation lookup and ChatCard hydration pipeline."}
+{"timestamp":"2025-10-24T00:00:00Z","status":"done","summary":"Refreshed interpreter prompts, loader defaults, and voice guidance to enforce STOP completion signals."}
+{"timestamp":"2025-10-27T00:00:00Z","status":"done","summary":"Hardened Codex approval prompt parsing to display Select/Choose options and added regression coverage."}
+{"timestamp":"2025-10-28T00:00:00Z","status":"done","summary":"Added User Guided Notes card with Qt UI, notes persistence, deterministic embeddings, and export routines; documented missing PySide6 blocking Qt tests."}
+{"timestamp": "2025-09-19T04:32:13.999973+00:00", "status": "done", "summary": "Ensure Codex bridge launch uses the saved working folder when valid and defaults to Codex-Transit otherwise; added monkeypatched regression tests."}
+{"timestamp":"2025-10-31T00:00:00Z","status":"done","summary":"Added pane toggle toolbar to User Guided Notes with per-note visibility persistence."}
+{"timestamp":"2025-10-31T00:00:00Z","status":"done","summary":"Add repo reference helper with ChatInput suggestions and metadata logging."}
+{"timestamp": "2025-11-01T00:00:00Z", "status": "done", "summary": "Start panel cursor-exit auto-dismiss wired into VirtualDesktopCore with regression tests; environment still lacks flake8 and PySide6 so Qt suite fails during validation."}
+{"timestamp":"2025-11-02T00:00:00Z","status":"done","summary":"Implemented ProcessErrorCard to capture subprocess stderr, append ErrorCenter records, and emit isolation toasts; flake8 binary and PySide6 remain unavailable so Qt validations fail."}
+{"timestamp":"2025-11-03T12:00:00Z","status":"done","summary":"Prevented Codex approval tokens from appearing in chat output and added regression tests."}
+{"timestamp":"2025-11-04T00:00:00Z","status":"done","summary":"Documented Guru Codex chat persona updates covering workspace precedence, approval token etiquette, repository visibility, citations, and safety guardrails."}
+{"timestamp": "2025-09-20T16:51:27.350089+00:00", "status": "done", "summary": "Adjusted Virtual Desktop canvas sync to subtract Windows taskbar height only when maximized (not fullscreen) and expanded geometry tests."}
+{"timestamp":"2025-11-07T00:00:00Z","status":"done","summary":"Refined Virtual Desktop fit scheduling with in-progress guard, screen-change queueing, and geometry alignment skip; flake8 and PySide6 remain missing for validation."}
+{"timestamp":"2025-11-07T12:05:00Z","status":"done","summary":"Added User Guided Notes pop-out toggle with Virtual Desktop hand-off and updated Qt tests."}
+{"timestamp":"2025-11-08T00:00:00Z","status":"done","summary":"Refreshed User Guided Notes theme helper with light/dark palettes, font scaling toggle, and layout tuning; validation blocked by missing PySide6/flake8."}
+{"timestamp": "2025-09-21T04:12:47.019747+00:00", "status": "done", "summary": "Adjusted Virtual Desktop maximize fit to compare client geometry with tolerance so Windows launch no longer toggles states."}
+
+{"timestamp": "2025-09-21T08:54:12.201054+00:00", "status": "done", "summary": "Adjusted Virtual Desktop layout margins so Windows taskbar offsets no longer double the horizontal thickness."}
+{"timestamp":"2025-09-21T09:02:28Z","status":"done","summary":"Aligned desktop icon drag snapping with shared grid origin and documented validation gaps (flake8, PySide6)."}
+{"timestamp":"2025-11-12T18:00:00Z","status":"done","summary":"Embed Windows GUI apps via ExternalAppCard and update Virtual Desktop process loading fallback."}
+{"timestamp":"2025-11-13T00:00:00Z","status":"done","summary":"Limit DesktopIcon single-clicks to selection while keeping double-click open behavior."}
+{"timestamp":"2025-11-14T00:00:00Z","status":"done","summary":"Refreshed DesktopIcon hover/selection UI, QFileInfo tooltip details, and QDrag reposition workflow; validation blocked by missing flake8/PySide6."}
+{"timestamp":"2025-11-16T00:00:00Z","status":"done","summary":"Restructured StartPanel pinned area into list + icon grid with synced type labels; validation blocked by missing PySide6/flake8."}
+{"timestamp":"2025-11-17T00:00:00Z","status":"done","summary":"Persist Start menu close preference with Click Off vs Auto Close modes, add settings controls, and wire global click dismissal."}
+{"timestamp":"2025-11-18T00:00:00Z","status":"done","summary":"Resolved DesktopCanvas core lookup with weakref caching and routed icon opens/context menu to VirtualDesktopCore.open_any_path."}
+{"timestamp": "2025-09-22T00:40:35Z", "status": "done", "summary": "Retitled Settings panel/card to \"Virtual Desktop Settings\" and logged design/testing context; flake8 binary and PySide6 deps still missing."}
+{"timestamp":"2025-11-20T00:00:00Z","status":"done","summary":"Expose desktop sort order control in Settings and refresh canvas arrangement."}
+{"timestamp":"2025-11-21T00:00:00Z","status":"done","summary":"Refreshed StartPanel sidebar to show recent recommendations with compact icons while preserving pinned grid selection; validation blocked by missing PySide6/flake8."}
+{"timestamp":"2025-11-24T00:00:00Z","status":"done","summary":"Make ExternalAppCard embed timeout configurable and add Windows regression coverage for slow embeds."}
+{"timestamp":"2025-11-25T00:00:00Z","status":"done","summary":"Accept DesktopCanvas URL drops, copy into VDSK_ROOT, refresh icons, and cover with Qt drop regression."}
+{"timestamp":"2025-11-26T00:00:00Z","status":"done","summary":"Trimmed StartPanel pinned layout minimums to let recommendations and pinned grid share width responsively; validation pending missing PySide6/flake8."}
+{"timestamp":"2025-11-27T00:00:00Z","status":"done","summary":"Updated StartPanel pinned buttons to show text under icons with expanded sizing; design doc captured and validations note missing PySide6/flake8."}
+{"timestamp":"2025-10-02T00:00:00Z","status":"done","summary":"Resolved Windows document association launching by resolving associated executables and adding Windows regression coverage; validations blocked by missing PySide6/flake8."}
+{"timestamp":"2025-11-28T00:00:00Z","status":"done","summary":"Cache StartPanel path icons via helper with Blender regression; PySide6 missing for Qt tests."}
+{"timestamp":"2025-11-29T00:00:00Z","status":"done","summary":"Enforced single-card behavior for Virtual Desktop cards and added regression coverage ensuring replacements close prior cards."}
+{"timestamp":"2025-11-30T00:00:00Z","status":"done","summary":"Cleared Virtual Desktop card drag drop-shadow trails by repainting cached effect bounds."}
+{"timestamp":"2025-12-02T00:00:00Z","status":"done","summary":"Seeded Virtual_Desktop workspace with starter assets and documentation."}

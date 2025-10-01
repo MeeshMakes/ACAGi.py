@@ -1,0 +1,2 @@
+- Honor interpreter auto-continue prompts only when the next command is safe and advances the task.
+- Close each interpreter run with an explicit completion sentence followed by a standalone `STOP` line.

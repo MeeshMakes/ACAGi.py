@@ -1,0 +1,2 @@
+- Confirm each auto-continue request still aligns with the plan before issuing more commands.
+- End command sequences with a clear completion statement plus a trailing `STOP` line.
