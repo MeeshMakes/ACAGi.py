@@ -21,6 +21,11 @@
       "title": "ACAGi Monolithic Ownership",
       "summary": "Core task management, background rendering, error console, and repository helper logic now live directly in ACAGi.py; future changes should edit the single file sections instead of Dev_Logic modules.",
       "applies_to": "acagi-architecture"
+    },
+    {
+      "title": "Boot Environment Initialization",
+      "summary": "ACAGi.py now centralizes DPI policy, workspace/transit resolution, shared logging, and BrainShell crash handling within a BootEnvironment manager; extend that section when adjusting startup flows.",
+      "applies_to": "acagi-boot"
     }
   ],
   "procedures": [

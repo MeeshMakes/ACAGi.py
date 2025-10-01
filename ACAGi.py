@@ -11,22 +11,8 @@ Windows 10+ for the bridge runtime.
 
 from __future__ import annotations
 
-# --- Single-file ACAGi sets DPI policy before QApplication instantiation ---
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import Qt
-
-
-def _ensure_high_dpi_rounding_policy() -> None:
-    """Apply the pass-through rounding policy before a QApplication exists."""
-
-    if QGuiApplication.instance() is not None:
-        return
-    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-
-
-_ensure_high_dpi_rounding_policy()
 
 import argparse
 import base64
@@ -60,7 +46,7 @@ from enum import Enum
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from types import ModuleType
+from types import ModuleType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -166,9 +152,443 @@ from safety import SafetyViolation, manager as safety_manager
 from image_pipeline import analyze_image, perform_ocr
 from prompt_loader import get_prompt_watcher, iter_prompt_definitions, prompt_text
 
+
+# ============================================================================
+# Boot & Environment
+# ============================================================================
+
+APP_NAME = "Agent Virtual Desktop — Codex-Terminal"
 VD_LOGGER_NAME = "VirtualDesktop"
 VD_LOG_FILENAME = "vd_system.log"
-VD_LOG_PATH = Path(__file__).resolve().with_name(VD_LOG_FILENAME)
+VD_LOG_PATH: Path = Path()
+Excepthook = Callable[
+    [type[BaseException], BaseException, Optional[TracebackType]],
+    None,
+]
+_ORIGINAL_EXCEPTHOOK: Optional[Excepthook] = None
+
+
+def _ensure_high_dpi_rounding_policy() -> None:
+    """Apply pass-through DPI rounding before any QApplication is created."""
+
+    if QGuiApplication.instance() is not None:
+        return
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+
+_ensure_high_dpi_rounding_policy()
+
+
+def here() -> Path:
+    """Return the directory containing this script."""
+
+    return Path(__file__).resolve().parent
+
+
+def _resolve_directory(path: Path) -> Path:
+    """Expand, resolve, and create the provided directory path."""
+
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:
+        resolved = path.expanduser()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _default_workspace_path() -> Path:
+    """Compute the fallback workspace root when no override is provided."""
+
+    return here() / "Agent_Codex_Standalone"
+
+
+def _legacy_transit_candidates() -> list[Path]:
+    """Historical transit directories migrated into the current workspace."""
+
+    return [here() / "Codex-Transit"]
+
+
+def _migrate_legacy_transit(target: Path) -> None:
+    """Fold any legacy transit directories into the target directory."""
+
+    for legacy in _legacy_transit_candidates():
+        if not legacy.exists() or not legacy.is_dir():
+            continue
+        try:
+            if legacy.resolve() == target.resolve():
+                continue
+        except Exception:
+            pass
+
+        if not target.exists():
+            try:
+                legacy.rename(target)
+                continue
+            except OSError:
+                pass
+
+        target.mkdir(parents=True, exist_ok=True)
+
+        for child in list(legacy.iterdir()):
+            destination = target / child.name
+            if destination.exists():
+                continue
+            try:
+                child.rename(destination)
+            except OSError:
+                shutil.move(str(child), str(destination))
+
+        try:
+            legacy.rmdir()
+        except OSError:
+            pass
+
+
+def _shared_file_handler_attached(logger: logging.Logger, *, path: Path) -> bool:
+    """Return ``True`` if the logger already writes to the requested path."""
+
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            try:
+                if Path(handler.baseFilename).resolve() == path.resolve():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def configure_shared_logger(*, log_path: Optional[Path] = None) -> logging.Logger:
+    """Attach a file handler targeting ``vd_system.log`` and return the logger."""
+
+    logger = logging.getLogger(VD_LOGGER_NAME)
+    target_path = log_path
+    if target_path is None:
+        default_path = _default_workspace_path() / VD_LOG_FILENAME
+        target_path = VD_LOG_PATH if VD_LOG_PATH else default_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not _shared_file_handler_attached(logger, path=target_path):
+        for handler in list(logger.handlers):
+            if isinstance(handler, logging.FileHandler):
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+        file_handler = logging.FileHandler(target_path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        logger.addHandler(file_handler)
+
+    if logger.level == logging.NOTSET:
+        logger.setLevel(logging.INFO)
+    return logger
+
+
+class BrainShellCrashDialog(QDialog):
+    """High-contrast crash dialog surfaced when BrainShell hits a fatal error."""
+
+    def __init__(
+        self,
+        details: str,
+        *,
+        log_path: Optional[Path] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("BrainShell — Crash Report")
+        self.setModal(True)
+        self.resize(960, 600)
+        self.setObjectName("BrainShellCrashDialog")
+        self.setStyleSheet(
+            """
+            QDialog#BrainShellCrashDialog {
+                background-color: #0b1120;
+                color: #f8fafc;
+            }
+            QLabel#CrashTitle {
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#CrashSubtitle {
+                color: #cbd5f5;
+            }
+            QTextBrowser {
+                background-color: #020817;
+                color: #e2e8f0;
+                font-family: "Fira Code", "Source Code Pro", monospace;
+                border: 1px solid #1e293b;
+            }
+            QPushButton {
+                background-color: #1d4ed8;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("BrainShell encountered an unrecoverable error.", self)
+        title.setObjectName("CrashTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        subtitle_text = "A fatal exception was captured. Review the log and details below."
+        if log_path:
+            subtitle_text = f"A fatal exception was captured. System log: {log_path}"
+        subtitle = QLabel(subtitle_text, self)
+        subtitle.setObjectName("CrashSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        self.details = QTextBrowser(self)
+        self.details.setPlainText(details)
+        self.details.setReadOnly(True)
+        layout.addWidget(self.details, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+
+        copy_btn = QPushButton("Copy Details", self)
+        copy_btn.clicked.connect(self._copy_details)  # type: ignore[arg-type]
+        buttons.addWidget(copy_btn)
+
+        close_btn = QPushButton("Exit BrainShell", self)
+        close_btn.clicked.connect(self.accept)  # type: ignore[arg-type]
+        buttons.addWidget(close_btn)
+
+        layout.addLayout(buttons)
+
+    def _copy_details(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        clipboard = app.clipboard()
+        clipboard.setText(self.details.toPlainText())
+
+
+def install_global_exception_handler(logger: logging.Logger, *, log_path: Optional[Path] = None) -> None:
+    """Install a BrainShell-aligned crash handler capturing unhandled exceptions."""
+
+    global _ORIGINAL_EXCEPTHOOK
+    if _ORIGINAL_EXCEPTHOOK is None:
+        _ORIGINAL_EXCEPTHOOK = sys.excepthook
+
+    def _hook(exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None) -> None:
+        logger.error("Unhandled exception in ACAGi", exc_info=(exc_type, exc, tb))
+        for handler in logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                continue
+
+        details = "".join(traceback.format_exception(exc_type, exc, tb))
+        app = QApplication.instance()
+        if app is None:
+            try:
+                stderr = sys.stderr
+                stderr.write("Unhandled exception in ACAGi.\n")
+                stderr.write(details)
+                stderr.flush()
+            except Exception:
+                pass
+        else:
+            try:
+                dialog = BrainShellCrashDialog(details, log_path=log_path)
+                dialog.exec()
+            except Exception:
+                logger.error("Failed to display BrainShell crash dialog", exc_info=True)
+
+        if _ORIGINAL_EXCEPTHOOK and _ORIGINAL_EXCEPTHOOK is not _hook:
+            _ORIGINAL_EXCEPTHOOK(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+class BootEnvironment:
+    """Manage workspace, transit, logging, and crash capture bootstrapping."""
+
+    def __init__(self) -> None:
+        self.workspace: Path = Path()
+        self.transit: Path = Path()
+        self.agent_root: Path = Path()
+        self.logs_root: Path = Path()
+        self.log_path: Path = Path()
+        self.logger: logging.Logger = logging.getLogger(VD_LOGGER_NAME)
+        self.refresh()
+
+    def refresh(self) -> logging.Logger:
+        workspace = self._resolve_workspace()
+        transit = self._resolve_transit(workspace)
+        agent_root = workspace / ".codex_agent"
+        agent_root.mkdir(parents=True, exist_ok=True)
+        logs_root = agent_root / "logs"
+        logs_root.mkdir(parents=True, exist_ok=True)
+        log_path = logs_root / VD_LOG_FILENAME
+
+        logger = configure_shared_logger(log_path=log_path)
+        install_global_exception_handler(logger, log_path=log_path)
+
+        self.workspace = workspace
+        self.transit = transit
+        self.agent_root = agent_root
+        self.logs_root = logs_root
+        self.log_path = log_path
+        self.logger = logger
+
+        global VD_LOG_PATH
+        VD_LOG_PATH = log_path
+
+        return logger
+
+    def agent_subdir(self, name: str) -> Path:
+        subdir = self.agent_root / name
+        subdir.mkdir(parents=True, exist_ok=True)
+        return subdir
+
+    def _resolve_workspace(self) -> Path:
+        override = os.environ.get("CODEX_WORKSPACE", "").strip()
+        if override:
+            return _resolve_directory(Path(override))
+        return _resolve_directory(_default_workspace_path())
+
+    def _resolve_transit(self, workspace: Path) -> Path:
+        target = workspace / "Terminal Desktop"
+        _migrate_legacy_transit(target)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+
+BOOT_ENV = BootEnvironment()
+
+
+def base_dir() -> Path:
+    """Return the active workspace root for backwards compatibility."""
+
+    return BOOT_ENV.workspace
+
+
+def workspace_root() -> Path:
+    """Expose the currently resolved workspace directory."""
+
+    return BOOT_ENV.workspace
+
+
+def agent_data_root() -> Path:
+    """Directory scoped to Codex-managed assets inside the workspace."""
+
+    return BOOT_ENV.agent_root
+
+
+def agent_logs_dir() -> Path:
+    """Location of the agent's persistent log directory."""
+
+    return BOOT_ENV.logs_root
+
+
+def transit_dir() -> Path:
+    """Return the active transit directory used by the Terminal Desktop."""
+
+    return BOOT_ENV.transit
+
+
+def shared_logger() -> logging.Logger:
+    """Retrieve the shared Virtual Desktop logger instance."""
+
+    return BOOT_ENV.logger
+
+
+def _agent_subdir(name: str) -> Path:
+    return BOOT_ENV.agent_subdir(name)
+
+
+def agent_images_dir() -> Path:
+    return _agent_subdir("images")
+
+
+def agent_sessions_dir() -> Path:
+    return _agent_subdir("sessions")
+
+
+def agent_archives_dir() -> Path:
+    return _agent_subdir("archives")
+
+
+def agent_data_dir() -> Path:
+    return _agent_subdir("data")
+
+
+def agent_lexicons_dir() -> Path:
+    return _agent_subdir("lexicons")
+
+
+for _name in ("images", "sessions", "logs", "archives", "data", "lexicons"):
+    _agent_subdir(_name)
+
+
+def _clamp_to_agent_subdir(raw: Optional[Path | str], *, subdir: Path) -> Path:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return subdir
+
+    try:
+        candidate = Path(raw).expanduser()
+    except Exception:
+        return subdir
+
+    if not candidate.is_absolute():
+        candidate = subdir / candidate
+
+    try:
+        resolved = candidate.resolve(strict=False)
+    except Exception:
+        resolved = candidate
+
+    try:
+        agent_root = agent_data_root().resolve(strict=False)
+    except Exception:
+        agent_root = agent_data_root()
+
+    if resolved == agent_root or agent_root in resolved.parents:
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
+
+    target = subdir / resolved.name
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def styles_path() -> Path:
+    p = here() / "Styles"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / "advanced_styles.json"
+
+
+def terminal_desktop_dir() -> Path:
+    """Location for the standalone terminal's desktop workspace."""
+
+    return transit_dir()
+
+
+def lexicons_dir() -> Path:
+    return agent_lexicons_dir()
+
+
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 _DEPENDENCY_LABELS: Dict[str, str] = {
     _REQUESTS_MODULE_NAME: "requests",
@@ -2637,253 +3057,6 @@ def notify_dependency_missing(error: OptionalDependencyError) -> None:
     logger.warning(error.user_message)
     warnings.warn(error.user_message, RuntimeWarning, stacklevel=3)
     _DEPENDENCY_WARNINGS_EMITTED.add(error.module_name)
-
-
-def _shared_log_handler_attached(logger: logging.Logger) -> bool:
-    for handler in logger.handlers:
-        if isinstance(handler, logging.FileHandler):
-            try:
-                if Path(handler.baseFilename).resolve() == VD_LOG_PATH:
-                    return True
-            except Exception:
-                continue
-    return False
-
-
-def configure_shared_logger() -> logging.Logger:
-    """Return a logger that writes to the shared Virtual Desktop log file."""
-
-    logger = logging.getLogger(VD_LOGGER_NAME)
-    if not _shared_log_handler_attached(logger):
-        VD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(VD_LOG_PATH, mode="a", encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(handler)
-    if logger.level == logging.NOTSET:
-        logger.setLevel(logging.INFO)
-    return logger
-
-# --------------------------------------------------------------------------------------
-# Crash capture
-# --------------------------------------------------------------------------------------
-
-class ErrorPopup(QDialog):
-    def __init__(self, title: str, message: str, details: str, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setModal(True)
-        self.resize(900, 580)
-        layout = QVBoxLayout(self)
-
-        msg = QLabel(message, self); msg.setWordWrap(True)
-        layout.addWidget(msg)
-
-        self.details = QTextBrowser(self)
-        self.details.setPlainText(details)
-        self.details.setReadOnly(True)
-        layout.addWidget(self.details, 1)
-
-        btns = QHBoxLayout()
-        copy_btn = QPushButton("Copy to Clipboard", self)
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.details.toPlainText()))
-        close_btn = QPushButton("Close", self)
-        close_btn.clicked.connect(self.accept)
-        btns.addStretch(1); btns.addWidget(copy_btn); btns.addWidget(close_btn)
-        layout.addLayout(btns)
-
-def install_global_exception_handler(logger: Optional[logging.Logger] = None):
-    shared_logger = logger or configure_shared_logger()
-
-    def _hook(exc_type, exc, tb):
-        shared_logger.error(
-            "Unhandled exception in ACAGi",
-            exc_info=(exc_type, exc, tb),
-        )
-        for handler in shared_logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                continue
-
-        text = "".join(traceback.format_exception(exc_type, exc, tb))
-        try:
-            dlg = ErrorPopup("Unhandled Error", "An unexpected error occurred.", text)
-            dlg.exec()
-        except Exception:
-            shared_logger.error(
-                "Failed to display unhandled error dialog",
-                exc_info=True,
-            )
-
-    sys.excepthook = _hook
-
-# --------------------------------------------------------------------------------------
-# Paths / constants
-# --------------------------------------------------------------------------------------
-
-APP_NAME = "Agent Virtual Desktop — Codex-Terminal"
-
-def here() -> Path:
-    return Path(os.path.abspath(os.path.dirname(__file__)))
-
-def _resolve_directory(path: Path) -> Path:
-    try:
-        resolved = path.expanduser().resolve()
-    except Exception:
-        resolved = path.expanduser()
-    resolved.mkdir(parents=True, exist_ok=True)
-    return resolved
-
-
-def base_dir() -> Path:
-    env = os.environ.get("CODEX_WORKSPACE")
-    if env:
-        try:
-            return _resolve_directory(Path(env))
-        except Exception:
-            pass
-    fallback = Path(__file__).resolve().with_name("Agent_Codex_Standalone")
-    return _resolve_directory(fallback)
-
-
-def workspace_root() -> Path:
-    return base_dir()
-
-
-def agent_data_root() -> Path:
-    """Root directory scoped to the workspace for Codex-managed assets."""
-
-    root = workspace_root() / ".codex_agent"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _agent_subdir(name: str) -> Path:
-    path = agent_data_root() / name
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def agent_images_dir() -> Path:
-    return _agent_subdir("images")
-
-
-def agent_sessions_dir() -> Path:
-    return _agent_subdir("sessions")
-
-
-def agent_logs_dir() -> Path:
-    return _agent_subdir("logs")
-
-
-def agent_archives_dir() -> Path:
-    return _agent_subdir("archives")
-
-
-def agent_data_dir() -> Path:
-    return _agent_subdir("data")
-
-
-def agent_lexicons_dir() -> Path:
-    return _agent_subdir("lexicons")
-
-
-for _name in ("images", "sessions", "logs", "archives", "data", "lexicons"):
-    _agent_subdir(_name)
-
-
-def _clamp_to_agent_subdir(raw: Optional[Path | str], *, subdir: Path) -> Path:
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return subdir
-
-    try:
-        candidate = Path(raw).expanduser()
-    except Exception:
-        return subdir
-
-    if not candidate.is_absolute():
-        candidate = subdir / candidate
-
-    try:
-        resolved = candidate.resolve(strict=False)
-    except Exception:
-        resolved = candidate
-
-    try:
-        agent_root = agent_data_root().resolve(strict=False)
-    except Exception:
-        agent_root = agent_data_root()
-
-    if resolved == agent_root or agent_root in resolved.parents:
-        resolved.mkdir(parents=True, exist_ok=True)
-        return resolved
-
-    target = subdir / resolved.name
-    target.mkdir(parents=True, exist_ok=True)
-    return target
-
-
-def styles_path() -> Path:
-    p = here() / "Styles"
-    p.mkdir(parents=True, exist_ok=True)
-    return p / "advanced_styles.json"
-
-def _legacy_transit_candidates() -> list[Path]:
-    return [here() / "Codex-Transit"]
-
-
-def _migrate_legacy_transit(target: Path) -> None:
-    for legacy in _legacy_transit_candidates():
-        if not legacy.exists() or not legacy.is_dir():
-            continue
-        try:
-            if legacy.resolve() == target.resolve():
-                continue
-        except Exception:
-            pass
-
-        if not target.exists():
-            try:
-                legacy.rename(target)
-                return
-            except OSError:
-                pass
-
-        target.mkdir(parents=True, exist_ok=True)
-
-        for child in list(legacy.iterdir()):
-            destination = target / child.name
-            if destination.exists():
-                continue
-            try:
-                child.rename(destination)
-            except OSError:
-                shutil.move(str(child), str(destination))
-
-        try:
-            legacy.rmdir()
-        except OSError:
-            pass
-
-
-def transit_dir() -> Path:
-    target = workspace_root() / "Terminal Desktop"
-    _migrate_legacy_transit(target)
-    target.mkdir(parents=True, exist_ok=True)
-    return target
-
-
-def terminal_desktop_dir() -> Path:
-    """Location for the standalone terminal's desktop workspace."""
-    return transit_dir()
-
-def lexicons_dir() -> Path:
-    return agent_lexicons_dir()
-
-def ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
 MEMORY_PATH = here() / "memory" / "codex_memory.json"
 MEMORY_LOCK = threading.Lock()
 
@@ -8789,10 +8962,9 @@ def locate_styles_json() -> str:
     return str(p) if p.is_file() else ""
 
 def main():
-    shared_logger = configure_shared_logger()
-    install_global_exception_handler(shared_logger)
-    shared_logger.info("ACAGi starting up (pid=%s)", os.getpid())
-    for handler in shared_logger.handlers:
+    logger = shared_logger()
+    logger.info("ACAGi starting up (pid=%s)", os.getpid())
+    for handler in logger.handlers:
         try:
             handler.flush()
         except Exception:
@@ -8808,6 +8980,13 @@ def main():
     if args.workspace:
         candidate = os.path.abspath(os.path.expanduser(args.workspace))
         os.environ["CODEX_WORKSPACE"] = candidate
+        logger = BOOT_ENV.refresh()
+        logger.info("Workspace override applied: %s", candidate)
+        for handler in logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                continue
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
