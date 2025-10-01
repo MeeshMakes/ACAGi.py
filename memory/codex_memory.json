@@ -1,0 +1,35 @@
+{
+  "version": "0.1.0",
+  "last_updated": "2025-10-01",
+  "stable_lessons": [
+    {
+      "title": "Verbose Implementation Standard",
+      "summary": "All code and documentation must include rationale-rich commentary and explicit edge-case considerations.",
+      "applies_to": "repository-wide"
+    },
+    {
+      "title": "Session Logging Discipline",
+      "summary": "Every working session must produce a log in logs/session_<date>.md capturing objectives, context, and follow-up prompts.",
+      "applies_to": "workflow"
+    }
+  ],
+  "procedures": [
+    {
+      "name": "Self-Prompt Kickoff",
+      "steps": [
+        "Review Agent manual, memory entries, and logic inbox for context.",
+        "Draft a self-contained objective prompt and record it in the session log.",
+        "Outline validation strategy before modifying files."
+      ]
+    }
+  ],
+  "tooling": {
+    "ci": [
+      "codex-pr-sentinel"
+    ],
+    "automation_scripts": [
+      "tools/codex_pr_sentinel.py",
+      "tools/logic_inbox.py"
+    ]
+  }
+}
