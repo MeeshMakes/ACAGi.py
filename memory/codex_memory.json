@@ -86,6 +86,11 @@
       "title": "Cerebellum Rationalizer Quotas",
       "summary": "Rationalizer jobs are dispatched through the Cerebellum scheduler which enforces Gate quotas, publishes cortex.intent and cortex.reference events, and surfaces telemetry on system.metrics; future cognitive workflows should integrate with ensure_rationalizer_manager rather than spawning ad-hoc threads.",
       "applies_to": "cortex-rationalizer"
+    },
+    {
+      "title": "Task Bucket Serialization Discipline",
+      "summary": "Task buckets advance through capture→note→bucketize→assemble→apply→test→verify→promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
+      "applies_to": "task-orchestration"
     }
   ],
   "procedures": [
