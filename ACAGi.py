@@ -44,7 +44,7 @@ import traceback
 import uuid
 import warnings
 import zipfile
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from functools import lru_cache
 from dataclasses import dataclass, field
 from enum import Enum
@@ -4622,6 +4622,607 @@ class DatasetManagerDock(QDockWidget):
             except Exception:
                 return agent_data_dir()
         return agent_data_dir()
+
+# ============================================================================
+# Virtual Desktop Dock (new consolidated UI shell)
+# ============================================================================
+
+
+class VirtualDesktopDock(QDockWidget):
+    """Dockable Virtual Desktop with consoles, Dev Space, and OCR overlays."""
+
+    def __init__(
+        self,
+        chat_card: Optional["ChatCard"],
+        parent: Optional[QWidget] = None,
+        *,
+        dataset_root: Optional[Path] = None,
+    ) -> None:
+        super().__init__("Virtual Desktop", parent)
+        self.setObjectName("VirtualDesktopDock")
+        self.setAllowedAreas(
+            Qt.LeftDockWidgetArea
+            | Qt.RightDockWidgetArea
+            | Qt.BottomDockWidgetArea
+        )
+        self.toggleViewAction().setText("Virtual Desktop")
+
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.virtual_desktop")
+        self._chat: Optional["ChatCard"] = None
+        self._dataset_root = _dataset_root(dataset_root)
+        self._tasks: Dict[str, Task] = {}
+        self._run_logs: Dict[str, List[str]] = {}
+        self._latest_diff: Optional[Dict[str, Any]] = None
+        self._log_buffer: Deque[str] = deque(maxlen=400)
+        self._metrics_snapshot: Dict[str, Any] = {}
+        self._dataset_snapshot: Dict[str, int] = {}
+        self._ocr_history: List[Dict[str, str]] = []
+        self._subscriptions: List[Tuple[str, Subscription]] = []
+        self._console_view: Optional[QPlainTextEdit] = None
+        self._devspace_tabs: Optional[QTabWidget] = None
+        self._stats_view: Optional[QTextBrowser] = None
+        self._dev_logs_view: Optional[QPlainTextEdit] = None
+        self._data_view: Optional[QTextBrowser] = None
+        self._code_view: Optional[QTextBrowser] = None
+        self._graph_view: Optional[QPlainTextEdit] = None
+        self._ocr_path: Optional[QLineEdit] = None
+        self._ocr_output: Optional[QTextBrowser] = None
+        self._ocr_history_list: Optional[QListWidget] = None
+        self._ocr_status: Optional[QLabel] = None
+        self._last_update_ts: Optional[float] = None
+
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Virtual Desktop components load on demand to preserve startup "
+            "performance while keeping consoles, Dev Space tabs, and OCR "
+            "overlays within reach.",
+            container,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self._main_tabs = QTabWidget(container)
+        self._console_tab = QWidget(self._main_tabs)
+        self._devspace_tab = QWidget(self._main_tabs)
+        self._ocr_tab = QWidget(self._main_tabs)
+        self._main_tabs.addTab(self._console_tab, "Consoles")
+        self._main_tabs.addTab(self._devspace_tab, "Dev Space")
+        self._main_tabs.addTab(self._ocr_tab, "OCR Overlay")
+        self._main_tabs.currentChanged.connect(self._ensure_tab_initialized)
+        layout.addWidget(self._main_tabs, 1)
+
+        self._status_label = QLabel("Awaiting event stream…", container)
+        layout.addWidget(self._status_label)
+
+        self.setWidget(container)
+        self.visibilityChanged.connect(self._on_visibility_changed)
+
+        self.set_chat_card(chat_card)
+        self._install_subscriptions()
+        self._refresh_dataset_snapshot()
+
+    # ------------------------------------------------------------------
+    def set_chat_card(self, chat_card: Optional["ChatCard"]) -> None:
+        """Store the active chat card for future integrations."""
+
+        self._chat = chat_card
+
+    # ------------------------------------------------------------------
+    def _install_subscriptions(self) -> None:
+        topics = (
+            "task.created",
+            "task.updated",
+            "task.status",
+            "task.deleted",
+            "task.diff",
+            "system.metrics",
+        )
+        for topic in topics:
+            try:
+                handle = subscribe(topic, self._make_callback(topic))
+            except Exception:
+                self._logger.exception("Failed to subscribe to %s", topic)
+                continue
+            self._subscriptions.append((topic, handle))
+        self.destroyed.connect(lambda *_: self._teardown())
+
+    # ------------------------------------------------------------------
+    def _on_visibility_changed(self, visible: bool) -> None:
+        if visible:
+            self._ensure_tab_initialized(self._main_tabs.currentIndex())
+
+    # ------------------------------------------------------------------
+    def _ensure_tab_initialized(self, index: int) -> None:
+        widget = self._main_tabs.widget(index)
+        if widget is self._console_tab:
+            self._ensure_console_panel()
+        elif widget is self._devspace_tab:
+            self._ensure_devspace_panel()
+        elif widget is self._ocr_tab:
+            self._ensure_ocr_panel()
+
+    # ------------------------------------------------------------------
+    def _ensure_console_panel(self) -> None:
+        if self._console_view is not None:
+            return
+        layout = QVBoxLayout(self._console_tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._console_view = QPlainTextEdit(self._console_tab)
+        self._console_view.setObjectName("VirtualDesktopConsoleView")
+        self._console_view.setReadOnly(True)
+        layout.addWidget(self._console_view, 1)
+
+        refresh_btn = QPushButton("Refresh from run logs", self._console_tab)
+        refresh_btn.clicked.connect(self._refresh_console_from_logs)
+        layout.addWidget(refresh_btn, 0, Qt.AlignRight)
+
+        self._update_console_view()
+
+    # ------------------------------------------------------------------
+    def _ensure_devspace_panel(self) -> None:
+        if self._devspace_tabs is not None:
+            return
+        layout = QVBoxLayout(self._devspace_tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._devspace_tabs = QTabWidget(self._devspace_tab)
+        layout.addWidget(self._devspace_tabs, 1)
+
+        stats_widget = QWidget(self._devspace_tabs)
+        stats_layout = QVBoxLayout(stats_widget)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(4)
+        self._stats_view = QTextBrowser(stats_widget)
+        self._stats_view.setObjectName("VirtualDesktopStats")
+        self._stats_view.setOpenExternalLinks(False)
+        stats_layout.addWidget(self._stats_view, 1)
+        self._devspace_tabs.addTab(stats_widget, "Stats")
+
+        logs_widget = QWidget(self._devspace_tabs)
+        logs_layout = QVBoxLayout(logs_widget)
+        logs_layout.setContentsMargins(0, 0, 0, 0)
+        logs_layout.setSpacing(4)
+        self._dev_logs_view = QPlainTextEdit(logs_widget)
+        self._dev_logs_view.setObjectName("VirtualDesktopLogs")
+        self._dev_logs_view.setReadOnly(True)
+        logs_layout.addWidget(self._dev_logs_view, 1)
+        self._devspace_tabs.addTab(logs_widget, "Logs")
+
+        data_widget = QWidget(self._devspace_tabs)
+        data_layout = QVBoxLayout(data_widget)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        data_layout.setSpacing(4)
+        refresh_btn = QPushButton("Refresh dataset snapshot", data_widget)
+        refresh_btn.clicked.connect(self._refresh_dataset_snapshot)
+        data_layout.addWidget(refresh_btn, 0, Qt.AlignRight)
+        self._data_view = QTextBrowser(data_widget)
+        self._data_view.setObjectName("VirtualDesktopData")
+        data_layout.addWidget(self._data_view, 1)
+        self._devspace_tabs.addTab(data_widget, "Data")
+
+        code_widget = QWidget(self._devspace_tabs)
+        code_layout = QVBoxLayout(code_widget)
+        code_layout.setContentsMargins(0, 0, 0, 0)
+        code_layout.setSpacing(4)
+        self._code_view = QTextBrowser(code_widget)
+        self._code_view.setObjectName("VirtualDesktopCode")
+        mono = QFont(self._code_view.font())
+        mono.setStyleHint(QFont.TypeWriter)
+        self._code_view.setFont(mono)
+        code_layout.addWidget(self._code_view, 1)
+        self._devspace_tabs.addTab(code_widget, "Code")
+
+        graph_widget = QWidget(self._devspace_tabs)
+        graph_layout = QVBoxLayout(graph_widget)
+        graph_layout.setContentsMargins(0, 0, 0, 0)
+        graph_layout.setSpacing(4)
+        self._graph_view = QPlainTextEdit(graph_widget)
+        self._graph_view.setObjectName("VirtualDesktopGraph")
+        self._graph_view.setReadOnly(True)
+        graph_font = QFont(self._graph_view.font())
+        graph_font.setStyleHint(QFont.TypeWriter)
+        self._graph_view.setFont(graph_font)
+        graph_layout.addWidget(self._graph_view, 1)
+        self._devspace_tabs.addTab(graph_widget, "Graph")
+
+        self._update_devspace_views()
+
+    # ------------------------------------------------------------------
+    def _ensure_ocr_panel(self) -> None:
+        if self._ocr_output is not None:
+            return
+        layout = QVBoxLayout(self._ocr_tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        intro = QLabel(
+            "Select a capture to extract OCR Markdown and persist the output "
+            "for later review.",
+            self._ocr_tab,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        path_row = QHBoxLayout()
+        path_row.setSpacing(6)
+        self._ocr_path = QLineEdit(self._ocr_tab)
+        self._ocr_path.setPlaceholderText("Image path within the workspace…")
+        path_row.addWidget(self._ocr_path, 1)
+        browse = QPushButton("Browse…", self._ocr_tab)
+        browse.clicked.connect(self._browse_ocr_file)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        run_btn = QPushButton("Run OCR", self._ocr_tab)
+        run_btn.clicked.connect(self._trigger_ocr)
+        action_row.addWidget(run_btn, 0)
+        self._ocr_status = QLabel("", self._ocr_tab)
+        self._ocr_status.setWordWrap(True)
+        action_row.addWidget(self._ocr_status, 1)
+        layout.addLayout(action_row)
+
+        self._ocr_output = QTextBrowser(self._ocr_tab)
+        self._ocr_output.setObjectName("VirtualDesktopOCROutput")
+        layout.addWidget(self._ocr_output, 2)
+
+        history_label = QLabel("Recent OCR runs", self._ocr_tab)
+        layout.addWidget(history_label)
+        self._ocr_history_list = QListWidget(self._ocr_tab)
+        self._ocr_history_list.setObjectName("VirtualDesktopOCRHistory")
+        self._ocr_history_list.itemSelectionChanged.connect(
+            self._load_history_item
+        )
+        layout.addWidget(self._ocr_history_list, 1)
+
+    # ------------------------------------------------------------------
+    def _make_callback(self, topic: str) -> Callable[[dict], None]:
+        def _callback(payload: dict) -> None:
+            snapshot = dict(payload)
+            QTimer.singleShot(
+                0,
+                lambda: self._handle_event(topic, snapshot),
+            )
+
+        return _callback
+
+    # ------------------------------------------------------------------
+    def _handle_event(self, topic: str, payload: Dict[str, Any]) -> None:
+        self._append_log_line(topic, payload)
+        if topic in {"task.created", "task.updated"}:
+            self._apply_task_payload(payload)
+            self._refresh_dataset_snapshot()
+        elif topic == "task.status":
+            self._apply_task_status(payload)
+        elif topic == "task.deleted":
+            self._apply_task_deleted(payload)
+        elif topic == "task.diff":
+            self._apply_diff_payload(payload)
+        elif topic == "system.metrics":
+            self._metrics_snapshot = dict(payload)
+        self._update_run_logs()
+        self._refresh_views()
+
+    # ------------------------------------------------------------------
+    def _apply_task_payload(self, payload: Mapping[str, Any]) -> None:
+        try:
+            task = Task.from_dict(dict(payload))
+        except Exception:
+            self._logger.debug("Invalid task payload: keys=%s", payload.keys())
+            return
+        self._tasks[task.id] = task
+
+    # ------------------------------------------------------------------
+    def _apply_task_status(self, payload: Mapping[str, Any]) -> None:
+        task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
+        if not task_id:
+            return
+        status = payload.get("status") or payload.get("to")
+        if not status:
+            return
+        task = self._tasks.get(task_id)
+        if task:
+            task.status = str(status)
+            task.updated_ts = time.time()
+
+    # ------------------------------------------------------------------
+    def _apply_task_deleted(self, payload: Mapping[str, Any]) -> None:
+        task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
+        if not task_id:
+            return
+        self._tasks.pop(task_id, None)
+        self._run_logs.pop(task_id, None)
+
+    # ------------------------------------------------------------------
+    def _apply_diff_payload(self, payload: Mapping[str, Any]) -> None:
+        self._latest_diff = {
+            "added": int(payload.get("added", 0)),
+            "removed": int(payload.get("removed", 0)),
+            "files": list(payload.get("files", [])),
+            "timestamp": time.time(),
+        }
+
+    # ------------------------------------------------------------------
+    def _append_log_line(self, topic: str, payload: Mapping[str, Any]) -> None:
+        when = datetime.now().strftime("%H:%M:%S")
+        summary = self._summarise_payload(topic, payload)
+        self._log_buffer.append(f"[{when}] {topic}: {summary}")
+        self._last_update_ts = time.time()
+
+    # ------------------------------------------------------------------
+    def _summarise_payload(self, topic: str, payload: Mapping[str, Any]) -> str:
+        if topic.startswith("task"):
+            title = str(payload.get("title") or payload.get("id") or "").strip()
+            status = payload.get("status") or payload.get("to")
+            if status:
+                return f"{title} → {status}"
+            return title or "(task event)"
+        if topic == "system.metrics":
+            keys = [key for key in payload.keys() if key != "meta"]
+            return f"metrics fields={', '.join(keys) or 'none'}"
+        snippet = json.dumps(payload, ensure_ascii=False)
+        return snippet[:160]
+
+    # ------------------------------------------------------------------
+    def _update_run_logs(self) -> None:
+        for task in self._tasks.values():
+            tail = load_run_log_tail(task, self._dataset_root, max_lines=80)
+            if tail:
+                self._run_logs[task.id] = tail
+
+    # ------------------------------------------------------------------
+    def _refresh_views(self) -> None:
+        self._update_console_view()
+        self._update_devspace_views()
+        self._refresh_status_text()
+
+    # ------------------------------------------------------------------
+    def _update_console_view(self) -> None:
+        if not self._console_view:
+            return
+        text = "\n".join(self._log_buffer)
+        self._console_view.setPlainText(text or "Event stream idle.")
+        bar = self._console_view.verticalScrollBar()
+        if bar:
+            bar.setValue(bar.maximum())
+
+    # ------------------------------------------------------------------
+    def _update_devspace_views(self) -> None:
+        self._update_stats_view()
+        self._update_logs_view()
+        self._update_data_view()
+        self._update_code_view()
+        self._update_graph_view()
+
+    # ------------------------------------------------------------------
+    def _update_stats_view(self) -> None:
+        if not self._stats_view:
+            return
+        statuses = Counter(task.status for task in self._tasks.values())
+        lines = [f"Total tasks: {len(self._tasks)}"]
+        if statuses:
+            parts = [f"{name}: {count}" for name, count in statuses.items()]
+            lines.append("Status mix: " + ", ".join(sorted(parts)))
+        if self._metrics_snapshot:
+            cpu = self._metrics_snapshot.get("cpu", "?")
+            mem = self._metrics_snapshot.get("memory", "?")
+            lines.append(f"Metrics • CPU: {cpu} • Memory: {mem}")
+        self._stats_view.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    def _update_logs_view(self) -> None:
+        if not self._dev_logs_view:
+            return
+        rows: List[str] = []
+        tasks = sorted(
+            self._tasks.values(), key=lambda item: item.updated_ts, reverse=True
+        )
+        for task in tasks:
+            tail = self._run_logs.get(task.id)
+            if not tail:
+                continue
+            rows.append(f"▶ {task.title} [{task.status}]")
+            rows.extend(tail[-12:])
+            rows.append("")
+        text = "\n".join(rows).strip()
+        self._dev_logs_view.setPlainText(text or "No run logs captured yet.")
+        bar = self._dev_logs_view.verticalScrollBar()
+        if bar:
+            bar.setValue(bar.maximum())
+
+    # ------------------------------------------------------------------
+    def _update_data_view(self) -> None:
+        if not self._data_view:
+            return
+        if not self._dataset_snapshot:
+            self._data_view.setPlainText("No dataset files discovered yet.")
+            return
+        lines = ["Dataset entries:"]
+        for name, count in sorted(self._dataset_snapshot.items()):
+            lines.append(f"• {name}: {count}")
+        self._data_view.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    def _update_code_view(self) -> None:
+        if not self._code_view:
+            return
+        if not self._latest_diff:
+            self._code_view.setPlainText("No diffs recorded yet.")
+            return
+        added = self._latest_diff.get("added", 0)
+        removed = self._latest_diff.get("removed", 0)
+        files = self._latest_diff.get("files", [])
+        when = self._latest_diff.get("timestamp")
+        timestamp = "unknown"
+        if isinstance(when, float):
+            timestamp = datetime.fromtimestamp(when).strftime("%H:%M:%S")
+        lines = [
+            f"Last diff observed at {timestamp}",
+            f"Added lines: {added}",
+            f"Removed lines: {removed}",
+            "Files:",
+        ]
+        lines.extend(f"  - {path}" for path in files or ["(none)"])
+        self._code_view.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    def _update_graph_view(self) -> None:
+        if not self._graph_view:
+            return
+        if not self._tasks:
+            self._graph_view.setPlainText("Graph requires at least one task.")
+            return
+        rows = ["Task lineage graph:"]
+        for task in sorted(self._tasks.values(), key=lambda t: t.created_ts):
+            parent = task.parent_id or "—"
+            rows.append(f"{task.id} ← {parent} :: {task.title}")
+        self._graph_view.setPlainText("\n".join(rows))
+
+    # ------------------------------------------------------------------
+    def _refresh_console_from_logs(self) -> None:
+        if not self._console_view:
+            return
+        rows: List[str] = []
+        for task in sorted(
+            self._tasks.values(), key=lambda item: item.updated_ts, reverse=True
+        ):
+            tail = self._run_logs.get(task.id)
+            if not tail:
+                continue
+            rows.append(f"▶ {task.title} [{task.status}]")
+            rows.extend(tail[-10:])
+            rows.append("")
+        text = "\n".join(rows).strip()
+        if text:
+            self._console_view.setPlainText(text)
+        else:
+            self._console_view.setPlainText(
+                "No run log output located for tracked tasks."
+            )
+
+    # ------------------------------------------------------------------
+    def _refresh_dataset_snapshot(self) -> None:
+        snapshot: Dict[str, int] = {}
+        root = self._dataset_root
+        if root.exists():
+            for idx, path in enumerate(sorted(root.glob("*.jsonl"))):
+                if idx >= 10:
+                    break
+                try:
+                    with path.open("r", encoding="utf-8") as fh:
+                        count = sum(1 for line in fh if line.strip())
+                except Exception:
+                    self._logger.debug("Failed to read dataset file %s", path)
+                    continue
+                snapshot[path.name] = count
+        self._dataset_snapshot = snapshot
+        self._update_data_view()
+        self._refresh_status_text()
+
+    # ------------------------------------------------------------------
+    def _refresh_status_text(self) -> None:
+        parts = [f"Tasks: {len(self._tasks)}", f"Events cached: {len(self._log_buffer)}"]
+        if self._dataset_snapshot:
+            parts.append(f"Datasets tracked: {len(self._dataset_snapshot)}")
+        if self._last_update_ts:
+            stamp = datetime.fromtimestamp(self._last_update_ts).strftime("%H:%M:%S")
+            parts.append(f"Last update {stamp}")
+        self._status_label.setText(" • ".join(parts))
+
+    # ------------------------------------------------------------------
+    def _browse_ocr_file(self) -> None:
+        if not self._ocr_path:
+            return
+        base = agent_data_dir()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select image for OCR",
+            str(base),
+        )
+        if file_path:
+            self._ocr_path.setText(file_path)
+
+    # ------------------------------------------------------------------
+    def _trigger_ocr(self) -> None:
+        if not self._ocr_path or not self._ocr_output:
+            return
+        raw_path = self._ocr_path.text().strip()
+        if not raw_path:
+            self._set_ocr_status("Select an image before running OCR.")
+            return
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            self._set_ocr_status(f"Image not found: {path}")
+            return
+        result = perform_ocr(path)
+        if result.error:
+            self._set_ocr_status(f"OCR failed: {result.error}")
+            self._ocr_output.setPlainText("")
+        else:
+            self._set_ocr_status("OCR completed successfully.")
+            content = (
+                f"## Markdown\n{result.markdown}\n\n## Raw Text\n{result.text}"
+            )
+            self._ocr_output.setPlainText(content)
+            entry = {
+                "path": path.as_posix(),
+                "markdown": result.markdown,
+                "text": result.text,
+            }
+            self._ocr_history.append(entry)
+            self._update_ocr_history()
+
+    # ------------------------------------------------------------------
+    def _set_ocr_status(self, message: str) -> None:
+        if self._ocr_status:
+            self._ocr_status.setText(message)
+
+    # ------------------------------------------------------------------
+    def _update_ocr_history(self) -> None:
+        if not self._ocr_history_list:
+            return
+        self._ocr_history_list.blockSignals(True)
+        self._ocr_history_list.clear()
+        for entry in reversed(self._ocr_history[-20:]):
+            item = QListWidgetItem(entry["path"])
+            item.setData(Qt.UserRole, entry)
+            self._ocr_history_list.addItem(item)
+        self._ocr_history_list.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    def _load_history_item(self) -> None:
+        if not self._ocr_history_list or not self._ocr_output:
+            return
+        items = self._ocr_history_list.selectedItems()
+        if not items:
+            return
+        entry = items[0].data(Qt.UserRole) or {}
+        markdown = entry.get("markdown", "")
+        text = entry.get("text", "")
+        content = f"## Markdown\n{markdown}\n\n## Raw Text\n{text}"
+        self._ocr_output.setPlainText(content)
+        if self._ocr_path:
+            self._ocr_path.setText(entry.get("path", ""))
+
+    # ------------------------------------------------------------------
+    def _teardown(self) -> None:
+        for topic, handle in self._subscriptions:
+            try:
+                handle.unsubscribe()
+            except Exception:
+                self._logger.debug(
+                    "Failed to unsubscribe %s", topic, exc_info=True
+                )
+        self._subscriptions.clear()
+
 
 # ============================================================================
 # Virtual Desktop Backgrounds (Inlined from Dev_Logic/background)
@@ -12896,14 +13497,18 @@ class MainWindow(QMainWindow):
 
         self.desktop: Optional[TerminalDesktop] = None
         self.chat = ChatCard(self.theme, self.ollama, self.settings, self.lex_mgr, self)
-        if self._embedded:
-            self.setCentralWidget(self.chat)
-        else:
-            self.desktop = TerminalDesktop(theme, self.chat, self)
-            self.setCentralWidget(self.desktop)
+        self.setCentralWidget(self.chat)
         self.dataset_dock = DatasetManagerDock(self.chat, self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dataset_dock)
         self.dataset_dock.hide()
+        self.virtual_desktop_dock = VirtualDesktopDock(
+            self.chat,
+            self,
+            dataset_root=TASKS_DATA_ROOT,
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, self.virtual_desktop_dock)
+        self.virtual_desktop_dock.hide()
+        self.tabifyDockWidget(self.dataset_dock, self.virtual_desktop_dock)
         safety_manager.set_confirmer(self._confirm_risky_command)
         self.status_indicator: QStatusBar = self.statusBar()
         self._refresh_status_bar()
@@ -12936,6 +13541,7 @@ class MainWindow(QMainWindow):
         self.fullscreen_act.triggered.connect(self._toggle_fullscreen)
         view_menu.addAction(self.fullscreen_act)
         view_menu.addAction(self.dataset_dock.toggleViewAction())
+        view_menu.addAction(self.virtual_desktop_dock.toggleViewAction())
 
     def _init_shortcuts(self):
         focus_input = QAction(self); focus_input.setShortcut(QKeySequence("Ctrl+`"))
@@ -13136,14 +13742,12 @@ class MainWindow(QMainWindow):
             if hasattr(old_chat, "detach_safety_notifier"):
                 old_chat.detach_safety_notifier()
             self.chat = ChatCard(self.theme, self.ollama, self.settings, self.lex_mgr, self)
-            if self._embedded:
-                self.desktop = None
-                self.setCentralWidget(self.chat)
-            else:
-                self.desktop = TerminalDesktop(self.theme, self.chat, self)
-                self.setCentralWidget(self.desktop)
+            self.desktop = None
+            self.setCentralWidget(self.chat)
             if hasattr(self, "dataset_dock"):
                 self.dataset_dock.set_chat_card(self.chat)
+            if hasattr(self, "virtual_desktop_dock"):
+                self.virtual_desktop_dock.set_chat_card(self.chat)
             configure_safety_sentinel(self.feature_flags)
             self._refresh_status_bar()
 
