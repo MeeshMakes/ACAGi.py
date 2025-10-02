@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.11] - 2025-10-05
+### Added
+- Enabled transcript bubble taps to push Hippocampus-backed memory entries and
+  append corresponding session JSONL notices with dataset anchors for reruns.
+
+### Changed
+- Wrapped the Codex bridge LED in a dedicated health state machine that
+  synchronizes tooltips, interpreter toggle availability, and ready-banner
+  acknowledgements.
+- Wired approval prompt responses and ready detections through the new state
+  handling so busy/error transitions surface consistent system notices.
+
 ## [0.1.10] - 2025-10-04
 ### Added
 - Introduced a sentinel monitor hub that subscribes to task/status topics, detects loops/regressions/stalls, and publishes immune responses with rationale on the `system.immune` stream.

@@ -7616,6 +7616,63 @@ class HippocampusClient:
         self.brain_map.register_node(anchor, brain_payload)
         return record
 
+    @staticmethod
+    def _shorten_snippet(text: str, limit: int = 240) -> str:
+        """Return a compact single-line snippet suitable for status messages."""
+
+        normalized = " ".join(text.split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 1] + "…"
+
+    def record_transcript_tap(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """Persist a transcript tap via the dataset service and emit metadata.
+
+        The tap stores the raw text inside the Hippocampus dataset with tags that
+        capture the originating role and session id. A shortened snippet is
+        returned so the caller can display an inline confirmation while keeping
+        the full text available through the dataset anchor.
+        """
+
+        trimmed = (text or "").strip()
+        if not trimmed:
+            raise ValueError("Transcript tap requires non-empty text")
+
+        role_label = (role or "unknown").strip().lower() or "unknown"
+        tags = ["transcript_tap", f"tap_role:{role_label}"]
+        extra = {
+            "event": "transcript_tap",
+            "session_id": session_id,
+            "tap_role": role_label,
+            "captured_at": datetime.now(UTC).isoformat(),
+        }
+
+        payload = self.dataset.add_entry("system", trimmed, [], tags=tags, extra=extra)
+        anchor = str(payload.get("anchor") or payload.get("id") or "")
+        snippet = self._shorten_snippet(trimmed)
+
+        self.logger.info(
+            "Transcript tap stored",
+            extra={
+                "event": "transcript_tap",
+                "anchor": anchor,
+                "session_id": session_id,
+                "role": role_label,
+            },
+        )
+
+        return {
+            "anchor": anchor,
+            "snippet": snippet,
+            "payload": payload,
+        }
+
 @dataclass(slots=True)
 class ConversationPaths:
     identifier: str
@@ -9150,6 +9207,15 @@ class ParsedCodexEvent:
     payload: Any
 
 
+class TerminalHealthState(Enum):
+    """Enumerate terminal bridge health states for LED + status handling."""
+
+    OFFLINE = "offline"
+    PROBING = "probing"
+    READY = "ready"
+    FAULT = "fault"
+
+
 class CodexInterpreter:
     """Auto-respond to Codex prompts when enabled."""
 
@@ -9361,6 +9427,10 @@ def _normalize_display_text(value: str) -> str:
 
 
 class ChatBubbleWidget(QFrame):
+    """Renderable chat bubble that also emits taps for memory capture."""
+
+    tapped = Signal(str, str)  # role, raw text snapshot
+
     def __init__(
         self,
         theme: Theme,
@@ -9371,11 +9441,15 @@ class ChatBubbleWidget(QFrame):
         thinks: Optional[Sequence[str]] = None,
         images: Optional[Sequence[Path]] = None,
         parent: Optional[QWidget] = None,
+        raw_text: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
         self.theme = theme
         self.role = role
+        self._raw_text = raw_text if raw_text is not None else text
+        self._press_pos: Optional[QPoint] = None
         self.setObjectName("ChatBubbleWidget")
+        self.setCursor(Qt.PointingHandCursor)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -9455,6 +9529,22 @@ class ChatBubbleWidget(QFrame):
         layout.addWidget(bubble)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
+    def mousePressEvent(self, event):  # pragma: no cover - UI interaction
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):  # pragma: no cover - UI interaction
+        try:
+            if event.button() == Qt.LeftButton and self._press_pos is not None:
+                if (event.pos() - self._press_pos).manhattanLength() <= 4:
+                    text = self._raw_text.strip()
+                    if text:
+                        self.tapped.emit(self.role, text)
+        finally:
+            self._press_pos = None
+            super().mouseReleaseEvent(event)
+
 
 class ConversationView(QFrame):
     def __init__(self, theme: Theme, parent: Optional[QWidget] = None) -> None:
@@ -9497,7 +9587,8 @@ class ConversationView(QFrame):
         model_name: str = "",
         thinks: Optional[Sequence[str]] = None,
         images: Optional[Sequence[Path]] = None,
-    ) -> None:
+        raw_text: Optional[str] = None,
+    ) -> ChatBubbleWidget:
         bubble = ChatBubbleWidget(
             self.theme,
             role,
@@ -9505,10 +9596,12 @@ class ConversationView(QFrame):
             model_name=model_name,
             thinks=thinks,
             images=images,
+            raw_text=raw_text,
         )
         self._append_row(role, bubble)
         self._refresh_bubble_styles()
         QTimer.singleShot(0, self._scroll_to_bottom)
+        return bubble
 
     def append_widget(
         self,
@@ -10012,6 +10105,9 @@ class ChatCard(QFrame):
         self._task_bus_handles: List[Subscription] = []
         self._loaded_conversation_id: Optional[str] = None
         self._recent_input_references: Deque[Dict[str, str]] = deque(maxlen=10)
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.chat")
+        self._health_state = TerminalHealthState.OFFLINE
+        self._ready_banner_seen = False
 
         self.codex = CodexBootstrap(self.ollama)
         self.bridge = CodexBridge(
@@ -10065,6 +10161,8 @@ class ChatCard(QFrame):
 
         self.led = BridgeLED(self.theme, tooltip="Codex Bridge")
         hbox.addWidget(self.led, 0, Qt.AlignVCenter)
+        self.led.setToolTip(self._health_state_tooltip(self._health_state))
+        self.led.set_state(self._LED_COLOR_BY_STATE[self._health_state])
         self.interpreter_caption = QLabel("Interpreter: On" if interpreter_default else "Interpreter: Off", header)
         self.interpreter_caption.setObjectName("InterpreterCaption")
         hbox.addWidget(self.interpreter_caption, 0, Qt.AlignVCenter)
@@ -10166,8 +10264,65 @@ class ChatCard(QFrame):
         except Exception:
             return 0
 
+    _LED_COLOR_BY_STATE: Dict[TerminalHealthState, str] = {
+        TerminalHealthState.OFFLINE: "red",
+        TerminalHealthState.PROBING: "yellow",
+        TerminalHealthState.READY: "green",
+        TerminalHealthState.FAULT: "red",
+    }
+
     def _add_shortcut(self, key: str, fn):
         act = QAction(self); act.setShortcut(QKeySequence(key)); act.triggered.connect(fn); self.addAction(act)
+
+    def _health_state_tooltip(self, state: TerminalHealthState) -> str:
+        mapping = {
+            TerminalHealthState.OFFLINE: "Bridge offline",
+            TerminalHealthState.PROBING: "Bridge running — waiting for ready banner",
+            TerminalHealthState.READY: "Bridge ready",
+            TerminalHealthState.FAULT: "Bridge reported an error",
+        }
+        return mapping.get(state, "Bridge status unknown")
+
+    def _interpret_led_state(self, color: str) -> TerminalHealthState:
+        normalized = (color or "").strip().lower()
+        if normalized == "green":
+            return TerminalHealthState.READY
+        if normalized == "yellow":
+            return TerminalHealthState.PROBING
+        return (
+            TerminalHealthState.FAULT
+            if self.bridge.running()
+            else TerminalHealthState.OFFLINE
+        )
+
+    def _set_health_state(self, state: TerminalHealthState) -> None:
+        if state == self._health_state:
+            return
+
+        previous = self._health_state
+        self._health_state = state
+        self._led_state = self._LED_COLOR_BY_STATE.get(state, "red")
+        self.led.set_state(self._led_state)
+        self.led.setToolTip(self._health_state_tooltip(state))
+        self._refresh_interpreter_toggle_enabled()
+
+        if state == TerminalHealthState.PROBING and previous in {
+            TerminalHealthState.OFFLINE,
+            TerminalHealthState.FAULT,
+        }:
+            self._emit_system_notice(
+                "[Codex] Bridge warming up — waiting for ready banner."
+            )
+        elif state == TerminalHealthState.READY:
+            if not self._ready_banner_seen:
+                self._ready_banner_seen = True
+                self._emit_system_notice("[Codex] Ready banner detected. Bridge live.")
+        elif state == TerminalHealthState.FAULT and previous != TerminalHealthState.FAULT:
+            self._emit_system_notice(
+                "[Codex] Bridge error detected. Inspect the console window."
+            )
+        elif state == TerminalHealthState.OFFLINE:
+            self._ready_banner_seen = False
 
     def _update_interpreter_caption(self, enabled: bool) -> None:
         if hasattr(self, "interpreter_caption"):
@@ -10248,9 +10403,7 @@ class ChatCard(QFrame):
 
     @Slot(str)
     def _handle_led_state(self, state: str) -> None:
-        self._led_state = state or "red"
-        self.led.set_state(state)
-        self._refresh_interpreter_toggle_enabled()
+        self._set_health_state(self._interpret_led_state(state))
 
     def _on_interpreter_toggled(self, checked: bool) -> None:
         enabled = bool(checked)
@@ -10563,6 +10716,53 @@ class ChatCard(QFrame):
         self._codex_status(f"[Codex] Approval → {label}")
         self.codex_led_signal.emit("yellow")
         self.bridge.press_enter_async(self._ui_hwnd())
+
+    @Slot(str, str)
+    def _handle_transcript_tap(self, role: str, text: str) -> None:
+        """Persist tapped transcript text through Hippocampus and log a notice."""
+
+        trimmed = (text or "").strip()
+        if not trimmed:
+            return
+        if not hasattr(self, "hippocampus") or not self.hippocampus:
+            self._emit_system_notice("[Memory] Hippocampus unavailable; tap ignored.")
+            return
+
+        try:
+            record = self.hippocampus.record_transcript_tap(
+                session_id=self.session_id,
+                role=role,
+                text=trimmed,
+            )
+        except Exception as exc:
+            self._logger.exception("Transcript tap failed")
+            self._emit_system_notice(f"[Memory] Transcript tap failed: {exc}")
+            return
+
+        anchor = str(record.get("anchor") or "").strip()
+        snippet = record.get("snippet") or trimmed
+        references: Optional[List[Dict[str, str]]] = None
+        if anchor:
+            references = [
+                {
+                    "type": "hippocampus",
+                    "anchor": anchor,
+                    "session": self.session_id,
+                    "source_role": role,
+                }
+            ]
+
+        note_lines = [
+            f"[Memory] Saved {role} message to Hippocampus.",
+        ]
+        if anchor:
+            note_lines.append(f"Anchor: {anchor[:8]}…")
+        note_lines.append("")
+        note_lines.append(snippet)
+        message = "\n".join(note_lines).strip()
+
+        self._record_message("system", message, [], references=references)
+        self.append_signal.emit(ChatMessage("system", message, []))
 
     @Slot(str)
     def _on_codex_output(self, reply_text: str):
@@ -11271,6 +11471,8 @@ class ChatCard(QFrame):
             self.view.append_message("system", f"[Codex] Launched. PID={proc.pid}")
             self.bridge.attach(proc.pid)
             self.bridge.start()
+            self._ready_banner_seen = False
+            self._set_health_state(TerminalHealthState.PROBING)
             self.codex_led_signal.emit("yellow")
             self.btn_codex_start.setEnabled(False)
             self.btn_codex_stop.setEnabled(True)
@@ -11283,6 +11485,7 @@ class ChatCard(QFrame):
     def _stop_codex_bridge(self):
         try:
             self.bridge.stop()
+            self._set_health_state(TerminalHealthState.OFFLINE)
             self.btn_codex_start.setEnabled(True)
             self.btn_codex_stop.setEnabled(False)
             self.view.append_message("system", "[Codex] Bridge stopped.")
@@ -11449,13 +11652,15 @@ class ChatCard(QFrame):
         text = re.sub(r"<think>(.*?)</think>", "", text, flags=re.DOTALL)
         think_lines = [t.strip() for t in thinks if t.strip()] if msg.role == "assistant" else []
         model_name = msg.model_name if msg.role == "assistant" else ""
-        self.view.append_message(
+        bubble = self.view.append_message(
             msg.role,
             text,
             model_name=model_name,
             thinks=think_lines,
             images=msg.images,
+            raw_text=text,
         )
+        bubble.tapped.connect(self._handle_transcript_tap)
 
     @Slot(bool)
     def _set_busy(self, state: bool):
