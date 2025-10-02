@@ -20,8 +20,21 @@ Welcome to **ACAGi.py** — a project maintained by MeeshMakes.
 
 ## Overview
 
-ACAGi.py is a Python-based repository focused on [insert brief description of project purpose or functionality here].  
+ACAGi.py is a Python-based repository focused on [insert brief description of project purpose or functionality here].
 It leverages Python’s flexibility and simplicity to achieve [insert one or two goals or key features].
+
+### Voice pipeline highlights
+
+- **Local ASR + TTS adapters** – `ACAGi.py` now bundles on-device speech-to-text
+  and text-to-speech adapters that stream partial transcripts to
+  `speech.partial` while supporting barge-in (pausing narration when a human
+  starts speaking).
+- **Speech orchestrator** – the shared orchestrator exposes a
+  `speech.request` topic so docks, macros, or automation can enqueue narration
+  requests, and publishes telemetry on `speech.tts` for UI widgets.
+- **Amygdala salience** – diarization metadata (speaker labels, priorities,
+  barge-in flags) feeds the Amygdala component, which republishes weighted
+  scores on `system.salience` for downstream attention dashboards.
 
 ## Language Composition
 

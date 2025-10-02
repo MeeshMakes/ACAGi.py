@@ -1,4 +1,26 @@
 # Changelog
+## [0.1.17] - 2025-10-07
+### Added
+- Embedded local-first ASR and TTS adapters inside `ACAGi.py` with streaming
+  partial transcripts on the `speech.partial` bus topic and barge-in support
+  that pauses synthesis while the operator speaks.
+- Introduced a shared `SpeechOrchestrator` entry point plus a `speech.request`
+  event interface so UI or automation layers can enqueue narration safely.
+- Connected a new Amygdala salience pipeline that weights diarization and
+  speaker-priority metadata, publishing aggregated scores on `system.salience`.
+
+### Changed
+- Extended default settings to include a `voice` section with ASR/TTS tunables
+  and propagated configuration reloads through the orchestrator.
+- Expanded event dispatcher topics for speech activity, TTS telemetry, and
+  salience scoring so downstream docks can subscribe without manual wiring.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+- Performed manual audio checks by capturing microphone input to verify
+  partial transcript streaming, triggering TTS narration, and speaking over it
+  to confirm barge-in pauses/resumes playback while logs reflected the state.
+
 ## [0.1.16] - 2025-10-06
 ### Added
 - Extended the main window status bar with a telemetry panel that surfaces
