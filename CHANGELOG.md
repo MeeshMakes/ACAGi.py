@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.8] - 2025-10-02
+### Added
+- Embedded a `MemoryServices` stack that loads durable lessons, instruction inbox items, and session JSONL tails during boot and exposes CRUD helpers for each store.
+- Introduced `DatasetNodePersistence` to split dataset entries into Git-friendly JSONL cores with vector/thumbnail sidecars and enforced metadata anchors.
+
+### Changed
+- Updated the dataset manager to rely on the new persistence helpers, automatically generating thumbnails and storing embeddings in sidecars while keeping JSONL entries lightweight.
+
 ## [0.1.7] - 2025-10-05
 ### Added
 - Introduced a topic-aware event dispatcher with bounded subscriber queues so observation, note, task, and system streams share a consistent pub/sub surface.
