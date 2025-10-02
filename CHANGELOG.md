@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.6] - 2025-10-05
+### Changed
+- Consolidated safety guardrails, prompt loader, image pipeline, and repository indexing code directly into `ACAGi.py`, replacing sibling module imports with scoped sections referencing the Dev_Logic assets.
+- Embedded the token budget helpers into the monolithic module so runtime budget calculations no longer depend on external imports.
+
 # [0.1.5] - 2025-10-04
 ### Added
 - Added a structured runtime settings loader (`acagi.ini`) that materializes defaults, documents config sections, and persists boolean/limit flags for offline, sandbox, and remote integrations.

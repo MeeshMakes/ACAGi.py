@@ -26,6 +26,11 @@
       "title": "Boot Environment Initialization",
       "summary": "ACAGi.py now centralizes DPI policy, workspace/transit resolution, shared logging, and BrainShell crash handling within a BootEnvironment manager; extend that section when adjusting startup flows.",
       "applies_to": "acagi-boot"
+    },
+    {
+      "title": "Dev Logic Path Constant",
+      "summary": "Use the DEV_LOGIC_ROOT constant within ACAGi.py when referencing prompts, datasets, or other assets migrated from Dev_Logic modules so paths remain stable after inlining.",
+      "applies_to": "acagi-architecture"
     }
   ],
   "procedures": [

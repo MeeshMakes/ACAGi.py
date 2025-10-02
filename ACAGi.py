@@ -15,7 +15,9 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import Qt
 
 import argparse
+import ast
 import base64
+import builtins
 import copy
 import ctypes
 import configparser
@@ -34,6 +36,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -59,12 +62,11 @@ from typing import (
     Mapping,
     MutableMapping,
     Optional,
+    Protocol,
     Sequence,
     Set,
     Tuple,
 )
-
-import token_budget
 
 # Optional dependencies are resolved via runtime checks instead of guarded imports
 _REQUESTS_MODULE_NAME = "requests"
@@ -150,11 +152,1264 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QStatusBar,
 )
-from memory_manager import RepositoryIndex
-from safety import SafetyViolation, manager as safety_manager
-from image_pipeline import analyze_image, perform_ocr
-from prompt_loader import get_prompt_watcher, iter_prompt_definitions, prompt_text
 
+
+
+
+# ============================================================================
+# Dev Logic Roots
+# ============================================================================
+
+DEV_LOGIC_ROOT = Path(__file__).resolve().parent / "Dev_Logic"
+
+
+# ============================================================================
+# Token Budget Utilities (Inlined from Dev_Logic/token_budget.py)
+# ============================================================================
+
+_TIKTOKEN_MODULE_NAME = "tiktoken"
+
+if importlib.util.find_spec(_TIKTOKEN_MODULE_NAME):
+    import tiktoken  # type: ignore  # noqa: F401
+else:
+    tiktoken = None  # type: ignore[assignment]
+
+_MODEL_TOKEN_LIMITS: Dict[str, int] = {
+    "qwen3": 32768,
+    "qwen2": 32768,
+    "qwen": 32768,
+    "llama3": 8192,
+    "llama-3": 8192,
+    "llama2": 4096,
+    "llama-2": 4096,
+    "mistral": 8192,
+    "mixtral": 8192,
+    "phi3": 4096,
+    "phi-3": 4096,
+    "phi2": 4096,
+    "codellama": 16384,
+    "deepseek": 16384,
+    "gpt-4o": 128000,
+    "gpt-4": 8192,
+    "gpt-3.5": 4096,
+}
+_DEFAULT_MAX_TOKENS = 8192
+_WORD_RE = re.compile(r"\S+")
+
+
+@lru_cache(maxsize=32)
+def _encoding_for_model(model: Optional[str]) -> Any:
+    """Return a cached tokenizer for *model* when tiktoken is available."""
+
+    if tiktoken is None:
+        return None
+    name = (model or "").strip() or "cl100k_base"
+    try:
+        return tiktoken.encoding_for_model(name)
+    except Exception:
+        try:
+            return tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return None
+
+
+def get_model_token_limit(model: Optional[str]) -> int:
+    """Return the maximum prompt tokens supported by *model*."""
+
+    if not model:
+        return _DEFAULT_MAX_TOKENS
+    key = model.lower()
+    for pattern, limit in _MODEL_TOKEN_LIMITS.items():
+        if pattern in key:
+            return limit
+    return _DEFAULT_MAX_TOKENS
+
+
+def prompt_token_budget(model: Optional[str], headroom_pct: int) -> int:
+    """Compute the usable prompt budget given a headroom percentage."""
+
+    limit = get_model_token_limit(model)
+    pct = max(1, min(int(headroom_pct or 0), 100))
+    return int(limit * (pct / 100.0))
+
+
+def count_tokens(text: str, model: Optional[str] = None) -> int:
+    """Count tokens for *text* using an optional tokenizer fallback."""
+
+    if not text:
+        return 0
+    encoding = _encoding_for_model(model)
+    if encoding is not None:
+        try:
+            return len(encoding.encode(text))
+        except Exception:
+            pass
+    tokens = _WORD_RE.findall(text)
+    if tokens:
+        return len(tokens)
+    return max(1, math.ceil(len(text) / 4))
+
+# ============================================================================
+# Safety Guardrails (Inlined from Dev_Logic/safety.py)
+# ============================================================================
+
+
+class SafetyViolation(RuntimeError):
+    """Raised when a safety rule blocks an operation."""
+
+
+class SafetyManager:
+    """Coordinates safety guardrails for file writes and shell commands."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._protected_files: set[Path] = set()
+        self._protected_dirs: set[Path] = set()
+        self._notifiers: Dict[str, Callable[[str], None]] = {}
+        self._confirmer: Optional[Callable[[str, Sequence[str]], bool]] = None
+        self._original_open = builtins.open
+        self._installed = False
+        self._risk_patterns = (
+            re.compile(r"\brm\b.*\b--no-preserve-root\b"),
+            re.compile(r"\brm\b.*\b-\w*[rf]\w*\b.*\s/"),
+            re.compile(r"\bsudo\s+rm\b"),
+            re.compile(r"\bmkfs(\.\w+)?\b"),
+            re.compile(r"\bformat\s+[A-Za-z]:"),
+            re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*;\s*\}\s*;\s*:"),
+        )
+
+    def install_file_guard(self) -> None:
+        """Monkey patch :func:`open` so destructive writes are intercepted."""
+
+        with self._lock:
+            if self._installed:
+                return
+
+            def _guarded_open(file, mode="r", *args, **kwargs):  # type: ignore[override]
+                path = self._coerce_path(file)
+                if path is not None and self._is_write_mode(mode):
+                    self._enforce_protected(path, mode)
+                return self._original_open(file, mode, *args, **kwargs)
+
+            builtins.open = _guarded_open  # type: ignore[assignment]
+            self._installed = True
+
+    def add_protected_path(self, path: os.PathLike[str] | str) -> None:
+        resolved = self._normalise(path)
+        with self._lock:
+            self._protected_files.add(resolved)
+
+    def add_protected_directory(self, path: os.PathLike[str] | str) -> None:
+        resolved = self._normalise(path)
+        with self._lock:
+            self._protected_dirs.add(resolved)
+
+    def remove_protected_path(self, path: os.PathLike[str] | str) -> None:
+        resolved = self._normalise(path)
+        with self._lock:
+            self._protected_files.discard(resolved)
+
+    def remove_protected_directory(self, path: os.PathLike[str] | str) -> None:
+        resolved = self._normalise(path)
+        with self._lock:
+            self._protected_dirs.discard(resolved)
+
+    def clear_protected(self) -> None:
+        with self._lock:
+            self._protected_files.clear()
+            self._protected_dirs.clear()
+
+    def add_notifier(self, callback: Callable[[str], None]) -> str:
+        token = uuid.uuid4().hex
+        with self._lock:
+            self._notifiers[token] = callback
+        return token
+
+    def remove_notifier(self, token: str) -> None:
+        with self._lock:
+            self._notifiers.pop(token, None)
+
+    def clear_notifiers(self) -> None:
+        with self._lock:
+            self._notifiers.clear()
+
+    def set_confirmer(
+        self, callback: Optional[Callable[[str, Sequence[str]], bool]]
+    ) -> None:
+        with self._lock:
+            self._confirmer = callback
+
+    def ensure_command_allowed(self, cmd: Sequence[str]) -> None:
+        if not cmd:
+            return
+
+        canonical = [str(part) for part in cmd]
+        joined = shlex.join(canonical)
+        lowered = joined.lower()
+
+        reason = self._match_risky(lowered, canonical)
+        if not reason:
+            return
+
+        prompt = (
+            f"[SAFETY] Confirmation required: {joined}"
+            if reason == "confirm"
+            else f"[SAFETY] {reason}: {joined}"
+        )
+        self._dispatch(prompt)
+
+        allow = False
+        callback = self._confirmer
+        if callback is not None:
+            try:
+                allow = bool(callback(prompt, tuple(canonical)))
+            except Exception as exc:  # pragma: no cover - defensive
+                self._dispatch(f"[SAFETY] Confirmation handler failed: {exc}")
+                allow = False
+
+        if allow:
+            self._dispatch(f"[SAFETY] Approved: {joined}")
+            return
+
+        message = f"[SAFETY] Blocked command: {joined}"
+        self._dispatch(message)
+        raise SafetyViolation(message)
+
+    def _match_risky(self, lowered: str, tokens: Sequence[str]) -> Optional[str]:
+        for pattern in self._risk_patterns:
+            if pattern.search(lowered):
+                return "confirm"
+
+        if not tokens:
+            return None
+
+        lowered_tokens = [tok.lower() for tok in tokens]
+        if "rm" in lowered_tokens or any(tok.endswith("rm") for tok in lowered_tokens):
+            if self._has_flag(lowered_tokens, "r") and self._has_flag(lowered_tokens, "f"):
+                if any(tok == "/" or tok.startswith("/") for tok in lowered_tokens):
+                    return "confirm"
+        return None
+
+    @staticmethod
+    def _has_flag(tokens: Sequence[str], flag: str) -> bool:
+        return any(token.startswith("-") and flag in token for token in tokens)
+
+    def _dispatch(self, message: str) -> None:
+        with self._lock:
+            callbacks = list(self._notifiers.values())
+        for cb in callbacks:
+            try:
+                cb(message)
+            except Exception:  # pragma: no cover - defensive
+                continue
+
+    def _enforce_protected(self, path: Path, mode: str) -> None:
+        if not self._is_protected(path):
+            return
+
+        if "a" in mode and "w" not in mode:
+            return
+
+        message = f"[SAFETY] Blocked write to protected path: {path}"
+        self._dispatch(message)
+        raise SafetyViolation(message)
+
+    def _is_protected(self, path: Path) -> bool:
+        with self._lock:
+            files = set(self._protected_files)
+            dirs = set(self._protected_dirs)
+        if path in files:
+            return True
+        for root in dirs:
+            try:
+                if path == root or path.is_relative_to(root):  # type: ignore[attr-defined]
+                    return True
+            except AttributeError:
+                try:
+                    path.resolve()
+                    root.resolve()
+                except Exception:
+                    continue
+                if str(path).startswith(str(root)):
+                    return True
+        return False
+
+    @staticmethod
+    def _is_write_mode(mode: str) -> bool:
+        return any(token in mode for token in ("w", "a", "+", "x"))
+
+    @staticmethod
+    def _coerce_path(file: object) -> Optional[Path]:
+        if isinstance(file, (str, bytes, os.PathLike)):
+            return Path(file)
+        return None
+
+    @staticmethod
+    def _normalise(path: os.PathLike[str] | str) -> Path:
+        return Path(path).expanduser().resolve(strict=False)
+
+
+safety_manager = SafetyManager()
+safety_manager.install_file_guard()
+safety_manager.add_protected_path(Path("AGENT.md"))
+safety_manager.add_protected_directory(Path("errors"))
+
+
+# ============================================================================
+# Prompt Loader (Inlined from Dev_Logic/prompt_loader.py)
+# ============================================================================
+
+
+PROMPTS_DIR = DEV_LOGIC_ROOT / "prompts"
+
+
+@dataclass(frozen=True)
+class PromptDefinition:
+    """Static metadata describing a prompt bundle."""
+
+    slug: str
+    title: str
+    description: str
+    default: str = ""
+
+    @property
+    def base_path(self) -> Path:
+        return PROMPTS_DIR / f"{self.slug}.txt"
+
+    @property
+    def overlay_path(self) -> Path:
+        return PROMPTS_DIR / f"{self.slug}.overlay.txt"
+
+
+class PromptWatcher:
+    """Caches prompt text and refreshes when the underlying files change."""
+
+    def __init__(self, definition: PromptDefinition):
+        self._definition = definition
+        self._lock = RLock()
+        self._cached_text: str = ""
+        self._mtimes: tuple[Optional[float], Optional[float]] = (None, None)
+        PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+        self._load(initial=True)
+
+    @property
+    def definition(self) -> PromptDefinition:
+        return self._definition
+
+    @property
+    def base_path(self) -> Path:
+        return self._definition.base_path
+
+    @property
+    def overlay_path(self) -> Path:
+        return self._definition.overlay_path
+
+    def text(self) -> str:
+        """Return the prompt text, reloading if files changed."""
+
+        with self._lock:
+            current = (self._stat(self.base_path), self._stat(self.overlay_path))
+            if current != self._mtimes:
+                self._load()
+            return self._cached_text
+
+    def reload(self) -> None:
+        """Force a reload regardless of modification times."""
+
+        with self._lock:
+            self._load()
+
+    def _load(self, initial: bool = False) -> None:
+        base_text = self._read_file(self.base_path)
+        if not base_text.strip():
+            base_text = self._definition.default
+            if initial and self._definition.default and not self.base_path.exists():
+                self.base_path.parent.mkdir(parents=True, exist_ok=True)
+                self.base_path.write_text(
+                    self._definition.default + "\n", encoding="utf-8"
+                )
+                base_text = self._definition.default
+        overlay_text = self._read_file(self.overlay_path)
+        combined = base_text.strip()
+        overlay_clean = overlay_text.strip()
+        if overlay_clean:
+            combined = f"{combined}\n\n{overlay_clean}" if combined else overlay_clean
+        if not combined.strip():
+            combined = self._definition.default
+        self._cached_text = combined
+        self._mtimes = (self._stat(self.base_path), self._stat(self.overlay_path))
+
+    def _read_file(self, path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+
+    def _stat(self, path: Path) -> Optional[float]:
+        try:
+            return path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+
+
+_PROMPT_DEFINITIONS: Dict[str, PromptDefinition] = {
+    "codex_system": PromptDefinition(
+        slug="codex_system",
+        title="Codex System Prompt",
+        description="Core persona for the coding operator.",
+        default=(
+            "You are Codex-Local's coding operator. Work entirely within this local "
+            "workspace without network access. Translate user goals into exact shell "
+            "commands and code edits, think through each plan before running it, and "
+            "narrate critical decisions. The Codex interpreter may automatically prompt "
+            "you to continue executing work; resume only when the requested path is "
+            "safe and justified. When the requested work is complete, announce "
+            "completion and emit `STOP` on its own line so downstream tooling halts "
+            "cleanly. Respect safety guardrails, request confirmation for destructive "
+            "steps, and prefer deterministic, minimal changes that keep tests green."
+        ),
+    ),
+    "chat_system": PromptDefinition(
+        slug="chat_system",
+        title="Chat System Prompt",
+        description="Conversational analysis and planning persona.",
+        default=(
+            "You are Codex-Local's planning and explanation companion. Provide "
+            "thorough analysis, cite relevant repository context, and propose "
+            "actionable next steps. Keep guidance grounded in files that exist locally, "
+            "flag assumptions or risks, and delegate execution details to the coding "
+            "operator when commands must be run. Anticipate interpreter auto-continue "
+            "loops by outlining the next safe action and reminding the operator to "
+            "declare completion. When work is finished, ensure the response includes an "
+            "explicit completion note plus a standalone `STOP` line."
+        ),
+    ),
+    "codex_shell": PromptDefinition(
+        slug="codex_shell",
+        title="Codex Shell Prompt",
+        description="Translator from natural language intent to shell commands.",
+        default=(
+            "You convert natural language intent into concrete shell commands for "
+            "Codex-Local. Use POSIX-friendly syntax unless the session explicitly "
+            "targets another shell. Compose small, deterministic command sequences, "
+            "include safety flags, and never guess at paths that do not exist. Expect "
+            "interpreter auto-continue prompts; prepare follow-up commands only when "
+            "prior output requires them. When no further safe commands remain, state "
+            "that execution is complete and output `STOP` on its own line so automation "
+            "knows to halt. If a request is ambiguous, return a brief question instead "
+            "of a risky command."
+        ),
+    ),
+    "voice_system": PromptDefinition(
+        slug="voice_system",
+        title="Voice System Prompt",
+        description="Speech transcription and routing persona.",
+        default=(
+            "You run Codex-Local's voice interface. Listen for wake phrases, "
+            "transcribe speech accurately, and summarize intent in concise text. "
+            "Never execute commands yourself; hand the cleaned request to the "
+            "appropriate agent. Preserve privacy by keeping audio-derived data local "
+            "and discarding snippets once they are processed.\n\n"
+            "Interpreter awareness:\n"
+            "- Flag when a spoken request will trigger the coding interpreter so the "
+            "user knows auto-continue may occur.\n"
+            "- Remind the operator that completion replies must include a clear stop "
+            "sentence plus a standalone `STOP` line."
+        ),
+    ),
+}
+
+_PROMPT_CACHE: Dict[str, PromptWatcher] = {}
+_PROMPT_CACHE_LOCK = RLock()
+
+
+def get_prompt_watcher(slug: str) -> PromptWatcher:
+    """Return (and cache) the watcher for *slug*."""
+
+    with _PROMPT_CACHE_LOCK:
+        watcher = _PROMPT_CACHE.get(slug)
+        if watcher is None:
+            definition = _PROMPT_DEFINITIONS.get(slug)
+            if definition is None:
+                raise KeyError(f"Unknown prompt slug: {slug}")
+            watcher = PromptWatcher(definition)
+            _PROMPT_CACHE[slug] = watcher
+        return watcher
+
+
+def prompt_text(slug: str) -> str:
+    """Convenience wrapper returning the combined text for *slug*."""
+
+    return get_prompt_watcher(slug).text()
+
+
+def iter_prompt_definitions() -> Iterable[PromptDefinition]:
+    """Iterate over known prompt definitions in a stable order."""
+
+    for key in sorted(_PROMPT_DEFINITIONS.keys()):
+        yield _PROMPT_DEFINITIONS[key]
+
+
+# ============================================================================
+# Image Pipeline (Inlined from Dev_Logic/image_pipeline.py)
+# ============================================================================
+
+
+_PYTESSERACT_MODULE_NAME = "pytesseract"
+
+if importlib.util.find_spec(_PYTESSERACT_MODULE_NAME):
+    import pytesseract  # type: ignore  # noqa: F401
+else:
+    pytesseract = None  # type: ignore[assignment]
+
+
+class VisionClient(Protocol):
+    """Minimal protocol for Ollama-like chat clients."""
+
+    def chat(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[str]] = None,
+    ) -> Tuple[bool, str, str]:
+        ...
+
+
+@dataclass
+class OCRResult:
+    """Structured result returned by :func:`perform_ocr`."""
+
+    text: str
+    markdown: str
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+@dataclass
+class VisionResult:
+    """Structured result returned by :func:`analyze_image`."""
+
+    summary: str
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
+
+
+def _normalise_markdown(text: str) -> str:
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    cleaned: List[str] = []
+    blank = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if not blank and cleaned:
+                cleaned.append("")
+            blank = True
+            continue
+        blank = False
+        cleaned.append(stripped)
+    return "\n".join(cleaned).strip()
+
+
+def _ensure_image(path: Path) -> Optional[Path]:
+    if path.exists():
+        return path
+    return None
+
+
+def _encode_png_base64(path: Path) -> Optional[str]:
+    if Image is None:
+        try:
+            data = path.read_bytes()
+        except Exception:
+            return None
+        return base64.b64encode(data).decode("ascii")
+
+    try:
+        with Image.open(path) as img:
+            buffer = io.BytesIO()
+            img.convert("RGBA").save(buffer, format="PNG", optimize=True)
+            return base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:
+        try:
+            data = path.read_bytes()
+        except Exception:
+            return None
+        return base64.b64encode(data).decode("ascii")
+
+
+def perform_ocr(
+    image_path: Path | str,
+    *,
+    engine: Optional[Any] = None,
+    language: str = "eng",
+) -> OCRResult:
+    """Run OCR over *image_path* returning Markdown text or an error."""
+
+    path = _ensure_image(Path(image_path))
+    if path is None:
+        return OCRResult("", "", error="Image not found")
+
+    if Image is None:
+        return OCRResult("", "", error="Pillow not installed")
+
+    ocr_engine = engine or pytesseract
+    if ocr_engine is None:
+        return OCRResult("", "", error="pytesseract not installed")
+
+    try:
+        with Image.open(path) as img:
+            greyscale = img.convert("L")
+            text = ocr_engine.image_to_string(greyscale, lang=language)
+    except Exception as exc:
+        return OCRResult("", "", error=str(exc))
+
+    text = text.strip()
+    if not text:
+        return OCRResult("", "", error="No text detected")
+
+    markdown = _normalise_markdown(text)
+    return OCRResult(text=text, markdown=markdown)
+
+
+def analyze_image(
+    image_path: Path | str,
+    ocr_text: str,
+    *,
+    client: Optional[VisionClient],
+    model: str,
+    user_text: str = "",
+) -> VisionResult:
+    """Ask a vision-language model to describe *image_path*."""
+
+    path = _ensure_image(Path(image_path))
+    if path is None:
+        return VisionResult("", error="Image not found")
+
+    if client is None:
+        return VisionResult("", error="No vision client configured")
+
+    b64 = _encode_png_base64(path)
+    if not b64:
+        return VisionResult("", error="Unable to encode image")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a meticulous vision assistant. Use the provided OCR "
+                "Markdown as factual ground truth and summarise UI elements, "
+                "notable numbers, and potential actions succinctly."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User request: {user_text or '(none)'}\n\nOCR Markdown:\n{ocr_text or '(empty)'}"
+            ),
+        },
+    ]
+
+    ok, summary, err = client.chat(model=model, messages=messages, images=[b64])
+    if not ok:
+        return VisionResult("", error=err or "Vision model error")
+
+    summary = summary.strip()
+    if not summary:
+        return VisionResult("", error="Vision model returned no text")
+
+    return VisionResult(summary=summary)
+
+
+# ============================================================================
+# Repository Index (Inlined from Dev_Logic/memory_manager.py)
+# ============================================================================
+
+
+DATASETS_ROOT = DEV_LOGIC_ROOT / "datasets"
+
+Vector = List[float]
+TextEmbedder = Callable[[str], Sequence[float]]
+
+_FALLBACK_EMBED_DIM = 16
+_REPO_DEFAULT_EXCLUDE = {
+    ".git",
+    "__pycache__",
+    "datasets",
+    "errors",
+    "memory",
+    "Archived Conversations",
+}
+_MAX_INDEX_FILE_SIZE = 256_000
+_WINDOW_SIZE = 60
+_WINDOW_OVERLAP = 10
+
+
+def _hash_embedding(data: bytes, dims: int = _FALLBACK_EMBED_DIM) -> Vector:
+    if not data:
+        return [0.0] * dims
+
+    digest = hashlib.blake2b(data, digest_size=dims * 4).digest()
+    ints = [
+        int.from_bytes(digest[i : i + 4], "big", signed=False)
+        for i in range(0, len(digest), 4)
+    ]
+    vec = [value / 4294967295.0 for value in ints]
+    norm = math.sqrt(sum(component * component for component in vec))
+    if norm == 0:
+        return vec
+    return [component / norm for component in vec]
+
+
+def _fallback_repo_embedding(text: str) -> Vector:
+    tokens = [
+        token for token in re.findall(r"[A-Za-z0-9_]+", text.lower()) if token
+    ]
+    if not tokens:
+        return _hash_embedding(text.encode("utf-8"))
+    dims = _FALLBACK_EMBED_DIM
+    vec = [0.0] * dims
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        index = int.from_bytes(digest[:4], "big") % dims
+        vec[index] += 1.0
+    norm = math.sqrt(sum(component * component for component in vec))
+    if norm == 0:
+        return vec
+    return [component / norm for component in vec]
+
+
+def _ensure_vector(value: Any) -> Vector:
+    if isinstance(value, list):
+        result: Vector = []
+        for item in value:
+            try:
+                result.append(float(item))
+            except (TypeError, ValueError):
+                return []
+        return result
+    return []
+
+
+def _cosine(a: Vector, b: Vector) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    da = math.sqrt(sum(x * x for x in a))
+    db = math.sqrt(sum(y * y for y in b))
+    if da == 0 or db == 0:
+        return 0.0
+    return dot / (da * db)
+
+
+@dataclass(slots=True)
+class _RepoSegment:
+    path: Path
+    start_line: int
+    end_line: int
+    text: str
+    metadata: Dict[str, Any]
+
+
+@dataclass(slots=True)
+class _RepoIndexRecord:
+    identifier: str
+    path: str
+    start_line: int
+    end_line: int
+    text: str
+    embedding: Vector
+    metadata: Dict[str, Any]
+    timestamp: float
+
+    def score(self, query_vec: Vector) -> float:
+        if not self.embedding or not query_vec:
+            return 0.0
+        return _cosine(query_vec, self.embedding)
+
+
+def _segment_identifier(path: str, start_line: int, end_line: int) -> str:
+    payload = f"{path}:{start_line}:{end_line}".encode("utf-8", "ignore")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+class RepositoryIndex:
+    """Build and query a lightweight repository text index."""
+
+    def __init__(
+        self,
+        repo_root: Optional[Path | str] = None,
+        data_root: Optional[Path | str] = None,
+        *,
+        text_embedder: Optional[TextEmbedder] = None,
+        enable_embeddings: bool = True,
+        include_extensions: Optional[Sequence[str]] = None,
+        exclude_dirs: Optional[Sequence[str]] = None,
+        extra_roots: Optional[Sequence[Path | str]] = None,
+    ) -> None:
+        base_repo = (
+            Path(repo_root)
+            if repo_root is not None
+            else Path(__file__).resolve().parent
+        )
+        self.repo_root = base_repo.resolve()
+        base_data = (
+            Path(data_root)
+            if data_root is not None
+            else DATASETS_ROOT
+        )
+        self.data_root = base_data.resolve()
+        self.index_dir = self.data_root / "repo_index"
+        self.index_path = self.index_dir / "index.jsonl"
+        self.manifest_path = self.index_dir / "manifest.json"
+        self.enable_embeddings = enable_embeddings
+        self._text_embedder = text_embedder or _fallback_repo_embedding
+        self._include_extensions = (
+            tuple(include_extensions) if include_extensions else None
+        )
+        self._exclude_dirs = set(exclude_dirs) if exclude_dirs else set(
+            _REPO_DEFAULT_EXCLUDE
+        )
+        extras: List[Path] = []
+        seen: Set[Path] = {self.repo_root}
+        if extra_roots:
+            for entry in extra_roots:
+                try:
+                    candidate = Path(entry).expanduser().resolve()
+                except Exception:
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                extras.append(candidate)
+        self._extra_roots: Tuple[Path, ...] = tuple(extras)
+        self._roots: Tuple[Path, ...] = (self.repo_root, *self._extra_roots)
+        self._records: List[_RepoIndexRecord] = []
+        self._loaded = False
+        self._lock = RLock()
+
+    def rebuild(self) -> Dict[str, Any]:
+        segments: List[Tuple[Path, _RepoSegment]] = []
+        files_indexed = 0
+        timestamp = time.time()
+
+        for base_root, path in self._iter_repo_files():
+            text = self._read_file_text(path)
+            if text is None:
+                continue
+            files_indexed += 1
+            for segment in self._segment_file(path, text):
+                segments.append((base_root, segment))
+
+        entries = []
+        for base_root, segment in segments:
+            rel_path = self._relative_path(segment.path, base_root)
+            embedding: Vector = []
+            if self.enable_embeddings and segment.text.strip():
+                embedding = self._embed_text(segment.text)
+            record_id = _segment_identifier(
+                rel_path, segment.start_line, segment.end_line
+            )
+            metadata = dict(segment.metadata)
+            metadata.setdefault("scan_root", str(base_root))
+            entry = {
+                "id": record_id,
+                "path": rel_path,
+                "start_line": segment.start_line,
+                "end_line": segment.end_line,
+                "text": segment.text,
+                "embedding": embedding,
+                "metadata": metadata,
+                "ts": timestamp,
+            }
+            entries.append(entry)
+
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._write_index(entries)
+        tmp_path.replace(self.index_path)
+
+        embed_dim = 0
+        if entries and entries[0]["embedding"]:
+            embed_dim = len(entries[0]["embedding"])
+
+        manifest = {
+            "timestamp": timestamp,
+            "segments": len(entries),
+            "files_indexed": files_indexed,
+            "embedding_dim": embed_dim,
+        }
+        with self.manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
+
+        records = [
+            _RepoIndexRecord(
+                identifier=entry["id"],
+                path=str(entry["path"]),
+                start_line=int(entry["start_line"]),
+                end_line=int(entry["end_line"]),
+                text=str(entry["text"]),
+                embedding=_ensure_vector(entry.get("embedding")),
+                metadata=dict(entry.get("metadata") or {}),
+                timestamp=float(entry.get("ts") or timestamp),
+            )
+            for entry in entries
+        ]
+
+        with self._lock:
+            self._records = records
+            self._loaded = True
+
+        return {
+            "files_indexed": files_indexed,
+            "segments": len(entries),
+            "timestamp": timestamp,
+            "index_path": self.index_path,
+        }
+
+    def load(self) -> None:
+        with self._lock:
+            if self._loaded:
+                return
+            self._load_locked()
+
+    def iter_segments(self) -> Iterable[Dict[str, Any]]:
+        self.load()
+        with self._lock:
+            for record in self._records:
+                yield {
+                    "id": record.identifier,
+                    "path": record.path,
+                    "start_line": record.start_line,
+                    "end_line": record.end_line,
+                    "text": record.text,
+                    "metadata": dict(record.metadata),
+                    "timestamp": record.timestamp,
+                }
+
+    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        query_text = query.strip()
+        if not query_text or k <= 0 or not self.enable_embeddings:
+            return []
+
+        query_vec = self._embed_text(query_text)
+        if not query_vec:
+            return []
+
+        self.load()
+
+        with self._lock:
+            records = list(self._records)
+
+        scored: List[Tuple[float, _RepoIndexRecord]] = []
+        for record in records:
+            score = record.score(query_vec)
+            if score <= 0:
+                continue
+            scored.append((score, record))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        results: List[Dict[str, Any]] = []
+        for score, record in scored[:k]:
+            results.append(
+                {
+                    "id": record.identifier,
+                    "path": record.path,
+                    "start_line": record.start_line,
+                    "end_line": record.end_line,
+                    "text": record.text,
+                    "metadata": dict(record.metadata),
+                    "score": score,
+                    "timestamp": record.timestamp,
+                }
+            )
+        return results
+
+    def _embed_text(self, text: str) -> Vector:
+        vec = self._text_embedder(text) if text else []
+        return [float(value) for value in vec]
+
+    def _iter_repo_files(self) -> Iterable[Tuple[Path, Path]]:
+        for base_root in self._roots:
+            if not base_root.exists():
+                continue
+            try:
+                base_resolved = base_root.resolve()
+            except Exception:
+                base_resolved = base_root
+            for root, dirs, files in os.walk(base_root):
+                path_root = Path(root)
+                try:
+                    relative_parts = set(path_root.relative_to(base_resolved).parts)
+                except ValueError:
+                    relative_parts = set()
+                if relative_parts & self._exclude_dirs:
+                    dirs[:] = []
+                    continue
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if name not in self._exclude_dirs and not name.endswith(".egg-info")
+                ]
+                for name in files:
+                    candidate = path_root / name
+                    if candidate.is_symlink():
+                        continue
+                    if (
+                        self._include_extensions
+                        and candidate.suffix not in self._include_extensions
+                    ):
+                        continue
+                    yield base_resolved, candidate
+
+    def _read_file_text(self, path: Path) -> Optional[str]:
+        try:
+            if path.stat().st_size > _MAX_INDEX_FILE_SIZE:
+                return None
+        except OSError:
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return None
+        except OSError:
+            return None
+
+    def _segment_file(self, path: Path, text: str) -> List[_RepoSegment]:
+        suffix = path.suffix.lower()
+        lines = text.splitlines()
+        if suffix == ".py":
+            segments = self._segment_python(path, lines)
+            if segments:
+                return segments
+        if suffix in {".md", ".rst"}:
+            segments = self._segment_markdown(path, lines)
+            if segments:
+                return segments
+        return self._segment_generic(path, lines)
+
+    def _segment_python(self, path: Path, lines: List[str]) -> List[_RepoSegment]:
+        source = "\n".join(lines)
+        try:
+            module = ast.parse(source)
+        except SyntaxError:
+            return []
+
+        segments: List[_RepoSegment] = []
+
+        if module.body:
+            first = module.body[0]
+            if isinstance(first, ast.Expr) and isinstance(
+                getattr(first, "value", None), ast.Constant
+            ):
+                constant = first.value
+                if isinstance(constant.value, str):
+                    start = getattr(first, "lineno", 1)
+                    end = getattr(first, "end_lineno", start)
+                    text_block = self._slice_lines(lines, start, end)
+                    segment = self._make_segment(
+                        path,
+                        start,
+                        end,
+                        text_block,
+                        {"language": "python", "kind": "docstring"},
+                    )
+                    if segment:
+                        segments.append(segment)
+
+        for node in module.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                text_block = self._slice_lines(lines, start, end)
+                segment = self._make_segment(
+                    path,
+                    start,
+                    end,
+                    text_block,
+                    {
+                        "language": "python",
+                        "kind": "function",
+                        "name": getattr(node, "name", ""),
+                    },
+                )
+                if segment:
+                    segments.append(segment)
+            elif isinstance(node, ast.ClassDef):
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                text_block = self._slice_lines(lines, start, end)
+                segment = self._make_segment(
+                    path,
+                    start,
+                    end,
+                    text_block,
+                    {
+                        "language": "python",
+                        "kind": "class",
+                        "name": getattr(node, "name", ""),
+                    },
+                )
+                if segment:
+                    segments.append(segment)
+
+        if not segments:
+            return []
+        return segments
+
+    def _segment_markdown(self, path: Path, lines: List[str]) -> List[_RepoSegment]:
+        segments: List[_RepoSegment] = []
+        total = len(lines)
+        if total == 0:
+            return segments
+        current_start = 0
+        for idx, line in enumerate(lines):
+            if line.lstrip().startswith("#") and idx != current_start:
+                text_block = self._slice_lines(lines, current_start + 1, idx)
+                segment = self._make_segment(
+                    path,
+                    current_start + 1,
+                    idx,
+                    text_block,
+                    {"language": "markdown", "kind": "section"},
+                )
+                if segment:
+                    segments.append(segment)
+                current_start = idx
+        text_block = self._slice_lines(lines, current_start + 1, total)
+        segment = self._make_segment(
+            path,
+            current_start + 1,
+            total,
+            text_block,
+            {"language": "markdown", "kind": "section"},
+        )
+        if segment:
+            segments.append(segment)
+        return segments
+
+    def _segment_generic(self, path: Path, lines: List[str]) -> List[_RepoSegment]:
+        segments: List[_RepoSegment] = []
+        window = max(_WINDOW_SIZE, 1)
+        overlap = min(_WINDOW_OVERLAP, window - 1) if window > 1 else 0
+        total = len(lines)
+        if total == 0:
+            return segments
+        step = window - overlap if window > overlap else window
+        start = 0
+        while start < total:
+            end = min(total, start + window)
+            text_block = self._slice_lines(lines, start + 1, end)
+            segment = self._make_segment(
+                path,
+                start + 1,
+                end,
+                text_block,
+                {"language": self._guess_language(path), "kind": "block"},
+            )
+            if segment:
+                segments.append(segment)
+            if end == total:
+                break
+            start += step
+        return segments
+
+    def _make_segment(
+        self,
+        path: Path,
+        start_line: int,
+        end_line: int,
+        text: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[_RepoSegment]:
+        cleaned = text.strip("\n")
+        if not cleaned.strip():
+            return None
+        return _RepoSegment(
+            path=path,
+            start_line=start_line,
+            end_line=end_line,
+            text=cleaned,
+            metadata=dict(metadata),
+        )
+
+    def _slice_lines(self, lines: List[str], start: int, end: int) -> str:
+        start_index = max(start - 1, 0)
+        end_index = max(start_index, min(end, len(lines)))
+        return "\n".join(lines[start_index:end_index])
+
+    def _guess_language(self, path: Path) -> str:
+        suffix = path.suffix.lower().lstrip(".")
+        if not suffix:
+            return "text"
+        return suffix
+
+    def _relative_path(
+        self, path: Path, base_root: Optional[Path] = None
+    ) -> str:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        roots: List[Path] = []
+        if base_root is not None:
+            roots.append(base_root)
+        roots.append(self.repo_root)
+        for root in roots:
+            try:
+                return resolved.relative_to(root).as_posix()
+            except ValueError:
+                continue
+        return resolved.as_posix()
+
+    def _write_index(self, entries: List[Dict[str, Any]]) -> Path:
+        tmp_file = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", delete=False, dir=self.index_dir
+        )
+        try:
+            for entry in entries:
+                json.dump(entry, tmp_file, ensure_ascii=False)
+                tmp_file.write("\n")
+        finally:
+            tmp_file.close()
+        return Path(tmp_file.name)
+
+    def _load_locked(self) -> None:
+        records: List[_RepoIndexRecord] = []
+        if not self.index_path.exists():
+            self._records = []
+            self._loaded = True
+            return
+        with self.index_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                payload = line.strip()
+                if not payload:
+                    continue
+                try:
+                    entry = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                record = _RepoIndexRecord(
+                    identifier=str(entry.get("id") or ""),
+                    path=str(entry.get("path") or ""),
+                    start_line=int(entry.get("start_line") or 1),
+                    end_line=int(entry.get("end_line") or 1),
+                    text=str(entry.get("text") or ""),
+                    embedding=_ensure_vector(entry.get("embedding")),
+                    metadata=dict(entry.get("metadata") or {}),
+                    timestamp=float(entry.get("ts") or 0.0),
+                )
+                records.append(record)
+        self._records = records
+        self._loaded = True
 
 # ============================================================================
 # Boot & Environment
@@ -7355,12 +8610,12 @@ class ChatCard(QFrame):
                 DEFAULT_SETTINGS.get("reference_token_headroom", 80),
             )
         )
-        budget = token_budget.prompt_token_budget(model, headroom_pct) if guard_enabled else 0
-        message_tokens = token_budget.count_tokens(text, model)
+        budget = prompt_token_budget(model, headroom_pct) if guard_enabled else 0
+        message_tokens = count_tokens(text, model)
 
         context_entries: List[Tuple[str, int]] = []
         for line in context_lines:
-            context_entries.append((line, token_budget.count_tokens(line, model)))
+            context_entries.append((line, count_tokens(line, model)))
 
         base_tokens = message_tokens + sum(tokens for _, tokens in context_entries)
         notices: List[str] = []
@@ -7392,7 +8647,7 @@ class ChatCard(QFrame):
             included: List[str] = []
             skipped = 0
             for payload in payloads:
-                tokens = token_budget.count_tokens(payload, model)
+                tokens = count_tokens(payload, model)
                 if tokens <= available:
                     included.append(payload)
                     available -= tokens
