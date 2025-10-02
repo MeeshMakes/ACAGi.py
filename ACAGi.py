@@ -3112,7 +3112,7 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     "observation.delta",
     "note",
     "note.appended",
-    "task",
+    "task",  
     "task.created",
     "task.updated",
     "task.status",
@@ -3122,6 +3122,7 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     "task.bucket",
     "task.bucket.stage",
     "task.bucket.error",
+    "task.bucket.telemetry",
     # System coordination and metrics feeds.
     "system.metrics",
     "system.process",
@@ -3658,9 +3659,490 @@ class TaskBucketStageContext:
         self.dispatcher.publish(topic, enriched)
 
 
+@dataclass(slots=True)
+class AnchoredPatch:
+    """Anchored representation of a coder-generated repository patch."""
+
+    anchor: str
+    files: List[str]
+    diff: str
+    rationale: str
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise the patch for downstream telemetry consumers."""
+
+        return {
+            "anchor": self.anchor,
+            "files": list(self.files),
+            "diff": self.diff,
+            "rationale": self.rationale,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(slots=True)
+class ValidationCommand:
+    """Normalised description of a validation command executed by Test."""
+
+    command: List[str]
+    description: str
+    timeout: Optional[int] = None
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    """Captured stdout/stderr artefacts for a validation run."""
+
+    command: List[str]
+    description: str
+    returncode: int
+    stdout: str
+    stderr: str
+    duration: float
+    started_at: float
+    completed_at: float
+
+    @property
+    def status(self) -> str:
+        """Return ``passed`` when the command exited cleanly."""
+
+        return "passed" if self.returncode == 0 else "failed"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Render the validation result for bucket metadata."""
+
+        return {
+            "command": list(self.command),
+            "description": self.description,
+            "returncode": int(self.returncode),
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "duration": round(self.duration, 4),
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "status": self.status,
+        }
+
+
+class TaskBucketStageError(RuntimeError):
+    """Raised when a lifecycle stage encounters a recoverable failure."""
+
+
+def _derive_patch_anchor(bucket_id: str, diff_text: str) -> str:
+    """Return a deterministic anchor for ``diff_text`` scoped to ``bucket_id``."""
+
+    digest = hashlib.sha1(diff_text.encode("utf-8")).hexdigest()[:8]
+    return f"{bucket_id}-patch-{digest}"
+
+
+def _compose_patch_rationale(bucket: TaskBucket) -> str:
+    """Construct a rationale string describing the captured patch."""
+
+    lines: List[str] = []
+    for task in bucket.tasks:
+        lines.append(f"- Task {task.id}: {task.title}")
+    if bucket.notes:
+        lines.append("Existing notes:")
+        for note in bucket.notes[-3:]:
+            lines.append(f"  • {note}")
+    if not lines:
+        lines.append(
+            "No linked tasks; captured workspace diff snapshot for follow-up review."
+        )
+    return "\n".join(lines)
+
+
+def _normalise_validation_entries(
+    raw: Optional[Iterable[Any]],
+) -> List[ValidationCommand]:
+    """Return structured validation commands parsed from ``raw``."""
+
+    if not raw:
+        return []
+    commands: List[ValidationCommand] = []
+    for entry in raw:
+        command: List[str] = []
+        description = ""
+        timeout: Optional[int] = None
+        if isinstance(entry, Mapping):
+            payload = entry
+            cmd = payload.get("command") or payload.get("cmd")
+            if isinstance(cmd, str):
+                command = shlex.split(cmd)
+            elif isinstance(cmd, Sequence):
+                command = [str(part) for part in cmd if str(part).strip()]
+            description = str(payload.get("description") or "").strip()
+            timeout_val = payload.get("timeout")
+            if isinstance(timeout_val, (int, float)):
+                timeout = int(timeout_val)
+        elif isinstance(entry, str):
+            command = shlex.split(entry)
+        elif isinstance(entry, Sequence):
+            command = [str(part) for part in entry if str(part).strip()]
+        if not command:
+            continue
+        if not description:
+            description = " ".join(command)
+        commands.append(
+            ValidationCommand(
+                command=command,
+                description=description,
+                timeout=timeout,
+            )
+        )
+    return commands
+
+
+def _run_validation_command(cmd: ValidationCommand) -> ValidationResult:
+    """Execute ``cmd`` and capture stdout/stderr for telemetry."""
+
+    start_wall = time.time()
+    start = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            cmd.command,
+            capture_output=True,
+            text=True,
+            timeout=cmd.timeout or 300,
+            check=False,
+        )
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        returncode = completed.returncode
+    except subprocess.TimeoutExpired:
+        stdout = ""
+        stderr = f"Timeout after {cmd.timeout or 300}s"
+        returncode = -1
+    except FileNotFoundError as exc:
+        stdout = ""
+        stderr = f"Executable not found: {exc}"
+        returncode = -1
+    except Exception as exc:  # pragma: no cover - defensive logging
+        stdout = ""
+        stderr = f"Validation crashed: {exc}"
+        returncode = -1
+    duration = time.perf_counter() - start
+    return ValidationResult(
+        command=list(cmd.command),
+        description=cmd.description,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        duration=duration,
+        started_at=start_wall,
+        completed_at=time.time(),
+    )
+
+
+def _run_git(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Execute a git command and raise :class:`TaskBucketStageError` on failure."""
+
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "git failed"
+        raise TaskBucketStageError(f"git {' '.join(args)} failed: {message}")
+    return result
+
+
+def _collect_repo_diff(files: Iterable[str]) -> Tuple[List[str], str]:
+    """Return touched files and a unified diff for ``files`` when available."""
+
+    file_list = [str(path) for path in files if str(path).strip()]
+    file_args = ["--", *sorted(set(file_list))] if file_list else []
+    try:
+        names = _run_git(["diff", "--name-only", "HEAD", *file_args])
+    except TaskBucketStageError:
+        names = _run_git(["diff", "--name-only", "HEAD"])
+    touched = [
+        os.path.normpath(line)
+        for line in names.stdout.splitlines()
+        if line.strip()
+    ]
+    try:
+        diff_proc = _run_git(["diff", "--unified=8", "HEAD", *file_args])
+    except TaskBucketStageError:
+        diff_proc = _run_git(["diff", "--unified=8", "HEAD"])
+    diff_text = diff_proc.stdout
+    return touched, diff_text
+
+
+def _update_bucket_telemetry(
+    shared: MutableMapping[str, Any], scope: str, payload: Mapping[str, Any]
+) -> None:
+    """Persist telemetry ``payload`` for ``scope`` within ``shared``."""
+
+    telemetry = shared.setdefault("bucket_telemetry", {})
+    telemetry[scope] = dict(payload)
+
+
+def coder_apply_stage(context: TaskBucketStageContext) -> TaskBucketStageResult:
+    """Generate anchored patches from workspace diffs for the Apply stage."""
+
+    bucket = context.bucket
+    touched, diff_text = _collect_repo_diff(bucket.touched_files or [])
+    if diff_text.strip():
+        anchor = _derive_patch_anchor(bucket.identifier, diff_text)
+        rationale = _compose_patch_rationale(bucket)
+        patch = AnchoredPatch(
+            anchor=anchor,
+            files=touched,
+            diff=diff_text,
+            rationale=rationale,
+        )
+        patches = [patch.to_dict()]
+        note = (
+            f"Captured patch {anchor} touching {len(touched)} file(s) for review."
+        )
+        metadata = {
+            "coder": {
+                "patches": patches,
+                "generated_at": patch.created_at,
+            }
+        }
+        bucket.add_touched_files(touched)
+        context.shared.setdefault("coder", {})["patches"] = patches
+        _update_bucket_telemetry(
+            context.shared,
+            "coder",
+            {
+                "patch_anchor": anchor,
+                "files": len(touched),
+                "generated_at": patch.created_at,
+            },
+        )
+        context.publish(
+            "task.diff",
+            {
+                "anchor": anchor,
+                "files": touched,
+                "rationale": rationale,
+                "diff": diff_text,
+            },
+        )
+    else:
+        note = "No workspace modifications detected; coder emitted empty patch."
+        metadata = {
+            "coder": {
+                "patches": [],
+                "generated_at": time.time(),
+            }
+        }
+        context.shared.setdefault("coder", {})["patches"] = []
+        _update_bucket_telemetry(
+            context.shared,
+            "coder",
+            {"patch_anchor": None, "files": 0, "generated_at": time.time()},
+        )
+    context.logger.info(
+        "Task bucket %s apply stage note=%s", bucket.identifier, note
+    )
+    return TaskBucketStageResult(
+        touched_files=touched,
+        note=note,
+        metadata=metadata,
+    )
+
+
+def tester_validation_stage(
+    context: TaskBucketStageContext,
+) -> Optional[TaskBucketStageResult]:
+    """Run configured validation commands and attach their artefacts."""
+
+    bucket = context.bucket
+    shared = context.shared
+    raw_commands: List[Any] = []
+    metadata_commands = bucket.metadata.get("validation_commands")
+    if isinstance(metadata_commands, (str, bytes)):
+        raw_commands.append(metadata_commands)
+    elif isinstance(metadata_commands, Iterable):
+        raw_commands.extend(metadata_commands)  # type: ignore[arg-type]
+    shared_commands = shared.get("planned_validations") or []
+    if isinstance(shared_commands, (str, bytes)):
+        raw_commands.append(shared_commands)
+    elif isinstance(shared_commands, Iterable):
+        raw_commands.extend(shared_commands)  # type: ignore[arg-type]
+    commands = _normalise_validation_entries(raw_commands)
+    if not commands:
+        note = "No validation commands configured; skipping test stage."
+        _update_bucket_telemetry(
+            shared,
+            "test",
+            {"executed": 0, "passed": 0, "failed": 0, "status": "skipped"},
+        )
+        context.shared.setdefault("tester", {})["validations"] = []
+        return TaskBucketStageResult(
+            note=note,
+            metadata={
+                "test": {
+                    "validations": [],
+                    "status": "skipped",
+                }
+            },
+        )
+
+    results: List[ValidationResult] = []
+    failures = 0
+    for cmd in commands:
+        context.logger.info(
+            "Executing validation command for bucket %s: %s",
+            bucket.identifier,
+            cmd.description,
+        )
+        result = _run_validation_command(cmd)
+        results.append(result)
+        if result.returncode != 0:
+            failures += 1
+
+    payload = [result.to_dict() for result in results]
+    context.shared.setdefault("tester", {})["validations"] = payload
+    _update_bucket_telemetry(
+        shared,
+        "test",
+        {
+            "executed": len(results),
+            "passed": len(results) - failures,
+            "failed": failures,
+            "status": "failed" if failures else "passed",
+        },
+    )
+    note = (
+        f"Ran {len(results)} validation command(s); {failures} reported failures."
+    )
+    metadata = {
+        "test": {
+            "validations": payload,
+            "status": "failed" if failures else "passed",
+        }
+    }
+    if failures:
+        bucket.update_metadata(metadata["test"])
+        bucket.stage_state(context.stage).note = note
+        context.logger.warning(
+            "Validation failures detected for bucket %s stage=%s",
+            bucket.identifier,
+            context.stage.value,
+        )
+        raise TaskBucketStageError(note)
+    return TaskBucketStageResult(note=note, metadata=metadata)
+
+
+def verifier_review_stage(
+    context: TaskBucketStageContext,
+) -> TaskBucketStageResult:
+    """Consolidate coder/test artefacts and broadcast telemetry."""
+
+    shared = context.shared
+    coder_meta = shared.get("coder", {})
+    tester_meta = shared.get("tester", {})
+    patches = coder_meta.get("patches", [])
+    validations = tester_meta.get("validations", [])
+    passed = len([item for item in validations if item.get("status") == "passed"])
+    failed = len([item for item in validations if item.get("status") == "failed"])
+    status = "ready" if patches and failed == 0 else "blocked"
+    telemetry_payload = {
+        "patches": len(patches),
+        "validations_passed": passed,
+        "validations_failed": failed,
+        "status": status,
+        "timestamp": time.time(),
+    }
+    _update_bucket_telemetry(shared, "verify", telemetry_payload)
+    context.publish("task.bucket.telemetry", telemetry_payload)
+    note = (
+        "Verifier marked bucket ready for promotion."
+        if status == "ready"
+        else "Verifier blocked promotion pending review."
+    )
+    metadata = {"verify": {"telemetry": telemetry_payload, "status": status}}
+    context.logger.info(
+        "Task bucket %s verify stage status=%s",
+        context.bucket.identifier,
+        status,
+    )
+    return TaskBucketStageResult(note=note, metadata=metadata)
+
+
 TaskBucketStageHandler = Callable[
     [TaskBucketStageContext], Optional[TaskBucketStageResult]
 ]
+
+
+def _handle_bucket_stage_failure(
+    bucket: TaskBucket,
+    stage: TaskBucketStage,
+    exc: BaseException,
+    shared: MutableMapping[str, Any],
+    logger: logging.Logger,
+) -> None:
+    """Queue Rationalizer follow-up and persist the latest failure learning."""
+
+    error_message = f"{type(exc).__name__}: {exc}"
+    task_labels = [f"{task.id}:{task.title}" for task in bucket.tasks]
+    summary_parts = [
+        f"Task bucket {bucket.identifier} stage {stage.value} failed with {error_message}.",
+    ]
+    if task_labels:
+        joined = "; ".join(task_labels[:5])
+        if len(task_labels) > 5:
+            joined += "; …"
+        summary_parts.append(f"Tasks: {joined}.")
+    telemetry_snapshot = shared.get("bucket_telemetry", {})
+    if isinstance(telemetry_snapshot, Mapping) and telemetry_snapshot:
+        keys = ", ".join(sorted(str(key) for key in telemetry_snapshot.keys()))
+        summary_parts.append(f"Telemetry keys: {keys}.")
+    summary = " ".join(summary_parts)
+
+    manager = rationalizer_manager()
+    if manager is not None:
+        try:
+            manager.queue_intent_segmentation(
+                summary,
+                metadata={
+                    "bucket_id": bucket.identifier,
+                    "stage": stage.value,
+                    "tasks": [task.id for task in bucket.tasks],
+                },
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.debug(
+                "Failed to queue rationalizer job for bucket %s stage=%s",
+                bucket.identifier,
+                stage.value,
+                exc_info=True,
+            )
+
+    try:
+        memory_services().lessons.upsert_lesson(
+            title="Task bucket failure rationalization",
+            summary=summary,
+            applies_to="task-orchestration",
+            anchor=f"task-bucket-{stage.value}-failure-learning",
+            metadata={
+                "bucket_id": bucket.identifier,
+                "stage": stage.value,
+                "error": error_message,
+                "timestamp": time.time(),
+                "tasks": [task.id for task in bucket.tasks],
+                "telemetry": (
+                    dict(telemetry_snapshot)
+                    if isinstance(telemetry_snapshot, Mapping)
+                    else {}
+                ),
+            },
+        )
+    except Exception:  # pragma: no cover - defensive logging
+        logger.debug(
+            "Unable to persist bucket failure learning for bucket %s stage=%s",
+            bucket.identifier,
+            stage.value,
+            exc_info=True,
+        )
 
 
 @dataclass(slots=True)
@@ -3870,6 +4352,7 @@ class TaskBucketLifecycleRunner:
                 stage.value,
                 bucket.identifier,
             )
+            _handle_bucket_stage_failure(bucket, stage, exc, shared, self._logger)
             raise
 
         bucket.apply_stage_result(stage, result)
