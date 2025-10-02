@@ -3129,6 +3129,9 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     "speech.activity",
     "speech.partial",
     "speech.final",
+    # Cortex rationalization outputs.
+    "cortex.intent",
+    "cortex.reference",
 }
 _WILDCARD_TOPIC = "task.*"
 
@@ -3424,6 +3427,654 @@ def is_remote_fanout_enabled() -> bool:
     """Return the dispatcher remote fan-out flag for UI consumers."""
 
     return EVENT_DISPATCHER.remote_enabled()
+
+
+class GateQuotaController:
+    """Coordinate Gate quotas and expose energy/backpressure telemetry."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        limit: int,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._name = name
+        self._limit = max(0, int(limit))
+        self._logger = logger or logging.getLogger(
+            f"{VD_LOGGER_NAME}.gate.{name}"
+        )
+        self._lock = RLock()
+        self._condition = threading.Condition(self._lock)
+        self._waiters = 0
+        self._in_flight = 0
+        self._drops = 0
+
+    # ------------------------------------------------------------------
+    def acquire(self, *, block: bool = True, timeout: Optional[float] = None) -> bool:
+        """Reserve a slot for a worker while respecting the configured quota."""
+
+        with self._condition:
+            if self._limit <= 0:
+                self._drops += 1
+                self._logger.warning(
+                    "Gate %s disabled – rejecting request", self._name
+                )
+                return False
+
+            if self._in_flight < self._limit:
+                self._in_flight += 1
+                self._logger.debug(
+                    "Gate %s granted slot (in_flight=%s limit=%s)",
+                    self._name,
+                    self._in_flight,
+                    self._limit,
+                )
+                return True
+
+            if not block:
+                self._drops += 1
+                self._logger.debug(
+                    "Gate %s denied slot without blocking (limit=%s)",
+                    self._name,
+                    self._limit,
+                )
+                return False
+
+            start = time.monotonic()
+            self._waiters += 1
+            try:
+                while self._in_flight >= self._limit:
+                    remaining = None
+                    if timeout is not None:
+                        elapsed = time.monotonic() - start
+                        remaining = max(0.0, timeout - elapsed)
+                        if remaining == 0.0:
+                            break
+                    self._condition.wait(timeout=remaining)
+                    if timeout is not None and (time.monotonic() - start) >= timeout:
+                        break
+
+                if self._in_flight >= self._limit:
+                    self._drops += 1
+                    self._logger.warning(
+                        "Gate %s timed out waiting for slot (limit=%s)",
+                        self._name,
+                        self._limit,
+                    )
+                    return False
+
+                self._in_flight += 1
+                self._logger.debug(
+                    "Gate %s granted slot after wait (in_flight=%s limit=%s)",
+                    self._name,
+                    self._in_flight,
+                    self._limit,
+                )
+                return True
+            finally:
+                self._waiters = max(0, self._waiters - 1)
+
+    # ------------------------------------------------------------------
+    def release(self) -> None:
+        """Return a slot to the Gate and notify a waiting worker."""
+
+        with self._condition:
+            if self._in_flight > 0:
+                self._in_flight -= 1
+            self._condition.notify()
+            self._logger.debug(
+                "Gate %s released slot (in_flight=%s limit=%s)",
+                self._name,
+                self._in_flight,
+                self._limit,
+            )
+
+    # ------------------------------------------------------------------
+    def update_limit(self, limit: int) -> None:
+        """Adjust the active quota and wake blocked workers if capacity grew."""
+
+        with self._condition:
+            limit = max(0, int(limit))
+            if limit == self._limit:
+                return
+            self._logger.info(
+                "Gate %s limit changed %s → %s", self._name, self._limit, limit
+            )
+            self._limit = limit
+            self._condition.notify_all()
+
+    # ------------------------------------------------------------------
+    def snapshot(self) -> Dict[str, Any]:
+        """Return the current quota utilisation for telemetry consumers."""
+
+        with self._lock:
+            limit = self._limit
+            in_flight = self._in_flight
+            waiters = self._waiters
+            drops = self._drops
+        available = max(0, limit - in_flight)
+        energy = 0.0 if limit <= 0 else max(0.0, available / float(limit))
+        return {
+            "name": self._name,
+            "limit": limit,
+            "in_flight": in_flight,
+            "waiters": waiters,
+            "drops": drops,
+            "energy": round(energy, 4),
+        }
+
+
+class RationalizerTaskType(Enum):
+    """Different workloads executed by the Rationalizer workers."""
+
+    INTENT_SEGMENTATION = "intent_segmentation"
+    REFERENCE_RESOLUTION = "reference_resolution"
+
+
+@dataclass(slots=True)
+class RationalizerJob:
+    """Description of a queued Rationalizer workload."""
+
+    job_id: str
+    task_type: RationalizerTaskType
+    payload: Dict[str, Any]
+    created_at: float
+    conversation_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RationalizerResult:
+    """Structured result emitted by Rationalizer workers."""
+
+    job: RationalizerJob
+    status: str
+    duration: float
+    result: Mapping[str, Any]
+    error: Optional[str] = None
+
+
+class CerebellumScheduler:
+    """Dispatch Rationalizer jobs while respecting Gate quotas."""
+
+    def __init__(
+        self,
+        gate: GateQuotaController,
+        *,
+        queue_limit: int = 16,
+        telemetry_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._gate = gate
+        self._logger = logger or logging.getLogger(
+            f"{VD_LOGGER_NAME}.cerebellum.scheduler"
+        )
+        self._queue: "queue.Queue[Optional[Tuple[RationalizerJob, Callable[[RationalizerJob], None]]]]" = queue.Queue()
+        self._queue_limit = max(1, int(queue_limit))
+        self._telemetry_callback = telemetry_callback
+        self._lock = RLock()
+        self._active_workers = 0
+        self._submitted = 0
+        self._completed = 0
+        self._dropped = 0
+        self._stop_event = threading.Event()
+        self._dispatcher = threading.Thread(
+            target=self._dispatch_loop,
+            name="CerebellumScheduler",
+            daemon=True,
+        )
+        self._dispatcher.start()
+
+    # ------------------------------------------------------------------
+    def configure(self, *, queue_limit: Optional[int] = None) -> None:
+        """Update scheduler settings (queue length) at runtime."""
+
+        if queue_limit is None:
+            return
+        queue_limit = max(1, int(queue_limit))
+        if queue_limit == self._queue_limit:
+            return
+        self._logger.info(
+            "Cerebellum queue limit changed %s → %s",
+            self._queue_limit,
+            queue_limit,
+        )
+        self._queue_limit = queue_limit
+        self._emit_metrics()
+
+    # ------------------------------------------------------------------
+    def submit(
+        self,
+        job: RationalizerJob,
+        handler: Callable[[RationalizerJob], None],
+    ) -> bool:
+        """Queue ``job`` for execution, returning ``True`` on success."""
+
+        with self._lock:
+            if self._queue.qsize() >= self._queue_limit:
+                self._dropped += 1
+                self._logger.warning(
+                    "Cerebellum queue full – dropping job %s", job.job_id
+                )
+                self._emit_metrics()
+                return False
+            self._submitted += 1
+            self._queue.put((job, handler))
+            self._logger.info(
+                "Queued rationalizer job %s (%s) depth=%s",
+                job.job_id,
+                job.task_type.value,
+                self._queue.qsize(),
+            )
+        self._emit_metrics()
+        return True
+
+    # ------------------------------------------------------------------
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Stop the dispatcher thread and drain pending jobs."""
+
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+        self._queue.put(None)
+        if wait:
+            try:
+                self._dispatcher.join(timeout=5)
+            except Exception:
+                self._logger.debug("Failed to join Cerebellum dispatcher", exc_info=True)
+
+    # ------------------------------------------------------------------
+    def _dispatch_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            job, handler = item
+            acquired = self._gate.acquire(timeout=5.0)
+            if not acquired:
+                with self._lock:
+                    self._dropped += 1
+                self._logger.warning(
+                    "Gate denied rationalizer job %s – dropping", job.job_id
+                )
+                self._emit_metrics()
+                continue
+            self._launch_worker(job, handler)
+
+    # ------------------------------------------------------------------
+    def _launch_worker(
+        self,
+        job: RationalizerJob,
+        handler: Callable[[RationalizerJob], None],
+    ) -> None:
+        def _worker() -> None:
+            start = time.perf_counter()
+            try:
+                handler(job)
+            except Exception:
+                self._logger.exception(
+                    "Rationalizer worker crashed job=%s type=%s",
+                    job.job_id,
+                    job.task_type.value,
+                )
+            finally:
+                duration = time.perf_counter() - start
+                with self._lock:
+                    self._completed += 1
+                    self._active_workers = max(0, self._active_workers - 1)
+                self._gate.release()
+                self._logger.debug(
+                    "Rationalizer job %s finished in %.3fs", job.job_id, duration
+                )
+                self._emit_metrics()
+
+        with self._lock:
+            self._active_workers += 1
+        worker = threading.Thread(
+            target=_worker,
+            name=f"CerebellumWorker-{job.task_type.value}",
+            daemon=True,
+        )
+        worker.start()
+        self._emit_metrics()
+
+    # ------------------------------------------------------------------
+    def _emit_metrics(self) -> None:
+        snapshot = {
+            "scheduler": {
+                "cerebellum": {
+                    "active": self._active_workers,
+                    "queued": self._queue.qsize(),
+                    "submitted": self._submitted,
+                    "completed": self._completed,
+                    "dropped": self._dropped,
+                }
+            },
+            "gate": {
+                "rationalizer": self._gate.snapshot(),
+            },
+        }
+        callback = self._telemetry_callback
+        if callback is None:
+            return
+        try:
+            callback(snapshot)
+        except Exception:
+            self._logger.debug(
+                "Failed to publish Cerebellum telemetry", exc_info=True
+            )
+
+
+class RationalizerManager:
+    """Spin up short-lived workers for cognitive rationalisation tasks."""
+
+    def __init__(
+        self,
+        scheduler: CerebellumScheduler,
+        *,
+        publisher: Callable[[str, dict], None],
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._scheduler = scheduler
+        self._publisher = publisher
+        self._logger = logger or logging.getLogger(
+            f"{VD_LOGGER_NAME}.cortex.rationalizer"
+        )
+
+    # ------------------------------------------------------------------
+    def queue_intent_segmentation(
+        self,
+        utterance: str,
+        *,
+        conversation_id: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        job = RationalizerJob(
+            job_id=uuid.uuid4().hex,
+            task_type=RationalizerTaskType.INTENT_SEGMENTATION,
+            payload={"utterance": str(utterance or "")},
+            created_at=time.perf_counter(),
+            conversation_id=conversation_id,
+            metadata=dict(metadata or {}),
+        )
+        accepted = self._scheduler.submit(job, self._execute_job)
+        if not accepted:
+            self._logger.warning(
+                "Intent segmentation job dropped by scheduler job=%s",
+                job.job_id,
+            )
+        return job.job_id
+
+    # ------------------------------------------------------------------
+    def queue_reference_resolution(
+        self,
+        utterance: str,
+        references: Sequence[Mapping[str, Any]],
+        *,
+        conversation_id: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        job = RationalizerJob(
+            job_id=uuid.uuid4().hex,
+            task_type=RationalizerTaskType.REFERENCE_RESOLUTION,
+            payload={
+                "utterance": str(utterance or ""),
+                "references": [dict(ref) for ref in references],
+            },
+            created_at=time.perf_counter(),
+            conversation_id=conversation_id,
+            metadata=dict(metadata or {}),
+        )
+        accepted = self._scheduler.submit(job, self._execute_job)
+        if not accepted:
+            self._logger.warning(
+                "Reference resolution job dropped by scheduler job=%s",
+                job.job_id,
+            )
+        return job.job_id
+
+    # ------------------------------------------------------------------
+    def _execute_job(self, job: RationalizerJob) -> None:
+        start = time.perf_counter()
+        status = "success"
+        error: Optional[str] = None
+        try:
+            if job.task_type is RationalizerTaskType.INTENT_SEGMENTATION:
+                result = self._segment_intents(job.payload.get("utterance", ""))
+                topic = "cortex.intent"
+            else:
+                result = self._resolve_references(
+                    job.payload.get("utterance", ""),
+                    job.payload.get("references", []),
+                )
+                topic = "cortex.reference"
+        except Exception as exc:
+            status = "error"
+            error = repr(exc)
+            result = {"error": str(exc)}
+            topic = (
+                "cortex.intent"
+                if job.task_type is RationalizerTaskType.INTENT_SEGMENTATION
+                else "cortex.reference"
+            )
+            self._logger.exception(
+                "Rationalizer job failed job=%s type=%s",
+                job.job_id,
+                job.task_type.value,
+            )
+        duration = time.perf_counter() - start
+        payload = {
+            "job_id": job.job_id,
+            "type": job.task_type.value,
+            "status": status,
+            "duration": round(duration, 4),
+            "submitted_at": job.created_at,
+            "conversation_id": job.conversation_id,
+            "meta": dict(job.metadata),
+            "result": result,
+        }
+        if error is not None:
+            payload["error"] = error
+        self._publisher(topic, payload)
+
+    # ------------------------------------------------------------------
+    def _segment_intents(self, utterance: str) -> Dict[str, Any]:
+        text = str(utterance or "")
+        segments: List[Dict[str, Any]] = []
+        if not text.strip():
+            return {"segments": segments}
+
+        for match in re.finditer(r"[^.!?\n]+[.!?]?", text):
+            start, end = match.span()
+            snippet = match.group().strip()
+            if not snippet:
+                continue
+            label = self._classify_intent(snippet)
+            confidence = self._intent_confidence(snippet)
+            segments.append(
+                {
+                    "label": label,
+                    "text": snippet,
+                    "span": {"start": start, "end": end},
+                    "confidence": confidence,
+                }
+            )
+
+        if not segments:
+            segments.append(
+                {
+                    "label": "statement",
+                    "text": text.strip(),
+                    "span": {"start": 0, "end": len(text)},
+                    "confidence": 0.5,
+                }
+            )
+        return {"segments": segments}
+
+    # ------------------------------------------------------------------
+    def _classify_intent(self, snippet: str) -> str:
+        lowered = snippet.lower()
+        if snippet.endswith("?") or lowered.startswith(
+            ("how", "what", "why", "when", "where", "who")
+        ):
+            return "question"
+        if lowered.startswith(
+            (
+                "please",
+                "could you",
+                "can you",
+                "let's",
+                "let us",
+                "we should",
+                "let me",
+            )
+        ):
+            return "request"
+        if lowered.startswith(("note", "remember", "log", "document")):
+            return "note"
+        if "todo" in lowered or "task" in lowered:
+            return "task"
+        return "statement"
+
+    # ------------------------------------------------------------------
+    def _intent_confidence(self, snippet: str) -> float:
+        base = 0.45 + min(len(snippet) / 220.0, 0.35)
+        if snippet.endswith("?"):
+            base += 0.12
+        return round(min(base, 0.95), 3)
+
+    # ------------------------------------------------------------------
+    def _resolve_references(
+        self,
+        utterance: str,
+        references: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        text = str(utterance or "")
+        lower_text = text.lower()
+        resolutions: List[Dict[str, Any]] = []
+        for ref in references:
+            if not isinstance(ref, Mapping):
+                continue
+            path = str(ref.get("path") or "").strip()
+            if not path:
+                continue
+            ref_type = str(ref.get("type") or "file")
+            matches: List[Dict[str, Any]] = []
+            tokens: Set[str] = set()
+            stem = Path(path).stem.lower()
+            tokens.add(stem)
+            tokens.add(Path(path).name.lower())
+            alias = str(ref.get("alias") or "").strip().lower()
+            if alias:
+                tokens.add(alias)
+            for token in tokens:
+                if not token:
+                    continue
+                start = lower_text.find(token)
+                while start != -1:
+                    end = start + len(token)
+                    matches.append(
+                        {
+                            "match": text[start:end],
+                            "span": {"start": start, "end": end},
+                        }
+                    )
+                    start = lower_text.find(token, end)
+            confidence = round(min(0.9, 0.4 + 0.2 * len(matches)), 3)
+            resolutions.append(
+                {
+                    "path": path,
+                    "type": ref_type,
+                    "matches": matches,
+                    "status": "linked" if matches else "unreferenced",
+                    "confidence": confidence,
+                }
+            )
+        return {"references": resolutions}
+
+
+_RATIONALIZER_GATE: Optional[GateQuotaController] = None
+_CEREBELLUM_SCHEDULER: Optional[CerebellumScheduler] = None
+_RATIONALIZER_MANAGER: Optional[RationalizerManager] = None
+
+
+def ensure_rationalizer_manager(
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[RationalizerManager]:
+    """Initialise or reconfigure the Rationalizer manager singleton."""
+
+    global _RATIONALIZER_GATE, _CEREBELLUM_SCHEDULER, _RATIONALIZER_MANAGER
+
+    settings = dict(config or {})
+    limit = int(settings.get("rationalizer_limit", 2))
+    queue_limit = int(settings.get("queue_limit", 16))
+
+    if _RATIONALIZER_MANAGER is None or _CEREBELLUM_SCHEDULER is None:
+        gate_logger = logging.getLogger(f"{VD_LOGGER_NAME}.gate.rationalizer")
+        scheduler_logger = logging.getLogger(
+            f"{VD_LOGGER_NAME}.cerebellum.scheduler"
+        )
+        manager_logger = logging.getLogger(
+            f"{VD_LOGGER_NAME}.cortex.rationalizer"
+        )
+
+        _RATIONALIZER_GATE = GateQuotaController(
+            "rationalizer", limit=limit, logger=gate_logger
+        )
+
+        def _telemetry(payload: Mapping[str, Any]) -> None:
+            try:
+                publish("system.metrics", dict(payload))
+            except Exception:
+                scheduler_logger.debug(
+                    "Failed to publish rationalizer metrics", exc_info=True
+                )
+
+        _CEREBELLUM_SCHEDULER = CerebellumScheduler(
+            _RATIONALIZER_GATE,
+            queue_limit=queue_limit,
+            telemetry_callback=_telemetry,
+            logger=scheduler_logger,
+        )
+        _RATIONALIZER_MANAGER = RationalizerManager(
+            _CEREBELLUM_SCHEDULER,
+            publisher=lambda topic, payload: publish(topic, payload),
+            logger=manager_logger,
+        )
+        atexit.register(shutdown_rationalizer_manager)
+    else:
+        if _RATIONALIZER_GATE is not None:
+            _RATIONALIZER_GATE.update_limit(limit)
+        if _CEREBELLUM_SCHEDULER is not None:
+            _CEREBELLUM_SCHEDULER.configure(queue_limit=queue_limit)
+
+    return _RATIONALIZER_MANAGER
+
+
+def rationalizer_manager() -> Optional[RationalizerManager]:
+    """Return the active Rationalizer manager, if initialised."""
+
+    return _RATIONALIZER_MANAGER
+
+
+def shutdown_rationalizer_manager() -> None:
+    """Tear down Cerebellum scheduler threads on application exit."""
+
+    global _RATIONALIZER_MANAGER, _CEREBELLUM_SCHEDULER, _RATIONALIZER_GATE
+    if _CEREBELLUM_SCHEDULER is not None:
+        try:
+            _CEREBELLUM_SCHEDULER.shutdown()
+        except Exception:
+            logging.getLogger(
+                f"{VD_LOGGER_NAME}.cerebellum.scheduler"
+            ).debug("Failed to shutdown Cerebellum cleanly", exc_info=True)
+    _RATIONALIZER_MANAGER = None
+    _CEREBELLUM_SCHEDULER = None
+    _RATIONALIZER_GATE = None
 
 
 @dataclass(slots=True)
@@ -11619,6 +12270,10 @@ DEFAULT_SETTINGS = {
         "access_control_enforced": False,
     },
     "voice": copy.deepcopy(DEFAULT_VOICE_CONFIG),
+    "cerebellum": {
+        "rationalizer_limit": 2,
+        "queue_limit": 16,
+    },
 }
 
 
@@ -15212,6 +15867,24 @@ class ChatCard(QFrame):
         self.dataset.add_entry(role, text, images, tags=tags, extra=extra)
         if role == "user":
             self._store_session_note(text, images)
+            manager = rationalizer_manager()
+            if manager and text.strip():
+                meta = {
+                    "session_id": self.session_id,
+                    "source": "chat_card",
+                }
+                manager.queue_intent_segmentation(
+                    text,
+                    conversation_id=self.session_id,
+                    metadata=meta,
+                )
+                if refs:
+                    manager.queue_reference_resolution(
+                        text,
+                        refs,
+                        conversation_id=self.session_id,
+                        metadata=meta,
+                    )
 
     def _infer_thread(self, text: str, images: List[Path]):
         self.state_signal.emit(True)
@@ -16918,6 +17591,16 @@ class MainWindow(QMainWindow):
         voice_settings = self.settings.setdefault(
             "voice", copy.deepcopy(DEFAULT_VOICE_CONFIG)
         )
+        cerebellum_settings = self.settings.setdefault(
+            "cerebellum",
+            {"rationalizer_limit": 2, "queue_limit": 16},
+        )
+        try:
+            ensure_rationalizer_manager(cerebellum_settings)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to configure Rationalizer manager"
+            )
         self.speech = ensure_speech_orchestrator(voice_settings)
         if self.speech:
             self.speech.start()

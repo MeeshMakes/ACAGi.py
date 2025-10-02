@@ -81,6 +81,11 @@
       "title": "Speech Orchestrator and Amygdala Salience",
       "summary": "Local ASR/TTS adapters now publish speech activity, partial/final transcripts, and TTS telemetry on dedicated event bus topics while the Amygdala component weights diarization metadata and emits system.salience scores.",
       "applies_to": "voice-interface"
+    },
+    {
+      "title": "Cerebellum Rationalizer Quotas",
+      "summary": "Rationalizer jobs are dispatched through the Cerebellum scheduler which enforces Gate quotas, publishes cortex.intent and cortex.reference events, and surfaces telemetry on system.metrics; future cognitive workflows should integrate with ensure_rationalizer_manager rather than spawning ad-hoc threads.",
+      "applies_to": "cortex-rationalizer"
     }
   ],
   "procedures": [

@@ -1,4 +1,19 @@
 # Changelog
+## [0.1.18] - 2025-10-07
+### Added
+- Introduced a Cerebellum scheduler and Rationalizer manager that spin up
+  short-lived workers for intent segmentation and reference resolution while
+  enforcing Gate quotas.
+- Published cortex rationalizer results on new `cortex.intent` and
+  `cortex.reference` event topics alongside telemetry on `system.metrics`.
+
+### Changed
+- Extended default settings with Cerebellum quota controls and wired the chat
+  workflow to queue Rationalizer jobs whenever a user message is recorded.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+
 ## [0.1.17] - 2025-10-07
 ### Added
 - Embedded local-first ASR and TTS adapters inside `ACAGi.py` with streaming
