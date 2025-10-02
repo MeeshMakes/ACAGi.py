@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-07",
+  "last_updated": "2025-10-08",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -90,6 +90,11 @@
     {
       "title": "Task Bucket Serialization Discipline",
       "summary": "Task buckets advance through capture→note→bucketize→assemble→apply→test→verify→promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
+      "applies_to": "task-orchestration"
+    },
+    {
+      "title": "Task Bucket Failure Rationalization Loop",
+      "summary": "When a task bucket stage fails ACAGi queues a Rationalizer job with the failure context and updates the durable memory snapshot with the latest telemetry so follow-up runs start with concrete remediation clues.",
       "applies_to": "task-orchestration"
     }
   ],

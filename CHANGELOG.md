@@ -1,4 +1,15 @@
 # Changelog
+## [0.1.20] - 2025-10-08
+### Added
+- Implemented coder/test/verifier lifecycle handlers that capture anchored patches
+  with rationales, execute configured validations, and publish bucket telemetry
+  for UI consumers.
+
+### Changed
+- Routed task bucket failures through the Rationalizer loop and persisted the
+  latest failure snapshot in durable memory so operators retain actionable
+  learnings alongside telemetry events.
+
 ## [0.1.19] - 2025-10-08
 ### Added
 - Added task bucket lifecycle data classes and orchestration helpers that drive
