@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-06",
+  "last_updated": "2025-10-07",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -76,6 +76,11 @@
       "title": "Status Bar Telemetry Panel",
       "summary": "The main window status bar now embeds a StatusBarTelemetryPanel that consumes system.metrics telemetry to display remote fan-out state, sandbox posture, CPU/RAM meters, attention mix, and OCR duty cycle readings while exposing a remote pause/resume toggle.",
       "applies_to": "ui-status-bar"
+    },
+    {
+      "title": "Speech Orchestrator and Amygdala Salience",
+      "summary": "Local ASR/TTS adapters now publish speech activity, partial/final transcripts, and TTS telemetry on dedicated event bus topics while the Amygdala component weights diarization metadata and emits system.salience scores.",
+      "applies_to": "voice-interface"
     }
   ],
   "procedures": [

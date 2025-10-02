@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt
 
 import argparse
 import ast
+import audioop
 import atexit
 import base64
 import builtins
@@ -32,6 +33,7 @@ import logging
 import math
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
@@ -72,6 +74,10 @@ from typing import (
 # Optional dependencies are resolved via runtime checks instead of guarded imports
 _REQUESTS_MODULE_NAME = "requests"
 _PILLOW_MODULE_NAME = "PIL.Image"
+_NUMPY_MODULE_NAME = "numpy"
+_SOUNDDEVICE_MODULE_NAME = "sounddevice"
+_PYTTSX3_MODULE_NAME = "pyttsx3"
+_WHISPER_MODULE_NAME = "whisper"
 
 if importlib.util.find_spec(_REQUESTS_MODULE_NAME):
     import requests  # type: ignore  # noqa: F401
@@ -82,6 +88,26 @@ if importlib.util.find_spec(_PILLOW_MODULE_NAME):
     from PIL import Image  # type: ignore  # noqa: F401
 else:
     Image = None  # type: ignore[assignment]
+
+if importlib.util.find_spec(_NUMPY_MODULE_NAME):
+    import numpy as np  # type: ignore  # noqa: F401
+else:
+    np = None  # type: ignore[assignment]
+
+if importlib.util.find_spec(_SOUNDDEVICE_MODULE_NAME):
+    import sounddevice as sd  # type: ignore  # noqa: F401
+else:
+    sd = None  # type: ignore[assignment]
+
+if importlib.util.find_spec(_PYTTSX3_MODULE_NAME):
+    import pyttsx3  # type: ignore  # noqa: F401
+else:
+    pyttsx3 = None  # type: ignore[assignment]
+
+if importlib.util.find_spec(_WHISPER_MODULE_NAME):
+    import whisper  # type: ignore  # noqa: F401
+else:
+    whisper = None  # type: ignore[assignment]
 
 from PySide6.QtCore import (
     QRect,
@@ -3096,6 +3122,13 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     "system.metrics",
     "system.process",
     "system.immune",
+    "system.salience",
+    # Voice pipeline topics.
+    "speech.request",
+    "speech.tts",
+    "speech.activity",
+    "speech.partial",
+    "speech.final",
 }
 _WILDCARD_TOPIC = "task.*"
 
@@ -3391,6 +3424,1020 @@ def is_remote_fanout_enabled() -> bool:
     """Return the dispatcher remote fan-out flag for UI consumers."""
 
     return EVENT_DISPATCHER.remote_enabled()
+
+
+@dataclass(slots=True)
+class SpeechSynthesisRequest:
+    """Request queued for the local text-to-speech engine."""
+
+    text: str
+    voice: Optional[str] = None
+    rate: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SpeechHypothesis:
+    """Incremental hypothesis emitted by the local ASR adapter."""
+
+    utterance_id: str
+    text: str
+    confidence: float
+    start_ts: float
+    end_ts: float
+    speaker: str
+    speaker_priority: float
+    is_final: bool
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialise the hypothesis for event bus publication."""
+
+        meta = dict(self.metadata)
+        meta.setdefault("speaker", self.speaker)
+        meta.setdefault("speaker_priority", self.speaker_priority)
+        meta.setdefault("utterance_id", self.utterance_id)
+        payload: Dict[str, Any] = {
+            "id": self.utterance_id,
+            "text": self.text,
+            "confidence": float(self.confidence),
+            "start_ts": float(self.start_ts),
+            "end_ts": float(self.end_ts),
+            "speaker": self.speaker,
+            "speaker_priority": float(self.speaker_priority),
+            "is_final": bool(self.is_final),
+            "meta": meta,
+        }
+        diarization = meta.get("diarization")
+        if isinstance(diarization, Mapping):
+            payload["diarization"] = dict(diarization)
+        return payload
+
+
+@dataclass(slots=True)
+class SpeechActivity:
+    """Voice activity transition detected by the ASR pipeline."""
+
+    utterance_id: str
+    active: bool
+    timestamp: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Render the transition in a format suitable for the event bus."""
+
+        meta = dict(self.metadata)
+        meta.setdefault("utterance_id", self.utterance_id)
+        return {
+            "id": self.utterance_id,
+            "active": bool(self.active),
+            "timestamp": float(self.timestamp),
+            "meta": meta,
+        }
+
+
+class LocalTTSAdapter:
+    """Thin wrapper around ``pyttsx3`` that supports barge-in pauses."""
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        on_state_change: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._config: Dict[str, Any] = dict(config)
+        self._on_state_change = on_state_change
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.speech.tts")
+        self._queue: "queue.Queue[Optional[SpeechSynthesisRequest]]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._barge_in_gate = threading.Event()
+        self._barge_in_gate.set()
+        self._state_lock = threading.RLock()
+        self._speaking = False
+        self._barge_in_active = False
+        self._barge_in_replay: Optional[SpeechSynthesisRequest] = None
+        self._current_request: Optional[SpeechSynthesisRequest] = None
+        self._engine = None
+
+        if pyttsx3 is None:
+            self._logger.warning(
+                "pyttsx3 not available; local TTS will be disabled"
+            )
+        else:
+            try:
+                self._engine = pyttsx3.init()
+                self._apply_voice_config(self._config)
+            except Exception:
+                self._logger.exception("Failed to initialise pyttsx3")
+                self._engine = None
+
+        self._worker = threading.Thread(
+            target=self._run,
+            name="LocalTTSAdapter",
+            daemon=True,
+        )
+        self._worker.start()
+
+    # ------------------------------------------------------------------
+    @property
+    def available(self) -> bool:
+        """Return ``True`` when a synthesis engine is ready."""
+
+        return self._engine is not None
+
+    # ------------------------------------------------------------------
+    def configure(self, config: Mapping[str, Any]) -> None:
+        """Merge ``config`` into the active synthesis settings."""
+
+        self._config.update(config)
+        if self._engine is None:
+            return
+        try:
+            self._apply_voice_config(self._config)
+        except Exception:
+            self._logger.exception("Failed to apply TTS configuration")
+
+    # ------------------------------------------------------------------
+    def enqueue(self, request: SpeechSynthesisRequest) -> None:
+        """Queue ``request`` for speech if the engine is available."""
+
+        if not self.available:
+            self._logger.debug("Dropping TTS request because engine is unavailable")
+            return
+        self._queue.put(request)
+
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        """Stop worker threads and release the synthesis engine."""
+
+        self._stop_event.set()
+        self._queue.put(None)
+        if self._engine is not None:
+            try:
+                self._engine.stop()
+            except Exception:
+                self._logger.debug("Failed to stop TTS engine", exc_info=True)
+        if self._worker.is_alive():
+            self._worker.join(timeout=1.0)
+
+    # ------------------------------------------------------------------
+    def pause_for_barge_in(self) -> bool:
+        """Interrupt the active utterance and gate playback until resumed."""
+
+        if not self.available:
+            return False
+        with self._state_lock:
+            if not self._speaking or self._current_request is None:
+                return False
+            if self._barge_in_active:
+                return False
+            self._barge_in_active = True
+            self._barge_in_gate.clear()
+            self._barge_in_replay = self._current_request
+            self._logger.debug(
+                "Barge-in detected; pausing TTS for %s",
+                self._current_request.text[:64],
+            )
+        try:
+            assert self._engine is not None  # for type-checkers
+            self._engine.stop()
+        except Exception:
+            self._logger.debug("Error while stopping TTS engine", exc_info=True)
+        return True
+
+    # ------------------------------------------------------------------
+    def resume_after_barge_in(self) -> bool:
+        """Resume playback after user speech ends."""
+
+        if not self.available:
+            return False
+        with self._state_lock:
+            if not self._barge_in_active:
+                return False
+            self._barge_in_active = False
+            self._barge_in_gate.set()
+            self._logger.debug("Resuming TTS after barge-in pause")
+        return True
+
+    # ------------------------------------------------------------------
+    def is_speaking(self) -> bool:
+        """Return whether synthesis is currently producing audio."""
+
+        with self._state_lock:
+            return self._speaking
+
+    # ------------------------------------------------------------------
+    def _apply_voice_config(self, config: Mapping[str, Any]) -> None:
+        if self._engine is None:
+            return
+        voice_id = config.get("voice_id") or config.get("voice")
+        if voice_id:
+            try:
+                self._engine.setProperty("voice", voice_id)
+            except Exception:
+                self._logger.debug("Unknown voice id: %s", voice_id, exc_info=True)
+        rate = config.get("rate")
+        if rate:
+            try:
+                self._engine.setProperty("rate", int(rate))
+            except Exception:
+                self._logger.debug("Failed to set TTS rate", exc_info=True)
+
+    # ------------------------------------------------------------------
+    def _notify_state(self, state: str, metadata: Mapping[str, Any]) -> None:
+        if not self._on_state_change:
+            return
+        try:
+            self._on_state_change(state, dict(metadata))
+        except Exception:
+            self._logger.debug("TTS state callback error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            request: Optional[SpeechSynthesisRequest] = None
+            with self._state_lock:
+                if self._barge_in_replay is not None and not self._barge_in_active:
+                    request = self._barge_in_replay
+                    self._barge_in_replay = None
+            if request is None:
+                try:
+                    request = self._queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+            if request is None:
+                break
+            self._barge_in_gate.wait()
+            self._speak_request(request)
+
+    # ------------------------------------------------------------------
+    def _speak_request(self, request: SpeechSynthesisRequest) -> None:
+        if not self.available:
+            return
+        assert self._engine is not None
+        with self._state_lock:
+            self._speaking = True
+            self._current_request = request
+        self._notify_state("started", request.metadata)
+        interrupted = False
+        try:
+            if request.voice:
+                try:
+                    self._engine.setProperty("voice", request.voice)
+                except Exception:
+                    self._logger.debug(
+                        "Unable to switch to voice %s", request.voice, exc_info=True
+                    )
+            if request.rate:
+                try:
+                    self._engine.setProperty("rate", int(request.rate))
+                except Exception:
+                    self._logger.debug(
+                        "Unable to adjust speech rate", exc_info=True
+                    )
+            self._engine.say(request.text)
+            self._engine.runAndWait()
+        except Exception:
+            interrupted = True
+            self._logger.exception("TTS synthesis failed")
+        finally:
+            with self._state_lock:
+                interrupted = interrupted or self._barge_in_active
+                self._speaking = False
+                self._current_request = None
+                if interrupted and self._barge_in_active:
+                    if self._barge_in_replay is None:
+                        self._barge_in_replay = request
+                else:
+                    self._barge_in_replay = None
+            state = "interrupted" if interrupted else "completed"
+            self._notify_state(state, request.metadata)
+
+
+class LocalASRAdapter:
+    """Local microphone capture and Whisper-based transcription."""
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        on_partial: Callable[[SpeechHypothesis], None],
+        on_final: Callable[[SpeechHypothesis], None],
+        on_activity: Callable[[SpeechActivity], None],
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._config: Dict[str, Any] = dict(config)
+        self._on_partial = on_partial
+        self._on_final = on_final
+        self._on_activity = on_activity
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.speech.asr")
+        self._audio_queue: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._stream = None
+        self._worker: Optional[threading.Thread] = None
+        self._active = False
+
+        self._current_buffer = bytearray()
+        self._current_activity = False
+        self._utterance_id: Optional[str] = None
+        self._utterance_started = 0.0
+        self._last_voice_time = 0.0
+        self._last_partial_time = 0.0
+        self._last_partial_text = ""
+        self._model = None
+        self._model_lock = threading.RLock()
+
+    # ------------------------------------------------------------------
+    @property
+    def available(self) -> bool:
+        """Return whether the adapter can capture and transcribe audio."""
+
+        if sd is None:
+            return False
+        if whisper is None or np is None:
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def configure(self, config: Mapping[str, Any]) -> None:
+        """Update runtime configuration without restarting the stream."""
+
+        self._config.update(config)
+
+    # ------------------------------------------------------------------
+    def start(self) -> bool:
+        """Start microphone capture and transcription threads."""
+
+        if not self._config.get("enable_asr", True):
+            self._logger.info("ASR disabled via configuration")
+            return False
+        if self._active:
+            return True
+        if sd is None:
+            self._logger.warning(
+                "sounddevice is unavailable; ASR cannot be started"
+            )
+            return False
+        if whisper is None or np is None:
+            self._logger.warning(
+                "whisper or numpy missing; ASR transcripts will not be produced"
+            )
+
+        sample_rate = int(self._config.get("sample_rate", 16_000))
+        chunk_ms = int(self._config.get("chunk_ms", 30))
+        blocksize = max(1, int(sample_rate * (chunk_ms / 1000.0)))
+
+        try:
+            self._stream = sd.InputStream(
+                samplerate=sample_rate,
+                blocksize=blocksize,
+                channels=1,
+                dtype="int16",
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except Exception:
+            self._logger.exception("Failed to start microphone capture")
+            self._stream = None
+            return False
+
+        self._stop_event.clear()
+        self._worker = threading.Thread(
+            target=self._process_audio,
+            name="LocalASRAdapter",
+            daemon=True,
+        )
+        self._worker.start()
+        self._active = True
+        self._logger.info(
+            "Local ASR adapter started (sample_rate=%s chunk_ms=%s)",
+            sample_rate,
+            chunk_ms,
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        """Terminate capture threads and release audio resources."""
+
+        self._stop_event.set()
+        self._audio_queue.put(None)
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                self._logger.debug("Failed to close microphone stream", exc_info=True)
+            self._stream = None
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=1.0)
+        self._active = False
+
+    # ------------------------------------------------------------------
+    def _audio_callback(self, indata, frames, time_info, status) -> None:  # type: ignore[override]
+        if status:
+            self._logger.debug("ASR stream status: %s", status)
+        try:
+            chunk = bytes(indata.tobytes())
+        except Exception:
+            self._logger.debug("Failed to convert audio chunk", exc_info=True)
+            return
+        self._audio_queue.put(chunk)
+
+    # ------------------------------------------------------------------
+    def _process_audio(self) -> None:
+        silence_duration = float(self._config.get("silence_duration", 0.8))
+        partial_interval = float(self._config.get("partial_interval", 0.9))
+        vad_threshold = float(self._config.get("vad_threshold", 550))
+        speaker_priority = float(self._config.get("default_priority", 0.7))
+        speaker_label = str(self._config.get("speaker_label", "user"))
+
+        while not self._stop_event.is_set():
+            try:
+                chunk = self._audio_queue.get(timeout=0.25)
+            except queue.Empty:
+                chunk = None
+            if chunk is None:
+                if self._current_activity and (
+                    time.time() - self._last_voice_time
+                ) >= silence_duration:
+                    self._finalise_utterance(
+                        speaker_label=speaker_label,
+                        speaker_priority=speaker_priority,
+                    )
+                continue
+
+            now = time.time()
+            energy = audioop.rms(chunk, 2) if chunk else 0
+            if energy >= vad_threshold:
+                if not self._current_activity:
+                    self._begin_utterance(
+                        now,
+                        speaker_label=speaker_label,
+                        speaker_priority=speaker_priority,
+                    )
+                self._current_buffer.extend(chunk)
+                self._last_voice_time = now
+                if (now - self._last_partial_time) >= partial_interval:
+                    self._emit_partial(
+                        now,
+                        speaker_label=speaker_label,
+                        speaker_priority=speaker_priority,
+                    )
+            elif self._current_activity:
+                self._current_buffer.extend(chunk)
+                if (now - self._last_voice_time) >= silence_duration:
+                    self._finalise_utterance(
+                        speaker_label=speaker_label,
+                        speaker_priority=speaker_priority,
+                    )
+
+    # ------------------------------------------------------------------
+    def _begin_utterance(
+        self,
+        timestamp: float,
+        *,
+        speaker_label: str,
+        speaker_priority: float,
+    ) -> None:
+        self._current_activity = True
+        self._current_buffer = bytearray()
+        self._utterance_id = uuid.uuid4().hex
+        self._utterance_started = timestamp
+        self._last_voice_time = timestamp
+        self._last_partial_time = timestamp
+        self._last_partial_text = ""
+        activity = SpeechActivity(
+            utterance_id=self._utterance_id,
+            active=True,
+            timestamp=timestamp,
+            metadata={
+                "speaker": speaker_label,
+                "speaker_priority": speaker_priority,
+            },
+        )
+        self._on_activity(activity)
+
+    # ------------------------------------------------------------------
+    def _emit_partial(
+        self,
+        timestamp: float,
+        *,
+        speaker_label: str,
+        speaker_priority: float,
+    ) -> None:
+        if not self._current_buffer or self._utterance_id is None:
+            return
+        text, confidence = self._transcribe(bytes(self._current_buffer))
+        if not text or text == self._last_partial_text:
+            return
+        self._last_partial_text = text
+        self._last_partial_time = timestamp
+        hypothesis = SpeechHypothesis(
+            utterance_id=self._utterance_id,
+            text=text,
+            confidence=confidence,
+            start_ts=self._utterance_started,
+            end_ts=timestamp,
+            speaker=speaker_label,
+            speaker_priority=speaker_priority,
+            is_final=False,
+            metadata={},
+        )
+        self._on_partial(hypothesis)
+
+    # ------------------------------------------------------------------
+    def _finalise_utterance(
+        self,
+        *,
+        speaker_label: str,
+        speaker_priority: float,
+    ) -> None:
+        if not self._current_activity or self._utterance_id is None:
+            return
+        text, confidence = self._transcribe(bytes(self._current_buffer))
+        hypothesis = SpeechHypothesis(
+            utterance_id=self._utterance_id,
+            text=text,
+            confidence=confidence,
+            start_ts=self._utterance_started,
+            end_ts=self._last_voice_time,
+            speaker=speaker_label,
+            speaker_priority=speaker_priority,
+            is_final=True,
+            metadata={},
+        )
+        activity = SpeechActivity(
+            utterance_id=self._utterance_id,
+            active=False,
+            timestamp=time.time(),
+            metadata={
+                "speaker": speaker_label,
+                "speaker_priority": speaker_priority,
+            },
+        )
+        self._current_activity = False
+        self._current_buffer = bytearray()
+        self._utterance_id = None
+        self._on_final(hypothesis)
+        self._on_activity(activity)
+
+    # ------------------------------------------------------------------
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        if whisper is None:
+            return None
+        model_name = str(self._config.get("asr_model", "base"))
+        try:
+            self._model = whisper.load_model(model_name)
+            self._logger.info("Loaded Whisper model: %s", model_name)
+        except Exception:
+            self._logger.exception("Failed to load Whisper model: %s", model_name)
+            self._model = None
+        return self._model
+
+    # ------------------------------------------------------------------
+    def _transcribe(self, data: bytes) -> Tuple[str, float]:
+        if not data:
+            return "", 0.0
+        if whisper is None or np is None:
+            return "", 0.0
+        with self._model_lock:
+            model = self._load_model()
+        if model is None:
+            return "", 0.0
+        try:
+            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        except Exception:
+            self._logger.debug("Failed to normalise audio buffer", exc_info=True)
+            return "", 0.0
+        try:
+            result = model.transcribe(
+                audio,
+                language=str(self._config.get("language") or "en"),
+                fp16=False,
+            )
+        except Exception:
+            self._logger.exception("Whisper transcription error")
+            return "", 0.0
+        text = str(result.get("text") or "").strip()
+        segments = result.get("segments") or []
+        if segments and np is not None:
+            probs = [
+                float(segment.get("avg_logprob", -5.0)) for segment in segments
+            ]
+            avg = float(sum(probs) / max(len(probs), 1))
+            confidence = 1.0 / (1.0 + math.exp(-avg))
+        else:
+            confidence = float(max(0.0, 1.0 - float(result.get("no_speech_prob", 0.0))))
+        return text, confidence
+
+
+class SpeechOrchestrator:
+    """Coordinates ASR, TTS, barge-in, and event publication."""
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        publisher: Callable[[str, Dict[str, Any]], None],
+        subscriber: Callable[[str, Callable[[dict], None]], Subscription],
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._config: Dict[str, Any] = dict(config)
+        self._publisher = publisher
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.speech")
+        self._lock = threading.RLock()
+        self._utterance_meta: Dict[str, Dict[str, Any]] = {}
+
+        self._tts: Optional[LocalTTSAdapter] = None
+        if self._config.get("enable_tts", True):
+            self._tts = LocalTTSAdapter(
+                self._config,
+                on_state_change=self._handle_tts_state,
+                logger=logging.getLogger(f"{VD_LOGGER_NAME}.speech.tts"),
+            )
+
+        self._asr: Optional[LocalASRAdapter] = None
+        if self._config.get("enable_asr", True):
+            self._asr = LocalASRAdapter(
+                self._config,
+                on_partial=self._on_partial,
+                on_final=self._on_final,
+                on_activity=self._on_activity,
+                logger=logging.getLogger(f"{VD_LOGGER_NAME}.speech.asr"),
+            )
+
+        self._subscriptions: List[Subscription] = []
+        try:
+            self._subscriptions.append(
+                subscriber("speech.request", self._handle_speech_request)
+            )
+        except Exception:
+            self._logger.debug("Failed to subscribe to speech.request", exc_info=True)
+
+    # ------------------------------------------------------------------
+    def configure(self, config: Mapping[str, Any]) -> None:
+        """Update orchestrator configuration and child adapters."""
+
+        self._config.update(config)
+        if self._tts:
+            self._tts.configure(config)
+        if self._asr:
+            self._asr.configure(config)
+
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        """Start ASR capture if available."""
+
+        if self._asr and self._asr.available:
+            self._asr.start()
+        elif self._asr:
+            self._logger.info("ASR unavailable; barge-in limited to TTS pause only")
+
+    # ------------------------------------------------------------------
+    def shutdown(self) -> None:
+        """Stop adapters and release resources."""
+
+        if self._asr:
+            self._asr.stop()
+        if self._tts:
+            self._tts.stop()
+        for subscription in self._subscriptions:
+            try:
+                subscription.unsubscribe()
+            except Exception:
+                continue
+        self._subscriptions = []
+
+    # ------------------------------------------------------------------
+    def speak(self, text: str, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Queue ``text`` for synthesis when TTS is enabled."""
+
+        if not text:
+            return
+        if not self._tts or not self._tts.available:
+            self._logger.debug("Skipping speech output because TTS is disabled")
+            return
+        meta = dict(metadata or {})
+        request = SpeechSynthesisRequest(text=text, metadata=meta)
+        self._publisher(
+            "speech.tts",
+            {
+                "state": "queued",
+                "text": text,
+                "meta": dict(meta),
+            },
+        )
+        self._tts.enqueue(request)
+
+    # ------------------------------------------------------------------
+    def _handle_speech_request(self, payload: dict) -> None:
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return
+        metadata = payload.get("meta") or payload.get("metadata") or {}
+        self.speak(text, metadata=dict(metadata))
+
+    # ------------------------------------------------------------------
+    def _handle_tts_state(self, state: str, metadata: Dict[str, Any]) -> None:
+        payload = {"state": state, "meta": dict(metadata)}
+        self._publisher("speech.tts", payload)
+
+    # ------------------------------------------------------------------
+    def _on_activity(self, activity: SpeechActivity) -> None:
+        meta = self._utterance_meta.setdefault(activity.utterance_id, {})
+        meta.update(activity.metadata)
+        speaker_priority = float(
+            meta.get("speaker_priority", self._config.get("default_priority", 0.7))
+        )
+        meta["speaker_priority"] = speaker_priority
+        barge_in = False
+        if activity.active:
+            if self._tts and self._tts.is_speaking():
+                barge_in = self._tts.pause_for_barge_in()
+            if barge_in:
+                meta["barge_in"] = True
+                meta["speaker_priority"] = max(1.0, speaker_priority)
+                self._publisher(
+                    "speech.tts",
+                    {
+                        "state": "interrupted",
+                        "meta": dict(meta),
+                    },
+                )
+        else:
+            if meta.get("barge_in") and self._tts:
+                if self._tts.resume_after_barge_in():
+                    self._publisher(
+                        "speech.tts",
+                        {
+                            "state": "resumed",
+                            "meta": dict(meta),
+                        },
+                    )
+        payload = activity.to_payload()
+        payload_meta = payload.setdefault("meta", {})
+        payload_meta.update(meta)
+        self._publisher("speech.activity", payload)
+
+    # ------------------------------------------------------------------
+    def _on_partial(self, hypothesis: SpeechHypothesis) -> None:
+        meta = self._utterance_meta.setdefault(hypothesis.utterance_id, {})
+        hypothesis.metadata.update(meta)
+        hypothesis.metadata.setdefault(
+            "diarization",
+            self._build_diarization(meta, hypothesis),
+        )
+        payload = hypothesis.to_payload()
+        payload["meta"].update(meta)
+        self._publisher("speech.partial", payload)
+
+    # ------------------------------------------------------------------
+    def _on_final(self, hypothesis: SpeechHypothesis) -> None:
+        meta = self._utterance_meta.get(hypothesis.utterance_id, {})
+        hypothesis.metadata.update(meta)
+        hypothesis.metadata.setdefault(
+            "diarization",
+            self._build_diarization(meta, hypothesis),
+        )
+        payload = hypothesis.to_payload()
+        payload["meta"].update(meta)
+        if meta.get("barge_in") and self._tts:
+            # Ensure the queue resumes even if the ASR missed the activity end.
+            if self._tts.resume_after_barge_in():
+                self._publisher(
+                    "speech.tts",
+                    {
+                        "state": "resumed",
+                        "meta": dict(meta),
+                    },
+                )
+        self._publisher("speech.final", payload)
+        with self._lock:
+            self._utterance_meta.pop(hypothesis.utterance_id, None)
+
+    # ------------------------------------------------------------------
+    def _build_diarization(
+        self, meta: Mapping[str, Any], hypothesis: SpeechHypothesis
+    ) -> Dict[str, Any]:
+        diarization = {
+            "speaker": meta.get("speaker", hypothesis.speaker),
+            "priority": meta.get("speaker_priority", hypothesis.speaker_priority),
+        }
+        if meta.get("barge_in"):
+            diarization["barge_in"] = True
+        return diarization
+
+
+class Amygdala:
+    """Salience scoring pipeline influenced by diarization metadata."""
+
+    def __init__(
+        self,
+        *,
+        subscriber: Callable[[str, Callable[[dict], None]], Subscription],
+        publisher: Callable[[str, Dict[str, Any]], None],
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.amygdala")
+        self._publisher = publisher
+        self._subscriber = subscriber
+        self._speaker_bias: Dict[str, float] = {
+            "user": 0.9,
+            "assistant": 0.4,
+            "system": 0.2,
+        }
+        self._subscriptions: List[Subscription] = []
+        self._lock = threading.RLock()
+        self._attach()
+
+    # ------------------------------------------------------------------
+    def configure(self, config: Mapping[str, Any]) -> None:
+        bias = config.get("speaker_bias")
+        if isinstance(bias, Mapping):
+            with self._lock:
+                for speaker, value in bias.items():
+                    try:
+                        self._speaker_bias[str(speaker)] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+
+    # ------------------------------------------------------------------
+    def _attach(self) -> None:
+        topics = [
+            "speech.final",
+            "speech.partial",
+            "note",
+            "observation",
+            "task.status",
+        ]
+        for topic in topics:
+            try:
+                self._subscriptions.append(
+                    self._subscriber(topic, lambda payload, t=topic: self._process(t, payload))
+                )
+            except Exception:
+                self._logger.debug(
+                    "Failed to subscribe Amygdala to %s", topic, exc_info=True
+                )
+
+    # ------------------------------------------------------------------
+    def _process(self, topic: str, payload: Mapping[str, Any]) -> None:
+        try:
+            score, priority = self._score(topic, payload)
+        except Exception:
+            self._logger.exception("Failed to score salience for %s", topic)
+            return
+        salience_payload = {
+            "topic": topic,
+            "salience": score,
+            "speaker_priority": priority,
+            "meta": {},
+        }
+        if isinstance(payload.get("meta"), Mapping):
+            salience_payload["meta"].update(payload["meta"])  # type: ignore[index]
+        diarization = payload.get("diarization")
+        if isinstance(diarization, Mapping):
+            salience_payload["meta"].setdefault("diarization", dict(diarization))
+        summary = self._extract_text(payload)
+        if summary:
+            salience_payload["summary"] = summary[:160]
+        source_id = (
+            payload.get("id")
+            or payload.get("task_id")
+            or payload.get("utterance_id")
+        )
+        if source_id:
+            salience_payload["source_id"] = source_id
+        self._publisher("system.salience", salience_payload)
+
+    # ------------------------------------------------------------------
+    def _extract_text(self, payload: Mapping[str, Any]) -> str:
+        for key in ("text", "summary", "title", "message"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    # ------------------------------------------------------------------
+    def _score(self, topic: str, payload: Mapping[str, Any]) -> Tuple[float, float]:
+        text = self._extract_text(payload)
+        base = 0.1 + min(len(text) / 220.0, 0.6)
+        meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+        diarization = payload.get("diarization")
+        if isinstance(diarization, Mapping):
+            meta = {**meta, **diarization}
+        priority = self._speaker_priority(meta, payload)
+        if topic == "speech.final":
+            base += 0.2
+            if meta.get("barge_in"):
+                base += 0.3
+        elif topic == "speech.partial":
+            base *= 0.6
+        elif topic == "task.status":
+            status = str(payload.get("status") or "").lower()
+            if status in {"failed", "blocked", "cancelled"}:
+                base += 0.6
+            elif status in {"open", "ready"}:
+                base += 0.2
+        elif topic == "note":
+            base += 0.1
+        elif topic == "observation":
+            base += 0.05
+        score = max(0.0, min(2.0, base + priority))
+        return score, priority
+
+    # ------------------------------------------------------------------
+    def _speaker_priority(
+        self, meta: Mapping[str, Any], payload: Mapping[str, Any]
+    ) -> float:
+        priority_candidates = [
+            meta.get("speaker_priority"),
+            payload.get("speaker_priority"),
+        ]
+        diarization = payload.get("diarization")
+        if isinstance(diarization, Mapping):
+            priority_candidates.append(diarization.get("priority"))
+        for candidate in priority_candidates:
+            try:
+                if candidate is not None:
+                    return float(candidate)
+            except (TypeError, ValueError):
+                continue
+        speaker = meta.get("speaker") or payload.get("speaker")
+        if isinstance(speaker, str):
+            with self._lock:
+                if speaker in self._speaker_bias:
+                    return float(self._speaker_bias[speaker])
+        return 0.0
+
+
+_SPEECH_ORCHESTRATOR: Optional[SpeechOrchestrator] = None
+_AMYGDALA: Optional[Amygdala] = None
+
+
+def ensure_speech_orchestrator(config: Optional[Mapping[str, Any]]) -> Optional[SpeechOrchestrator]:
+    """Lazily instantiate the shared speech orchestrator."""
+
+    global _SPEECH_ORCHESTRATOR, _AMYGDALA
+    config = dict(config or {})
+    if _AMYGDALA is None:
+        try:
+            _AMYGDALA = Amygdala(
+                subscriber=lambda topic, cb: subscribe(topic, cb),
+                publisher=lambda topic, payload: publish(topic, payload),
+            )
+        except Exception:
+            logging.getLogger(f"{VD_LOGGER_NAME}.amygdala").exception(
+                "Failed to initialise Amygdala"
+            )
+    if _AMYGDALA is not None:
+        try:
+            _AMYGDALA.configure(config)
+        except Exception:
+            logging.getLogger(f"{VD_LOGGER_NAME}.amygdala").debug(
+                "Unable to apply Amygdala configuration", exc_info=True
+            )
+    enable_asr = bool(config.get("enable_asr", True))
+    enable_tts = bool(config.get("enable_tts", True))
+    if not enable_asr and not enable_tts:
+        return None
+    if _SPEECH_ORCHESTRATOR is None:
+        try:
+            _SPEECH_ORCHESTRATOR = SpeechOrchestrator(
+                config,
+                publisher=lambda topic, payload: publish(topic, payload),
+                subscriber=lambda topic, cb: subscribe(topic, cb),
+            )
+        except Exception:
+            logging.getLogger(f"{VD_LOGGER_NAME}.speech").exception(
+                "Failed to initialise speech orchestrator"
+            )
+            _SPEECH_ORCHESTRATOR = None
+    else:
+        _SPEECH_ORCHESTRATOR.configure(config)
+    return _SPEECH_ORCHESTRATOR
+
+
+def shutdown_speech_orchestrator() -> None:
+    """Shut down the shared speech orchestrator."""
+
+    global _SPEECH_ORCHESTRATOR
+    if _SPEECH_ORCHESTRATOR is None:
+        return
+    try:
+        _SPEECH_ORCHESTRATOR.shutdown()
+    except Exception:
+        logging.getLogger(f"{VD_LOGGER_NAME}.speech").debug(
+            "Failed to stop speech orchestrator cleanly", exc_info=True
+        )
+    _SPEECH_ORCHESTRATOR = None
+
+
+atexit.register(shutdown_speech_orchestrator)
 
 
 @dataclass(slots=True)
@@ -10524,6 +11571,26 @@ def sha256_file(p: Path, chunk: int = 1024 * 1024) -> str:
             h.update(b)
     return h.hexdigest()
 
+DEFAULT_VOICE_CONFIG: Dict[str, Any] = {
+    "enable_asr": True,
+    "enable_tts": True,
+    "asr_model": "base",
+    "language": "en",
+    "sample_rate": 16_000,
+    "chunk_ms": 30,
+    "silence_duration": 0.8,
+    "partial_interval": 0.9,
+    "vad_threshold": 550,
+    "default_priority": 0.7,
+    "speaker_label": "user",
+    "speaker_bias": {
+        "user": 0.9,
+        "assistant": 0.4,
+        "system": 0.2,
+    },
+}
+
+
 DEFAULT_SETTINGS = {
     "default_launch_mode": "bridge",
     "working_folder": str(transit_dir()),
@@ -10551,6 +11618,7 @@ DEFAULT_SETTINGS = {
         "encryption_enabled": False,
         "access_control_enforced": False,
     },
+    "voice": copy.deepcopy(DEFAULT_VOICE_CONFIG),
 }
 
 
@@ -15847,6 +16915,13 @@ class MainWindow(QMainWindow):
             self.settings["sandbox"] = copy.deepcopy(DEFAULT_SETTINGS.get("sandbox", {}))
             self.settings["scan_roots"] = []
 
+        voice_settings = self.settings.setdefault(
+            "voice", copy.deepcopy(DEFAULT_VOICE_CONFIG)
+        )
+        self.speech = ensure_speech_orchestrator(voice_settings)
+        if self.speech:
+            self.speech.start()
+
         # Error console setup
         self.error_console = ErrorConsole(parent=self)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.error_console)
@@ -16387,6 +17462,10 @@ class MainWindow(QMainWindow):
                 "scan_roots": vals["scan_roots"],
                 "shells": vals["shells"],
             })
+            voice_settings = self.settings.get("voice", {})
+            self.speech = ensure_speech_orchestrator(voice_settings)
+            if self.speech:
+                self.speech.start()
             self.settings["sandbox"] = vals["codex"]["sandbox"]
             self.settings["scan_roots"] = vals["codex"]["scan_roots"]
             codex_settings = load_codex_settings()
