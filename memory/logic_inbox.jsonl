@@ -3,3 +3,4 @@
 {"id": "2025-10-04-001", "title": "Expose runtime flags in settings dialog", "status": "pending", "notes": "Hook offline, sandbox, and remote URLs into the preferences UI backed by the new SettingsLoader."}
 {"id": "2025-10-04-002", "title": "Test SettingsLoader parsing", "status": "pending", "notes": "Add unit coverage for INI defaults, override parsing, and error handling."}
 {"id": "2025-10-04-003", "title": "Handle workspace config rebinding", "status": "pending", "notes": "Reload runtime settings when the workspace override adjusts BootEnvironment paths."}
+{"id": "2025-10-12-001", "title": "Author sentinel policy enforcement tests", "status": "pending", "notes": "Add automated coverage that mocks emit_sentinel_event to assert parallel-limit, timeout, and network-ban metadata when policies trip."}
