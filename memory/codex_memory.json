@@ -48,6 +48,11 @@
       "applies_to": "safety-monitoring"
     },
     {
+      "title": "Sentinel Event Broadcasts",
+      "summary": "system.sentinel events capture bridge loss, sandbox corruption repairs, and repeated regressions; UI consumers must replay sentinel_history_payloads() on startup to surface pending alerts.",
+      "applies_to": "safety-monitoring"
+    },
+    {
       "title": "Operation Policy Enforcement",
       "summary": "SafetyManager consumes policies.json to enforce coder/test allowlists, denylists, approval prompts, and sandbox requirements via run_checked helpers.",
       "applies_to": "operation-safety"
