@@ -1,4 +1,21 @@
 # Changelog
+## [0.1.23] - 2025-10-10
+### Added
+- Introduced a coordinated shutdown pipeline that flushes event dispatcher queues,
+  syncs log handlers, persists durable memory stores, and appends a structured
+  session note via the new `ShutdownCoordinator` helper.
+- Captured crash stack traces to timestamped files under the agent `crashes/`
+  directory and enhanced the BrainShell crash dialog with report metadata plus a
+  high-contrast terminal fallback banner when Qt is unavailable.
+
+### Changed
+- Routed the global exception hook through the shutdown coordinator so crash
+  handling triggers the same flush/persist workflow used during graceful exits.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+- Logged manual crash simulation steps in `logs/session_2025-10-02.md`.
+
 ## [0.1.22] - 2025-10-09
 ### Added
 - Added local GitHub Desktop and GitHub CLI detection with status badges in the
