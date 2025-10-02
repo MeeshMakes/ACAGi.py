@@ -36,6 +36,11 @@
       "title": "Event Dispatcher Telemetry",
       "summary": "Route new pub/sub topics through the unified EventDispatcher so queue backpressure, logging, and remote fan-out remain consistent across observation, note, and task streams.",
       "applies_to": "acagi-events"
+    },
+    {
+      "title": "Hippocampus Dataset Dock",
+      "summary": "Use the DatasetManagerDock to ingest tagged files or directories so Hippocampus can run OCR/embeddings, persist dataset nodes, and update the brain map registry.",
+      "applies_to": "dataset-ingestion"
     }
   ],
   "procedures": [
