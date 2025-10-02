@@ -1,4 +1,15 @@
 # Changelog
+## [0.1.25] - 2025-10-11
+### Added
+- Automated startup processing of `memory/logic_inbox.jsonl`, publishing events or scheduling task buckets for actionable inbox entries while preserving deferred instructions on disk.
+
+### Changed
+- Extended the shutdown coordinator to write success/failure/anchor summaries into both durable session notes and the dated session log, capturing logic inbox dispatch outcomes for follow-up reviews.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+- Manual verification: review `vd_system.log` for the "Logic inbox startup processing" summary and confirm `logs/session_<date>.md` receives the shutdown section with anchors.
+
 ## [0.1.24] - 2025-10-10
 ### Added
 - Emitted structured `system.sentinel` events for Codex bridge loss, sandbox

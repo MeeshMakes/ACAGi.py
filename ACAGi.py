@@ -11972,6 +11972,19 @@ class InstructionItem:
 
 
 @dataclass(slots=True)
+class InboxActionResult:
+    """Outcome details for processing a single instruction inbox entry."""
+
+    item_id: str
+    action: str
+    resolved: bool
+    anchor: Optional[str] = None
+    detail: Dict[str, Any] = field(default_factory=dict)
+    new_status: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
 class SessionTail:
     """Tail view of a session conversation JSONL file."""
 
@@ -12309,6 +12322,293 @@ class InstructionInboxStore:
         os.replace(tmp_path, self.path)
 
 
+def _derive_inbox_anchor(item: InstructionItem) -> str:
+    """Return a stable anchor identifier for ``item``."""
+
+    metadata = item.metadata or {}
+    candidate = str(metadata.get("anchor", "")).strip()
+    if candidate:
+        return candidate
+
+    basis = item.id or item.title or "logic-inbox"
+    slug = re.sub(r"[^a-z0-9]+", "-", basis.lower()).strip("-")
+    if slug:
+        return slug
+    return f"logic-inbox-{uuid.uuid4().hex[:8]}"
+
+
+def _normalise_note_entries(source: Any) -> List[str]:
+    """Coerce various note representations into a clean list of strings."""
+
+    entries: List[str] = []
+    if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+        candidates = source
+    else:
+        candidates = (source,) if isinstance(source, (str, bytes)) else ()
+
+    for raw in candidates:
+        text = str(raw).strip()
+        if text:
+            entries.append(text)
+    return entries
+
+
+def _build_bucket_payload(
+    item: InstructionItem, metadata: Mapping[str, Any]
+) -> Tuple[Dict[str, Any], str]:
+    """Construct a task bucket payload derived from the inbox metadata."""
+
+    bucket_meta_raw = metadata.get("bucket")
+    bucket_meta = bucket_meta_raw if isinstance(bucket_meta_raw, Mapping) else {}
+
+    bucket_id = str(bucket_meta.get("id") or _derive_inbox_anchor(item)).strip()
+    if not bucket_id:
+        bucket_id = _derive_inbox_anchor(item)
+
+    tasks_payload: List[Dict[str, Any]] = []
+    raw_tasks = bucket_meta.get("tasks")
+    if isinstance(raw_tasks, Sequence) and not isinstance(raw_tasks, (str, bytes)):
+        for raw_task in raw_tasks:
+            if isinstance(raw_task, Mapping):
+                tasks_payload.append(dict(raw_task))
+
+    touched_files_raw = bucket_meta.get("touched_files")
+    touched_files: Set[str] = set()
+    if isinstance(touched_files_raw, Sequence) and not isinstance(
+        touched_files_raw, (str, bytes)
+    ):
+        for entry in touched_files_raw:
+            text = str(entry).strip()
+            if text:
+                touched_files.add(os.path.normpath(text))
+
+    note_entries: List[str] = []
+    note_entries.extend(_normalise_note_entries(bucket_meta.get("notes")))
+    note_entries.extend(_normalise_note_entries(bucket_meta.get("note")))
+    if item.notes and item.notes.strip():
+        note_entries.append(item.notes.strip())
+
+    metadata_payload = dict(bucket_meta.get("metadata") or {})
+    metadata_payload.setdefault("inbox_id", item.id)
+    metadata_payload.setdefault("source_title", item.title)
+    metadata_payload.setdefault("source_status", item.status)
+    if item.notes:
+        metadata_payload.setdefault("source_notes", item.notes)
+
+    stages_raw = bucket_meta.get("stages")
+    stages: Dict[str, Dict[str, Any]]
+    if isinstance(stages_raw, Mapping):
+        stages = {}
+        for key, data in stages_raw.items():
+            if isinstance(data, Mapping):
+                stage_key = str(key)
+                stages[stage_key] = dict(data)
+    else:
+        stages = {
+            stage.value: {
+                "stage": stage.value,
+                "status": TaskBucketStageStatus.PENDING.value,
+            }
+            for stage in TASK_BUCKET_STAGE_SEQUENCE
+        }
+
+    payload = {
+        "bucket_id": bucket_id,
+        "tasks": tasks_payload,
+        "touched_files": sorted(touched_files),
+        "notes": note_entries,
+        "metadata": metadata_payload,
+        "stages": stages,
+    }
+    return payload, bucket_id
+
+
+def _dispatch_inbox_instruction(
+    item: InstructionItem,
+    dispatcher: EventDispatcher,
+    logger: logging.Logger,
+) -> InboxActionResult:
+    """Dispatch ``item`` based on its metadata and return the outcome."""
+
+    metadata = item.metadata or {}
+    anchor = _derive_inbox_anchor(item)
+    action_raw = metadata.get("action")
+    default_action = "bucket" if isinstance(metadata.get("bucket"), Mapping) else "event"
+    action = str(action_raw or default_action).strip().lower() or default_action
+
+    if action == "bucket":
+        payload, bucket_id = _build_bucket_payload(item, metadata)
+        dispatcher.publish("task.bucket", payload)
+        logger.info(
+            "Logic inbox scheduled bucket item_id=%s bucket_id=%s", item.id, bucket_id
+        )
+        return InboxActionResult(
+            item_id=item.id,
+            action="bucket",
+            resolved=True,
+            anchor=bucket_id,
+            detail={"topic": "task.bucket"},
+            new_status="scheduled",
+        )
+
+    topic = str(metadata.get("topic", "note")).strip() or "note"
+    if topic not in DEFAULT_EVENT_TOPICS:
+        dispatcher.register_topic(topic)
+
+    payload_raw = metadata.get("payload")
+    payload = dict(payload_raw) if isinstance(payload_raw, Mapping) else {}
+    payload.setdefault("inbox_id", item.id)
+    payload.setdefault("title", item.title)
+    payload.setdefault("notes", item.notes)
+    payload.setdefault("status", item.status)
+    payload.setdefault("anchor", anchor)
+
+    dispatcher.publish(topic, payload)
+    logger.info(
+        "Logic inbox published event item_id=%s topic=%s", item.id, topic
+    )
+    return InboxActionResult(
+        item_id=item.id,
+        action="event",
+        resolved=True,
+        anchor=anchor,
+        detail={"topic": topic},
+        new_status="dispatched",
+    )
+
+
+def process_logic_inbox_on_launch(
+    *,
+    dispatcher: EventDispatcher = EVENT_DISPATCHER,
+    services: Optional[MemoryServices] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    """Process logic inbox entries at startup, scheduling follow-up work."""
+
+    active_logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.inbox")
+    try:
+        memory = services or memory_services()
+    except Exception:
+        active_logger.exception("Unable to load memory services; aborting inbox scan")
+        raise
+
+    inbox = memory.inbox
+    items = inbox.list_items()
+    summary: Dict[str, Any] = {
+        "timestamp": _utc_iso(),
+        "total": len(items),
+        "processed": [],
+        "dispatched": [],
+        "scheduled": [],
+        "deferred": [],
+        "errors": [],
+        "skipped": [],
+    }
+
+    for item in items:
+        status_normalised = str(item.status or "").strip().lower()
+        if status_normalised in {"done", "completed", "complete", "closed", "archived"}:
+            summary["skipped"].append(
+                {
+                    "id": item.id,
+                    "status": item.status,
+                    "reason": "status-closed",
+                }
+            )
+            continue
+        if status_normalised in {"blocked", "waiting", "snoozed"}:
+            summary["deferred"].append(
+                {
+                    "id": item.id,
+                    "status": item.status,
+                    "reason": "status-deferred",
+                }
+            )
+            continue
+
+        try:
+            outcome = _dispatch_inbox_instruction(item, dispatcher, active_logger)
+        except Exception as exc:  # pragma: no cover - defensive runtime log
+            active_logger.exception(
+                "Failed to process logic inbox item %s", item.id
+            )
+            error_message = f"{type(exc).__name__}: {exc}"
+            summary["errors"].append({"id": item.id, "error": error_message})
+            summary["deferred"].append(
+                {
+                    "id": item.id,
+                    "status": item.status,
+                    "reason": "exception",
+                }
+            )
+            continue
+
+        summary["processed"].append(
+            {
+                "id": item.id,
+                "action": outcome.action,
+                "anchor": outcome.anchor,
+                "status": outcome.new_status,
+            }
+        )
+
+        if outcome.action == "bucket":
+            summary["scheduled"].append(
+                {"id": item.id, "anchor": outcome.anchor}
+            )
+        else:
+            summary["dispatched"].append(
+                {
+                    "id": item.id,
+                    "anchor": outcome.anchor,
+                    "topic": outcome.detail.get("topic"),
+                }
+            )
+
+        if outcome.resolved and outcome.new_status:
+            try:
+                inbox.mark_status(item.id, outcome.new_status)
+            except Exception:
+                active_logger.exception(
+                    "Failed to update logic inbox status item_id=%s", item.id
+                )
+                summary["errors"].append(
+                    {
+                        "id": item.id,
+                        "error": "status-persist-failed",
+                    }
+                )
+                summary["deferred"].append(
+                    {
+                        "id": item.id,
+                        "status": item.status,
+                        "reason": "status-persist-failed",
+                    }
+                )
+
+        if not outcome.resolved:
+            summary["deferred"].append(
+                {
+                    "id": item.id,
+                    "status": item.status,
+                    "reason": "unresolved",
+                }
+            )
+
+    try:
+        inbox.flush()
+    except Exception:
+        active_logger.exception("Failed to flush logic inbox after startup scan")
+
+    active_logger.info(
+        "Logic inbox startup processing completed total=%s dispatched=%s scheduled=%s",
+        summary["total"],
+        len(summary["dispatched"]),
+        len(summary["scheduled"]),
+    )
+    return summary
+
+
 class SessionTailStore:
     """Load session conversation tails and expose CRUD helpers."""
 
@@ -12594,14 +12894,20 @@ class ShutdownCoordinator:
         if memory_summary is not None:
             context["memory"] = memory_summary
 
+        log_path: Optional[Path] = None
         if record_note and not self._note_written:
             try:
-                note = _format_shutdown_note(context)
+                note, markdown, anchors = _format_shutdown_note(context)
                 append_session_note(note)
+                log_path = _append_session_log_entry(markdown)
             except Exception:
                 self._logger.exception("Failed to append shutdown session note")
             else:
                 context["session_note"] = note
+                context["session_log_entry"] = {
+                    "path": str(log_path) if log_path else None,
+                    "anchors": anchors,
+                }
                 self._note_written = True
 
         self._logger.info(
@@ -12617,46 +12923,136 @@ class ShutdownCoordinator:
         return context
 
 
-def _format_shutdown_note(summary: Mapping[str, Any]) -> str:
-    """Render a compact shutdown summary string for durable session notes."""
+def _derive_shutdown_outcomes(
+    summary: Mapping[str, Any]
+) -> Tuple[List[str], List[str], List[str]]:
+    """Return success, failure, and anchor collections from shutdown summary."""
 
-    timestamp = str(summary.get("timestamp") or _utc_iso())
-    reason = str(summary.get("reason") or "shutdown")
+    successes: List[str] = []
+    failures: List[str] = []
+    anchors: Set[str] = set()
 
     dispatcher = summary.get("event_dispatcher") or {}
     before = dispatcher.get("before") or {}
     after = dispatcher.get("after") or {}
-    before_total = int(before.get("total_queued", 0))
-    after_total = int(after.get("total_queued", 0))
-    before_drops = int(before.get("total_drops", 0))
-    after_drops = int(after.get("total_drops", 0))
+    successes.extend(
+        [
+            f"events {int(before.get('total_queued', 0))}->{int(after.get('total_queued', 0))}",
+            f"drops {int(before.get('total_drops', 0))}->{int(after.get('total_drops', 0))}",
+        ]
+    )
 
     log_info = summary.get("log_handlers") or {}
-    flushed = int(log_info.get("flushed", 0))
-    failed = int(log_info.get("failed", 0))
+    successes.append(
+        "log flush ok={ok} failed={failed}".format(
+            ok=int(log_info.get("flushed", 0)),
+            failed=int(log_info.get("failed", 0)),
+        )
+    )
 
     memory_info = summary.get("memory") or {}
-    lessons = memory_info.get("lessons") or {}
-    lessons_count = int(lessons.get("count", lessons.get("lessons", 0) or 0))
-    inbox = memory_info.get("inbox") or {}
-    inbox_count = int(inbox.get("items", 0))
-    sessions = memory_info.get("sessions") or {}
-    tails = int(sessions.get("tails", 0))
+    if memory_info:
+        lessons = memory_info.get("lessons") or {}
+        lessons_count = int(lessons.get("count", lessons.get("lessons", 0) or 0))
+        inbox = memory_info.get("inbox") or {}
+        sessions = memory_info.get("sessions") or {}
+        successes.extend(
+            [
+                f"lessons={lessons_count}",
+                f"inbox_items={int(inbox.get('items', 0))}",
+                f"session_tails={int(sessions.get('tails', 0))}",
+            ]
+        )
+        try:
+            lessons_store = memory_services().lessons
+            anchors.update(lessons_store.lessons.keys())
+        except Exception:
+            pass
 
+    inbox_summary = summary.get("inbox_launch") or {}
+    dispatched = inbox_summary.get("dispatched") or []
+    scheduled = inbox_summary.get("scheduled") or []
+    errors = inbox_summary.get("errors") or []
+    deferred = inbox_summary.get("deferred") or []
+    if dispatched or scheduled:
+        successes.append(
+            f"inbox dispatched={len(dispatched)} scheduled={len(scheduled)}"
+        )
+    for entry in (*dispatched, *scheduled, *errors, *deferred):
+        anchor = entry.get("anchor") or entry.get("id")
+        if anchor:
+            anchors.add(str(anchor))
+    if errors:
+        failures.append(f"inbox errors={len(errors)}")
+    if deferred:
+        failures.append(f"inbox deferred={len(deferred)}")
+
+    if summary.get("crash_report") or summary.get("exception"):
+        failures.append("crash detected")
+
+    successes = list(dict.fromkeys([text for text in successes if text]))
+    failures = list(dict.fromkeys([text for text in failures if text]))
+    anchor_list = sorted({str(anchor).strip() for anchor in anchors if str(anchor).strip()})
+
+    if not successes:
+        successes = ["no tracked successes"]
+
+    return successes, failures, anchor_list
+
+
+def _format_shutdown_note(summary: Mapping[str, Any]) -> Tuple[str, str, List[str]]:
+    """Render shutdown summaries for durable notes and session logs."""
+
+    timestamp = str(summary.get("timestamp") or _utc_iso())
+    reason = str(summary.get("reason") or "shutdown")
     crash_report = summary.get("crash_report") or summary.get("crash_report_path")
+
+    successes, failures, anchors = _derive_shutdown_outcomes(summary)
+    success_text = "; ".join(successes)
+    failure_text = "; ".join(failures) if failures else "none"
+    anchor_text = ", ".join(anchors) if anchors else "none"
 
     parts = [
         f"{timestamp} shutdown={reason}",
-        f"events {before_total}->{after_total}",
-        f"drops {before_drops}->{after_drops}",
-        f"log_handlers flushed={flushed} failed={failed}",
-        f"lessons={lessons_count}",
-        f"inbox_items={inbox_count}",
-        f"session_tails={tails}",
+        f"successes=[{success_text}]",
+        f"failures=[{failure_text}]",
+        f"anchors=[{anchor_text}]",
     ]
     if crash_report:
         parts.append(f"crash_report={crash_report}")
-    return " | ".join(parts)
+
+    markdown_lines = [
+        f"## Shutdown Summary — {timestamp}",
+        f"- **Reason:** {reason}",
+        f"- **Succeeded:** {success_text}",
+        f"- **Failed:** {failure_text}",
+        f"- **Anchors:** {anchor_text}",
+    ]
+    if crash_report:
+        markdown_lines.append(f"- **Crash Report:** {crash_report}")
+
+    return " | ".join(parts), "\n".join(markdown_lines), anchors
+
+
+def _append_session_log_entry(markdown: str) -> Path:
+    """Append ``markdown`` to the dated session log, creating it when missing."""
+
+    stamp = datetime.now(UTC).date().isoformat()
+    path = here() / "logs" / f"session_{stamp}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not path.exists():
+        header = f"# Session Log — {stamp}\n\n"
+        path.write_text(header, encoding="utf-8")
+
+    text = markdown.strip()
+    if not text:
+        return path
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n" + text + "\n")
+
+    return path
 
 
 SHUTDOWN_COORDINATOR = ShutdownCoordinator()
@@ -20918,6 +21314,12 @@ def main():
 
     _ensure_high_dpi_rounding_policy()
 
+    inbox_summary: Optional[Dict[str, Any]] = None
+    try:
+        inbox_summary = process_logic_inbox_on_launch(logger=logger)
+    except Exception:
+        logger.exception("Startup logic inbox processing failed")
+
     sys.argv = [sys.argv[0]] + qt_args
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -20930,7 +21332,10 @@ def main():
         exit_code = app.exec()
     finally:
         try:
-            SHUTDOWN_COORDINATOR.run(reason="app-exit")
+            extra_context: Dict[str, Any] = {}
+            if inbox_summary is not None:
+                extra_context["inbox_launch"] = inbox_summary
+            SHUTDOWN_COORDINATOR.run(reason="app-exit", extra_context=extra_context)
         except Exception:
             logger.exception("Shutdown coordinator failed during app exit")
 
