@@ -1,4 +1,22 @@
 # Changelog
+## [0.1.24] - 2025-10-10
+### Added
+- Emitted structured `system.sentinel` events for Codex bridge loss, sandbox
+  corruption repairs, and repeated task regressions with UI dialogs that meet
+  high-contrast requirements and surface recovery guidance.
+- Created `Dev_Logic/Implemented_logic/2025-10-10-sentinel-failure-injection.md`
+  documenting manual failure injection steps for each new sentinel pathway.
+
+### Changed
+- Extended the sentinel monitor with regression counters that escalate after
+  successive rollbacks and wired the terminal to subscribe to sentinel history
+  so startup alerts replay into the chat log.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+- Logged failure simulation procedures in
+  `Dev_Logic/Implemented_logic/2025-10-10-sentinel-failure-injection.md`.
+
 ## [0.1.23] - 2025-10-10
 ### Added
 - Introduced a coordinated shutdown pipeline that flushes event dispatcher queues,

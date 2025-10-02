@@ -2414,6 +2414,9 @@ class SettingsLoader:
         )
         self._parser = configparser.ConfigParser()
         self._policies: Optional[PolicyBundle] = None
+        # Alerts captured during parsing (e.g., sandbox corruption) are replayed
+        # once the sentinel event bus is initialised.
+        self._queued_alerts: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     def load(self) -> RuntimeSettings:
@@ -2509,7 +2512,30 @@ class SettingsLoader:
             status_variant = "detailed"
 
         sandbox = get("mode", "sandbox", "restricted").strip().lower()
-        if sandbox not in {"isolated", "restricted", "trusted"}:
+        sandbox_allowed = {"isolated", "restricted", "trusted"}
+        if sandbox not in sandbox_allowed:
+            reason = (
+                "Sandbox profile in acagi.ini was invalid; "
+                "defaulting to 'restricted'."
+            )
+            logging.getLogger(__name__).error(reason)
+            self._queued_alerts.append(
+                {
+                    "kind": "sandbox.corruption",
+                    "severity": "critical",
+                    "summary": "Sandbox policy file corrupted",
+                    "detail": reason,
+                    "recovery": (
+                        "Open Settings → Codex → Sandbox and resave a valid profile "
+                        "to regenerate acagi.ini."
+                    ),
+                    "source": "settings.loader",
+                    "metadata": {
+                        "invalid_value": sandbox,
+                        "allowed_values": sorted(sandbox_allowed),
+                    },
+                }
+            )
             sandbox = "restricted"
 
         sentinel_policy = get("policy", "sentinel", "strict").strip().lower()
@@ -2566,6 +2592,16 @@ class SettingsLoader:
         parser = configparser.ConfigParser()
         parser.read_dict(DEFAULT_RUNTIME_CONFIG)
         return parser
+
+    # ------------------------------------------------------------------
+    def consume_alerts(self) -> List[Dict[str, Any]]:
+        """Return and clear queued configuration alerts."""
+
+        alerts: List[Dict[str, Any]] = []
+        if self._queued_alerts:
+            alerts = list(self._queued_alerts)
+            self._queued_alerts.clear()
+        return alerts
 
 
 SETTINGS_LOADER = SettingsLoader()
@@ -3913,6 +3949,7 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     # System coordination and metrics feeds.
     "system.metrics",
     "system.process",
+    "system.sentinel",
     "system.immune",
     "system.salience",
     # Voice pipeline topics.
@@ -4293,6 +4330,9 @@ def publish(topic: str, payload: dict) -> None:
     """Broadcast ``payload`` to subscribers registered for ``topic``."""
 
     EVENT_DISPATCHER.publish(topic, payload)
+
+
+flush_pending_sentinel_events()
 
 
 def set_remote_fanout_enabled(enabled: bool) -> None:
@@ -7056,6 +7096,137 @@ def compose_palette_entries() -> List[PaletteEntry]:
     return sorted(entries, key=lambda item: item.title.lower())
 
 
+class SentinelSeverity(str, Enum):
+    """Severity scale for sentinel events surfaced to operators."""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+@dataclass(slots=True)
+class SentinelEventPayload:
+    """Structured payload broadcast on ``system.sentinel`` events."""
+
+    event_id: str
+    kind: str
+    severity: SentinelSeverity
+    summary: str
+    detail: str
+    recovery: str
+    source: str
+    timestamp: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "kind": self.kind,
+            "severity": self.severity.value,
+            "summary": self.summary,
+            "detail": self.detail,
+            "recovery": self.recovery,
+            "source": self.source,
+            "timestamp": datetime.fromtimestamp(self.timestamp, UTC).isoformat(),
+            "metadata": dict(self.metadata),
+        }
+
+
+_SENTINEL_EVENT_LOGGER = logging.getLogger(f"{VD_LOGGER_NAME}.sentinel")
+_SENTINEL_EVENT_HISTORY: Deque[SentinelEventPayload] = deque(maxlen=32)
+_SENTINEL_PENDING_EVENTS: Deque[SentinelEventPayload] = deque()
+_SENTINEL_EVENT_LOCK = RLock()
+
+
+def emit_sentinel_event(
+    kind: str,
+    *,
+    severity: str,
+    summary: str,
+    detail: str,
+    recovery: str,
+    source: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> SentinelEventPayload:
+    """Create, record, and publish a sentinel event."""
+
+    normalized = (severity or "").strip().lower()
+    try:
+        severity_value = SentinelSeverity(normalized)
+    except ValueError:
+        severity_value = SentinelSeverity.ERROR
+
+    event = SentinelEventPayload(
+        event_id=uuid.uuid4().hex,
+        kind=kind,
+        severity=severity_value,
+        summary=summary,
+        detail=detail,
+        recovery=recovery,
+        source=source,
+        timestamp=time.time(),
+        metadata=dict(metadata or {}),
+    )
+
+    with _SENTINEL_EVENT_LOCK:
+        _SENTINEL_EVENT_HISTORY.append(event)
+        publisher_ready = callable(globals().get("publish"))
+        if not publisher_ready:
+            _SENTINEL_PENDING_EVENTS.append(event)
+
+    log_extra = {"kind": kind, "source": source, "metadata": event.metadata}
+    if severity_value in {SentinelSeverity.ERROR, SentinelSeverity.CRITICAL}:
+        _SENTINEL_EVENT_LOGGER.error("%s — %s", summary, detail, extra=log_extra)
+    elif severity_value is SentinelSeverity.WARNING:
+        _SENTINEL_EVENT_LOGGER.warning("%s — %s", summary, detail, extra=log_extra)
+    else:
+        _SENTINEL_EVENT_LOGGER.info("%s — %s", summary, detail, extra=log_extra)
+
+    publisher = globals().get("publish")
+    if callable(publisher):
+        try:
+            publisher("system.sentinel", event.to_payload())
+        except Exception:
+            _SENTINEL_EVENT_LOGGER.exception(
+                "Failed to publish sentinel event", extra=log_extra
+            )
+
+    return event
+
+
+def flush_pending_sentinel_events() -> None:
+    """Publish any sentinel events that fired before the dispatcher existed."""
+
+    publisher = globals().get("publish")
+    if not callable(publisher):
+        return
+
+    with _SENTINEL_EVENT_LOCK:
+        pending = list(_SENTINEL_PENDING_EVENTS)
+        _SENTINEL_PENDING_EVENTS.clear()
+
+    for event in pending:
+        try:
+            publisher("system.sentinel", event.to_payload())
+        except Exception:
+            _SENTINEL_EVENT_LOGGER.exception(
+                "Failed to flush pending sentinel event",
+                extra={"kind": event.kind, "source": event.source},
+            )
+
+
+def sentinel_history_payloads() -> List[Dict[str, Any]]:
+    """Return a snapshot of sentinel events for late-subscribed listeners."""
+
+    with _SENTINEL_EVENT_LOCK:
+        return [event.to_payload() for event in _SENTINEL_EVENT_HISTORY]
+
+
+for _alert in SETTINGS_LOADER.consume_alerts():
+    emit_sentinel_event(**_alert)
+
+
 class ImmuneResponse(Enum):
     """Enumerate sentinel immune response strategies."""
 
@@ -7113,6 +7284,9 @@ class SentinelMonitorHub:
         self._stall_threshold = 600.0
         self._stall_interval = 60.0
         self._backoff_seconds = 300.0
+        self._regression_window = 900.0
+        self._regression_threshold = 2
+        self._regression_counter: Dict[str, Tuple[int, float]] = {}
         self._stop = threading.Event()
         self._subscriptions: List[Subscription] = []
         self._thread: Optional[threading.Thread] = None
@@ -7261,6 +7435,40 @@ class SentinelMonitorHub:
                 "regression",
                 notes,
             )
+            count, first_ts = self._record_regression(task_id, current_ts)
+            if count >= self._regression_threshold:
+                window = max(1, int(current_ts - first_ts))
+                emit_sentinel_event(
+                    "regression.repeat",
+                    severity="critical",
+                    summary=f"Task {task_id} regressed {count} times",
+                    detail=notes,
+                    recovery=(
+                        "Pause automation, inspect the failure diffs/tests, and "
+                        "prepare a manual rollback before retrying."
+                    ),
+                    source="sentinel.monitor",
+                    metadata={
+                        "task_id": task_id,
+                        "regression_count": count,
+                        "window_seconds": window,
+                        "previous_status": prev_status,
+                        "current_status": current_status,
+                    },
+            )
+
+    # ------------------------------------------------------------------
+    def _record_regression(self, task_id: str, ts: float) -> Tuple[int, float]:
+        """Track repeated regressions within the configured time window."""
+
+        with self._lock:
+            count, first_ts = self._regression_counter.get(task_id, (0, ts))
+            if ts - first_ts > self._regression_window:
+                count = 0
+                first_ts = ts
+            count += 1
+            self._regression_counter[task_id] = (count, first_ts)
+            return count, first_ts
 
     # ------------------------------------------------------------------
     def _watch_stalls(self) -> None:
@@ -16533,6 +16741,8 @@ class ChatCard(QFrame):
         self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.chat")
         self._health_state = TerminalHealthState.OFFLINE
         self._ready_banner_seen = False
+        self._manual_bridge_stop = False
+        self._seen_sentinel_events: Set[str] = set()
 
         self.codex = CodexBootstrap(self.ollama)
         self.bridge = CodexBridge(
@@ -16673,6 +16883,16 @@ class ChatCard(QFrame):
             self._task_bus_handles.append(subscribe("task.conversation", self._handle_task_conversation))
         except Exception:
             logger.exception("Failed to subscribe to task conversation events")
+        try:
+            sentinel_handle = subscribe(
+                "system.sentinel", self._handle_sentinel_event
+            )
+        except Exception:
+            logger.exception("Failed to subscribe to sentinel events")
+        else:
+            self._task_bus_handles.append(sentinel_handle)
+            for event_payload in sentinel_history_payloads():
+                self._handle_sentinel_event(event_payload, replay=True)
         self.destroyed.connect(lambda *_: self._teardown_task_bus())
 
         # Shortcuts
@@ -16746,8 +16966,46 @@ class ChatCard(QFrame):
             self._emit_system_notice(
                 "[Codex] Bridge error detected. Inspect the console window."
             )
+            emit_sentinel_event(
+                "bridge.fault",
+                severity="critical",
+                summary="Codex bridge reported a fault",
+                detail="Bridge LED transitioned into FAULT while the process is active.",
+                recovery=(
+                    "Inspect the Codex console for stack traces, clear the error, "
+                    "and restart the bridge from the Terminal header."
+                ),
+                source="ui.terminal",
+                metadata={
+                    "previous_state": previous.name,
+                    "bridge_running": self.bridge.running(),
+                    "manual_stop": self._manual_bridge_stop,
+                },
+            )
         elif state == TerminalHealthState.OFFLINE:
             self._ready_banner_seen = False
+            if (
+                previous in {TerminalHealthState.READY, TerminalHealthState.PROBING}
+                and not self._manual_bridge_stop
+            ):
+                emit_sentinel_event(
+                    "bridge.loss",
+                    severity="critical",
+                    summary="Codex bridge connection lost",
+                    detail=(
+                        "Bridge dropped to OFFLINE after reporting ready; command "
+                        "automation is paused."
+                    ),
+                    recovery=(
+                        "Verify the Codex CMD window is running, restart via 'Start "
+                        "Codex + Bridge', and re-run pending commands."
+                    ),
+                    source="ui.terminal",
+                    metadata={
+                        "previous_state": previous.name,
+                        "bridge_running": self.bridge.running(),
+                    },
+                )
 
     def _update_interpreter_caption(self, enabled: bool) -> None:
         if hasattr(self, "interpreter_caption"):
@@ -17551,6 +17809,75 @@ class ChatCard(QFrame):
         self._record_message("system", message, [])
         self.append_signal.emit(ChatMessage("system", message, []))
 
+    def _handle_sentinel_event(
+        self, payload: Mapping[str, Any], *, replay: bool = False
+    ) -> None:
+        if not isinstance(payload, Mapping):
+            return
+
+        event_id = str(payload.get("event_id") or "").strip() or uuid.uuid4().hex
+        if event_id in self._seen_sentinel_events:
+            return
+        self._seen_sentinel_events.add(event_id)
+
+        severity = str(payload.get("severity") or "error").strip().lower()
+        summary = str(payload.get("summary") or "Sentinel alert").strip()
+        detail = str(payload.get("detail") or "").strip()
+        recovery = str(payload.get("recovery") or "").strip()
+        source = str(payload.get("source") or "sentinel").strip() or "sentinel"
+
+        notice_lines = [f"[Sentinel:{source}] {summary}"]
+        if detail:
+            notice_lines.append(detail)
+        if recovery:
+            notice_lines.append(f"Recovery: {recovery}")
+        notice = "\n".join(notice_lines)
+
+        self._emit_system_notice(notice)
+        self._logger.error(
+            "Sentinel event captured (%s): %s",
+            severity,
+            summary,
+            extra={
+                "event_id": event_id,
+                "severity": severity,
+                "source": source,
+                "replay": replay,
+            },
+        )
+
+        if severity in {"error", "critical"}:
+            self._present_sentinel_dialog(
+                "Sentinel Alert",
+                notice_lines[0] if notice_lines else summary,
+                recovery or detail,
+            )
+
+    def _present_sentinel_dialog(
+        self, title: str, summary: str, recovery: str
+    ) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle(title)
+        dialog.setIcon(QMessageBox.Critical)
+        dialog.setStandardButtons(QMessageBox.Ok)
+        dialog.setText(f"<b>{summary}</b>")
+        if recovery:
+            dialog.setInformativeText(recovery)
+
+        # Palette tuned for WCAG AA contrast on dark surfaces.
+        palette = dialog.palette()
+        palette.setColor(QPalette.Window, QColor("#0B1220"))
+        palette.setColor(QPalette.WindowText, QColor("#F5FAFF"))
+        palette.setColor(QPalette.Base, QColor("#0B1220"))
+        palette.setColor(QPalette.Text, QColor("#F5FAFF"))
+        palette.setColor(QPalette.Button, QColor("#102542"))
+        palette.setColor(QPalette.ButtonText, QColor("#F5FAFF"))
+        palette.setColor(QPalette.Highlight, QColor(self.theme.accent))
+        palette.setColor(QPalette.HighlightedText, QColor("#0B1220"))
+        dialog.setPalette(palette)
+
+        dialog.exec()
+
     def _error_console(self) -> Optional[ErrorConsole]:
         window = self.window()
         if window and hasattr(window, "error_console"):
@@ -17855,6 +18182,7 @@ class ChatCard(QFrame):
     @Slot()
     def _start_codex_bridge(self):
         try:
+            self._manual_bridge_stop = False
             self.codex.ensure_ollama()
             exe = self.codex.ensure_release()
             s = load_codex_settings()
@@ -17909,6 +18237,7 @@ class ChatCard(QFrame):
     @Slot()
     def _stop_codex_bridge(self):
         try:
+            self._manual_bridge_stop = True
             self.bridge.stop()
             self._set_health_state(TerminalHealthState.OFFLINE)
             self.btn_codex_start.setEnabled(True)
@@ -17917,6 +18246,8 @@ class ChatCard(QFrame):
             self._refresh_interpreter_toggle_enabled()
         except Exception as e:
             self.view.append_message("system", f"[Codex Error] {e}")
+        finally:
+            self._manual_bridge_stop = False
 
     # ----- core inference -----
     def _system_prompt(self) -> str:
