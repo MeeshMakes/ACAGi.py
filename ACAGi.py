@@ -319,6 +319,7 @@ class SafetyManager:
         )
         self._operation_policies: Dict[str, "OperationPolicy"] = {}
         self._runtime_settings: Optional["RuntimeSettings"] = None
+        self._remote_allowed = False
 
     def install_file_guard(self) -> None:
         """Monkey patch :func:`open` so destructive writes are intercepted."""
@@ -392,6 +393,27 @@ class SafetyManager:
     def set_runtime_settings(self, settings: "RuntimeSettings") -> None:
         with self._lock:
             self._runtime_settings = settings
+            self._remote_allowed = not settings.offline
+
+    def remote_allowed(self) -> bool:
+        """Return whether remote actions are permitted by current policy."""
+
+        with self._lock:
+            return self._remote_allowed
+
+    def set_remote_state(self, enabled: bool) -> None:
+        """Update the remote policy flag and broadcast the transition."""
+
+        normalized = bool(enabled)
+        with self._lock:
+            previous = self._remote_allowed
+            self._remote_allowed = normalized
+
+        if previous == normalized:
+            return
+
+        state = "enabled" if normalized else "disabled"
+        self._dispatch(f"[POLICY] Remote access {state}")
 
     def ensure_command_allowed(
         self, cmd: Sequence[str], *, operation: Optional[str] = None
@@ -2018,6 +2040,130 @@ class RuntimeSettings:
     remote_sentinel: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteToolingState:
+    """Discovery results for optional GitHub tooling exposed in the UI."""
+
+    github_desktop: Optional[Path]
+    gh_cli: Optional[Path]
+    checked_at: datetime
+
+    @property
+    def github_desktop_available(self) -> bool:
+        """Return ``True`` when GitHub Desktop was located on disk."""
+
+        return self.github_desktop is not None
+
+    @property
+    def gh_cli_available(self) -> bool:
+        """Return ``True`` when the GitHub CLI executable is present."""
+
+        return self.gh_cli is not None
+
+    def to_metadata(self) -> Dict[str, Any]:
+        """Serialise the detection snapshot for telemetry payloads."""
+
+        return {
+            "github_desktop": {
+                "available": self.github_desktop_available,
+                "path": str(self.github_desktop) if self.github_desktop else "",
+            },
+            "gh_cli": {
+                "available": self.gh_cli_available,
+                "path": str(self.gh_cli) if self.gh_cli else "",
+            },
+            "checked_at": self.checked_at.isoformat(),
+        }
+
+
+def _first_existing_path(candidates: Iterable[Path]) -> Optional[Path]:
+    """Return the first path in *candidates* that exists and is a file."""
+
+    for candidate in candidates:
+        try:
+            if candidate and candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _probe_github_desktop() -> Optional[Path]:
+    """Locate the GitHub Desktop executable across common installation paths."""
+
+    possible: List[Path] = []
+
+    for binary in ("github-desktop", "github desktop", "GitHubDesktop", "GitHub Desktop"):
+        resolved = shutil.which(binary)
+        if resolved:
+            possible.append(Path(resolved))
+
+    appdata = Path(os.environ.get("LOCALAPPDATA", ""))
+    program_files = Path(os.environ.get("ProgramFiles", ""))
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", ""))
+    home = Path.home()
+
+    possible.extend(
+        path
+        for path in (
+            appdata / "GitHubDesktop/GitHubDesktop.exe",
+            program_files / "GitHub Desktop/GitHubDesktop.exe",
+            program_files_x86 / "GitHub Desktop/GitHubDesktop.exe",
+            Path("/Applications/GitHub Desktop.app/Contents/MacOS/GitHub Desktop"),
+            home
+            / "Applications/GitHub Desktop.app/Contents/MacOS/GitHub Desktop",
+            Path("/usr/bin/github-desktop"),
+            Path("/usr/local/bin/github-desktop"),
+            Path("/snap/bin/github-desktop"),
+        )
+        if path
+    )
+
+    return _first_existing_path(possible)
+
+
+def _probe_gh_cli() -> Optional[Path]:
+    """Locate the GitHub CLI executable without initiating network calls."""
+
+    possible: List[Path] = []
+    resolved = shutil.which("gh")
+    if resolved:
+        possible.append(Path(resolved))
+
+    appdata = Path(os.environ.get("LOCALAPPDATA", ""))
+    home = Path.home()
+
+    possible.extend(
+        path
+        for path in (
+            appdata / "GitHub CLI/gh.exe",
+            home / "AppData/Local/GitHub CLI/gh.exe",
+            Path("/usr/bin/gh"),
+            Path("/usr/local/bin/gh"),
+            Path("/opt/homebrew/bin/gh"),
+            Path("/snap/bin/gh"),
+        )
+        if path
+    )
+
+    return _first_existing_path(possible)
+
+
+def detect_remote_tooling() -> RemoteToolingState:
+    """Return a snapshot of local GitHub tooling availability."""
+
+    github_desktop = _probe_github_desktop()
+    gh_cli = _probe_gh_cli()
+    return RemoteToolingState(
+        github_desktop=github_desktop,
+        gh_cli=gh_cli,
+        checked_at=datetime.now(UTC),
+    )
+
+
+REMOTE_ACCESS: Optional["RemoteAccessController"] = None
+
+
 POLICIES_FILENAME = "policies.json"
 
 DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
@@ -2408,6 +2554,15 @@ def configure_safety_sentinel(settings: RuntimeSettings) -> None:
         _SENTINEL_LOGGER.debug(
             "Unable to refresh sentinel monitors", exc_info=True
         )
+
+    controller = REMOTE_ACCESS
+    if controller is not None:
+        try:
+            controller.update_runtime(settings)
+        except Exception:
+            _SENTINEL_LOGGER.debug(
+                "Failed to sync remote controller runtime", exc_info=True
+            )
 
 
 def agent_sessions_dir() -> Path:
@@ -3343,6 +3498,150 @@ def dispatch_macro_playbook(
     return dispatches
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteAccessSnapshot:
+    """Summarise the remote toggle state for UI, telemetry, and policies."""
+
+    enabled: bool
+    effective: bool
+    configured: bool
+    offline: bool
+    tooling: RemoteToolingState
+
+    def to_metadata(self) -> Dict[str, Any]:
+        """Serialise the snapshot into a metadata dictionary."""
+
+        payload = {
+            "enabled": self.enabled,
+            "effective": self.effective,
+            "configured": self.configured,
+            "offline": self.offline,
+        }
+        payload.update(self.tooling.to_metadata())
+        return payload
+
+
+class RemoteAccessController:
+    """Coordinate remote fan-out toggles, policies, and ScriptSpeak notices."""
+
+    def __init__(
+        self,
+        dispatcher: EventDispatcher,
+        safety: SafetyManager,
+        runtime: RuntimeSettings,
+    ) -> None:
+        self._dispatcher = dispatcher
+        self._safety = safety
+        self._runtime = runtime
+        self._lock = RLock()
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.remote")
+        self._tooling = detect_remote_tooling()
+        self._enabled = dispatcher.remote_enabled()
+        initial_snapshot = self.snapshot()
+        self._safety.set_remote_state(initial_snapshot.effective)
+
+    def snapshot(self) -> RemoteAccessSnapshot:
+        """Return the current remote access snapshot."""
+
+        with self._lock:
+            runtime = self._runtime
+            enabled = self._enabled
+            tooling = self._tooling
+        configured = bool(runtime.remote_event_bus)
+        effective = enabled and configured and not runtime.offline
+        return RemoteAccessSnapshot(
+            enabled=enabled,
+            effective=effective,
+            configured=configured,
+            offline=runtime.offline,
+            tooling=tooling,
+        )
+
+    def set_enabled(self, enabled: bool, *, source: str = "manual") -> RemoteAccessSnapshot:
+        """Update the remote toggle and propagate changes."""
+
+        normalized = bool(enabled)
+        with self._lock:
+            previous = self._enabled
+            self._enabled = normalized
+
+        if previous == normalized:
+            snapshot = self.snapshot()
+            self._logger.debug(
+                "Remote access unchanged (enabled=%s) via %s", normalized, source
+            )
+            return snapshot
+
+        self._dispatcher.set_remote_enabled(normalized)
+        snapshot = self.snapshot()
+        self._safety.set_remote_state(snapshot.effective)
+        state = "enabled" if normalized else "disabled"
+        self._logger.info("Remote access %s via %s", state, source)
+        self._emit_scriptspeak(snapshot, source)
+        return snapshot
+
+    def update_runtime(self, runtime: RuntimeSettings) -> None:
+        """Refresh the cached runtime settings used for snapshots."""
+
+        with self._lock:
+            self._runtime = runtime
+        snapshot = self.snapshot()
+        self._safety.set_remote_state(snapshot.effective)
+
+    def refresh_tooling(self) -> RemoteToolingState:
+        """Re-run tooling detection and return the new snapshot."""
+
+        snapshot = detect_remote_tooling()
+        with self._lock:
+            self._tooling = snapshot
+        return snapshot
+
+    def _emit_scriptspeak(
+        self, snapshot: RemoteAccessSnapshot, source: str
+    ) -> None:
+        """Emit a ScriptSpeak notice when the remote toggle changes."""
+
+        command = (
+            "TOGGLE_REMOTE enabled=true"
+            if snapshot.enabled
+            else "TOGGLE_REMOTE enabled=false"
+        )
+        metadata = snapshot.to_metadata()
+        metadata["source"] = source
+        try:
+            dispatch_scriptspeak(
+                command,
+                source="remote.controller",
+                metadata=metadata,
+            )
+        except Exception:
+            self._logger.debug(
+                "Failed to dispatch ScriptSpeak remote toggle notice", exc_info=True
+            )
+
+
+def remote_access_controller() -> RemoteAccessController:
+    """Return the process-wide remote access controller."""
+
+    if REMOTE_ACCESS is None:
+        raise RuntimeError("Remote access controller is not initialised")
+    return REMOTE_ACCESS
+
+
+def remote_access_snapshot() -> RemoteAccessSnapshot:
+    """Return the latest remote access snapshot."""
+
+    return remote_access_controller().snapshot()
+
+
+if REMOTE_ACCESS is None:
+    REMOTE_ACCESS = RemoteAccessController(
+        EVENT_DISPATCHER,
+        safety_manager,
+        RUNTIME_SETTINGS,
+    )
+
+
 def _dataset_root(candidate: Optional[Path]) -> Path:
     return Path(candidate) if candidate else TASKS_DATA_ROOT
 
@@ -3712,6 +4011,12 @@ class EventDispatcher:
         meta.setdefault("sandbox", RUNTIME_SETTINGS.sandbox)
         meta.setdefault("share_limit", RUNTIME_SETTINGS.share_limit)
         meta.setdefault("sentinel_policy", RUNTIME_SETTINGS.sentinel_policy)
+        controller = REMOTE_ACCESS
+        if controller is not None:
+            snapshot = controller.snapshot()
+            meta.setdefault("remote_enabled", snapshot.effective)
+            meta.setdefault("remote_configured", snapshot.configured)
+            meta.setdefault("remote_tooling", snapshot.tooling.to_metadata())
         enriched_payload["meta"] = meta
 
         deliveries: List[_SubscriptionState] = []
@@ -14249,7 +14554,15 @@ class CodexBridge:
 # --------------------------------------------------------------------------------------
 
 class SettingsDialog(QDialog):
-    def __init__(self, theme: Theme, parent: Optional[QWidget], ollama: OllamaClient, lex_mgr: LexiconManager):
+    def __init__(
+        self,
+        theme: Theme,
+        parent: Optional[QWidget],
+        ollama: OllamaClient,
+        lex_mgr: LexiconManager,
+        *,
+        remote_snapshot: Optional[RemoteAccessSnapshot] = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
@@ -14257,6 +14570,7 @@ class SettingsDialog(QDialog):
         self.theme = theme
         self.ollama = ollama
         self.lex_mgr = lex_mgr
+        self._remote_snapshot = remote_snapshot
 
         layout = QVBoxLayout(self)
 
@@ -14404,6 +14718,24 @@ class SettingsDialog(QDialog):
         cf.addRow(self.reference_token_guard)
         cf.addRow("Reference token headroom", self.reference_token_headroom)
         codex_layout.addLayout(cf)
+
+        remote_box = QGroupBox("Remote Access", codex_box)
+        remote_box.setObjectName("RemoteAccessBox")
+        remote_layout = QFormLayout(remote_box)
+        self.remote_status_value = QLabel("Status unknown", remote_box)
+        self.remote_status_value.setObjectName("RemoteStatusValue")
+        self.remote_status_value.setWordWrap(True)
+        self.remote_github_desktop_value = QLabel("GitHub Desktop —", remote_box)
+        self.remote_github_desktop_value.setWordWrap(True)
+        self.remote_gh_cli_value = QLabel("gh CLI —", remote_box)
+        self.remote_gh_cli_value.setWordWrap(True)
+        remote_layout.addRow("Remote toggle", self.remote_status_value)
+        remote_layout.addRow("GitHub Desktop", self.remote_github_desktop_value)
+        remote_layout.addRow("GitHub CLI", self.remote_gh_cli_value)
+        codex_layout.addWidget(remote_box)
+
+        if self._remote_snapshot is not None:
+            self.update_remote_capabilities(self._remote_snapshot)
 
         sandbox_box = QGroupBox("Sandbox")
         sandbox_box.setObjectName("SandboxBox")
@@ -14815,6 +15147,73 @@ class SettingsDialog(QDialog):
         if not trusted:
             self.scan_roots_list.clearSelection()
         self._update_scan_root_remove_enabled()
+
+    def update_remote_capabilities(self, snapshot: RemoteAccessSnapshot) -> None:
+        """Populate remote access labels and tooltips."""
+
+        self._remote_snapshot = snapshot
+        status = self._format_remote_status(snapshot)
+        details = [
+            f"Configured: {snapshot.configured}",
+            f"User toggle: {snapshot.enabled}",
+            f"Effective: {snapshot.effective}",
+            f"Offline: {snapshot.offline}",
+            f"Last check: {snapshot.tooling.checked_at.isoformat(timespec='seconds')}",
+        ]
+        self.remote_status_value.setText(status)
+        self.remote_status_value.setToolTip("\n".join(details))
+
+        desktop_text, desktop_tip = self._format_remote_tooling(
+            "GitHub Desktop",
+            snapshot.tooling.github_desktop,
+            snapshot.tooling.github_desktop_available,
+            snapshot.tooling.checked_at,
+        )
+        self.remote_github_desktop_value.setText(desktop_text)
+        self.remote_github_desktop_value.setToolTip(desktop_tip)
+
+        gh_text, gh_tip = self._format_remote_tooling(
+            "gh CLI",
+            snapshot.tooling.gh_cli,
+            snapshot.tooling.gh_cli_available,
+            snapshot.tooling.checked_at,
+        )
+        self.remote_gh_cli_value.setText(gh_text)
+        self.remote_gh_cli_value.setToolTip(gh_tip)
+
+    def _format_remote_status(self, snapshot: RemoteAccessSnapshot) -> str:
+        """Return a descriptive status string for the remote toggle."""
+
+        if snapshot.effective:
+            return "Enabled (fan-out active)"
+        if snapshot.enabled and snapshot.offline:
+            return "Paused (offline mode)"
+        if snapshot.enabled and not snapshot.configured:
+            return "Enabled (remote bus missing)"
+        if snapshot.enabled:
+            return "Enabled (awaiting connectivity)"
+        if snapshot.configured:
+            return "Disabled (remote configured)"
+        return "Disabled"
+
+    def _format_remote_tooling(
+        self,
+        name: str,
+        path: Optional[Path],
+        available: bool,
+        checked_at: datetime,
+    ) -> Tuple[str, str]:
+        """Return display text and tooltip for tooling availability."""
+
+        symbol = "✓" if available else "✗"
+        text = f"{name} {symbol}"
+        timestamp = checked_at.isoformat(timespec="seconds")
+        if available and path:
+            detail = f"{name} detected at {path}"
+        else:
+            detail = f"{name} not detected"
+        tooltip = f"{detail}\nLast checked: {timestamp}"
+        return text, tooltip
 
     def _row(self, *widgets: QWidget) -> QWidget:
         w = QWidget(self); h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0)
@@ -18650,13 +19049,14 @@ class StatusBarTelemetryPanel(QFrame):
     def __init__(
         self,
         runtime: RuntimeSettings,
-        remote_enabled: bool,
+        remote_snapshot: RemoteAccessSnapshot,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("StatusBarTelemetryPanel")
         self._runtime = runtime
         self._remote_configured = bool(runtime.remote_event_bus)
+        self._tooling = remote_snapshot.tooling
         self._latest_metrics: Dict[str, Any] = {}
 
         layout = QHBoxLayout(self)
@@ -18673,6 +19073,16 @@ class StatusBarTelemetryPanel(QFrame):
         )
         self._remote_button.toggled.connect(self._handle_remote_toggled)
         layout.addWidget(self._remote_button)
+
+        self._github_desktop_label = QLabel("GitHub Desktop —", self)
+        self._github_desktop_label.setObjectName("StatusGithubDesktopLabel")
+        self._github_desktop_label.setMinimumWidth(140)
+        layout.addWidget(self._github_desktop_label)
+
+        self._gh_cli_label = QLabel("gh CLI —", self)
+        self._gh_cli_label.setObjectName("StatusGhCliLabel")
+        self._gh_cli_label.setMinimumWidth(100)
+        layout.addWidget(self._gh_cli_label)
 
         self._sandbox_label = QLabel("Sandbox: —", self)
         self._sandbox_label.setObjectName("StatusSandboxLabel")
@@ -18698,23 +19108,25 @@ class StatusBarTelemetryPanel(QFrame):
 
         layout.addStretch(1)
 
-        self.update_runtime(runtime, remote_enabled)
+        self.update_runtime(runtime, remote_snapshot)
 
     # ------------------------------------------------------------------
-    def update_runtime(self, runtime: RuntimeSettings, remote_enabled: bool) -> None:
+    def update_runtime(
+        self, runtime: RuntimeSettings, remote_snapshot: RemoteAccessSnapshot
+    ) -> None:
         """Refresh runtime-dependent toggles (remote link, sandbox posture)."""
 
         self._runtime = runtime
         self._remote_configured = bool(runtime.remote_event_bus)
+        self.update_tooling(remote_snapshot.tooling)
         offline = runtime.offline
         should_enable = self._remote_configured and not offline
+        checked = remote_snapshot.enabled and should_enable
         self._remote_button.blockSignals(True)
         self._remote_button.setEnabled(should_enable)
-        self._remote_button.setChecked(remote_enabled and should_enable)
+        self._remote_button.setChecked(checked)
         self._remote_button.blockSignals(False)
-        self._sync_remote_button(
-            self._remote_button.isChecked(), should_enable, offline
-        )
+        self._sync_remote_button(remote_snapshot, should_enable)
 
         sandbox_label = runtime.sandbox.capitalize() or "Unknown"
         self._sandbox_label.setText(f"Sandbox: {sandbox_label}")
@@ -18794,30 +19206,37 @@ class StatusBarTelemetryPanel(QFrame):
     def _handle_remote_toggled(self, checked: bool) -> None:
         """Emit toggle events and keep button text in sync."""
 
-        self.remoteToggled.emit(checked)
-        self._sync_remote_button(
-            checked,
-            self._remote_button.isEnabled(),
-            self._runtime.offline,
+        snapshot = RemoteAccessSnapshot(
+            enabled=checked,
+            effective=(
+                checked and self._remote_configured and not self._runtime.offline
+            ),
+            configured=self._remote_configured,
+            offline=self._runtime.offline,
+            tooling=self._tooling,
         )
+        self.remoteToggled.emit(checked)
+        self._sync_remote_button(snapshot, self._remote_button.isEnabled())
 
     # ------------------------------------------------------------------
     def _sync_remote_button(
         self,
-        checked: bool,
+        snapshot: RemoteAccessSnapshot,
         enabled: bool,
-        offline: bool,
     ) -> None:
         """Update remote button text and tooltip based on state."""
 
-        label = "Remote On" if checked else "Remote Off"
+        label = "Remote On" if snapshot.effective else "Remote Off"
         self._remote_button.setText(label)
         remote_url = self._runtime.remote_event_bus or "(not configured)"
         tooltip = [
             f"Remote bus: {remote_url}",
-            f"Enabled: {enabled}",
-            f"Offline mode: {offline}",
+            f"Toggle available: {enabled}",
+            f"User toggle: {snapshot.enabled}",
+            f"Effective: {snapshot.effective}",
+            f"Offline mode: {snapshot.offline}",
         ]
+        tooltip.extend(self._tooling_tooltip_lines())
         self._remote_button.setToolTip("\n".join(tooltip))
 
     # ------------------------------------------------------------------
@@ -18833,6 +19252,73 @@ class StatusBarTelemetryPanel(QFrame):
         meter.setValue(value)
         meter.setFormat(f"{label} {value}%")
         meter.setToolTip(f"{label} utilisation at {value}%")
+
+    # ------------------------------------------------------------------
+    def update_tooling(self, tooling: RemoteToolingState) -> None:
+        """Render remote tooling availability badges."""
+
+        self._tooling = tooling
+        desktop_text, desktop_tip = self._tooling_label(
+            "GitHub Desktop",
+            tooling.github_desktop,
+            tooling.github_desktop_available,
+            tooling.checked_at,
+        )
+        self._github_desktop_label.setText(desktop_text)
+        self._github_desktop_label.setToolTip(desktop_tip)
+
+        gh_text, gh_tip = self._tooling_label(
+            "gh CLI",
+            tooling.gh_cli,
+            tooling.gh_cli_available,
+            tooling.checked_at,
+        )
+        self._gh_cli_label.setText(gh_text)
+        self._gh_cli_label.setToolTip(gh_tip)
+
+    # ------------------------------------------------------------------
+    def _tooling_label(
+        self,
+        name: str,
+        path: Optional[Path],
+        available: bool,
+        checked_at: datetime,
+    ) -> Tuple[str, str]:
+        """Return badge text and tooltip for a tooling probe."""
+
+        symbol = "✓" if available else "✗"
+        text = f"{name}: {symbol}"
+        timestamp = checked_at.isoformat(timespec="seconds")
+        if available and path:
+            detail = f"{name} detected at {path}"
+        else:
+            detail = f"{name} not detected"
+        tooltip = f"{detail}\nLast checked: {timestamp}"
+        return text, tooltip
+
+    # ------------------------------------------------------------------
+    def _tooling_tooltip_lines(self) -> List[str]:
+        """Provide a tooltip summary for remote tooling availability."""
+
+        timestamp = self._tooling.checked_at.isoformat(timespec="seconds")
+        lines = [
+            (
+                "GitHub Desktop: available"
+                if self._tooling.github_desktop_available
+                else "GitHub Desktop: missing"
+            ),
+        ]
+        if self._tooling.github_desktop:
+            lines.append(f"  • {self._tooling.github_desktop}")
+        lines.append(
+            "GitHub CLI: available"
+            if self._tooling.gh_cli_available
+            else "GitHub CLI: missing"
+        )
+        if self._tooling.gh_cli:
+            lines.append(f"  • {self._tooling.gh_cli}")
+        lines.append(f"Last check: {timestamp}")
+        return lines
 
     # ------------------------------------------------------------------
     def _update_attention(self, data: Optional[Mapping[str, Any]]) -> None:
@@ -19057,10 +19543,10 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(self.virtual_desktop_dock, self.brain_map_dock)
         safety_manager.set_confirmer(self._confirm_risky_command)
         self.status_indicator: QStatusBar = self.statusBar()
-        remote_enabled = is_remote_fanout_enabled()
+        remote_snapshot = remote_access_snapshot()
         self._status_panel = StatusBarTelemetryPanel(
             self.feature_flags,
-            remote_enabled,
+            remote_snapshot,
             self,
         )
         self._status_panel.remoteToggled.connect(
@@ -19430,20 +19916,28 @@ class MainWindow(QMainWindow):
     def _refresh_status_bar(self) -> None:
         if not hasattr(self, "status_indicator"):
             return
-        remote_enabled = is_remote_fanout_enabled()
+        snapshot = remote_access_snapshot()
         if hasattr(self, "_status_panel"):
             self._status_panel.update_runtime(
                 self.feature_flags,
-                remote_enabled,
+                snapshot,
             )
         offline_state = "Offline" if self.feature_flags.offline else "Online"
         sandbox_state = self.feature_flags.sandbox.capitalize()
         limit = self.settings.get("share_limit", self.feature_flags.share_limit)
         policy = self.feature_flags.sentinel_policy.capitalize()
-        if self.feature_flags.remote_event_bus:
-            remote_flag = "Remote linked" if remote_enabled else "Remote paused"
+        if snapshot.configured:
+            remote_flag = "Remote linked" if snapshot.effective else "Remote paused"
         else:
             remote_flag = "Local events"
+        ghd = (
+            "GitHub Desktop ✓"
+            if snapshot.tooling.github_desktop_available
+            else "GitHub Desktop ✗"
+        )
+        gh_cli = (
+            "gh CLI ✓" if snapshot.tooling.gh_cli_available else "gh CLI ✗"
+        )
         summary = " • ".join(
             [
                 offline_state,
@@ -19451,6 +19945,8 @@ class MainWindow(QMainWindow):
                 f"Share limit: {limit}",
                 f"Policy: {policy}",
                 remote_flag,
+                ghd,
+                gh_cli,
             ]
         )
         self.status_indicator.showMessage(summary)
@@ -19459,10 +19955,16 @@ class MainWindow(QMainWindow):
     def _on_remote_toggle_requested(self, enabled: bool) -> None:
         """Handle remote fan-out toggles emitted from the status panel."""
 
-        set_remote_fanout_enabled(enabled)
-        logging.getLogger(__name__).info(
-            "Remote fan-out toggled to %s", "enabled" if enabled else "disabled"
+        snapshot = remote_access_controller().set_enabled(
+            enabled, source="ui.status_bar"
         )
+        logging.getLogger(__name__).info(
+            "Remote fan-out toggled to %s (effective=%s)",
+            "enabled" if snapshot.enabled else "disabled",
+            snapshot.effective,
+        )
+        if hasattr(self, "_status_panel"):
+            self._status_panel.update_runtime(self.feature_flags, snapshot)
         self._refresh_status_bar()
 
     # ------------------------------------------------------------------
@@ -19522,7 +20024,15 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _open_settings(self):
-        dlg = SettingsDialog(self.theme, self, self.ollama, self.lex_mgr)
+        controller = remote_access_controller()
+        controller.refresh_tooling()
+        dlg = SettingsDialog(
+            self.theme,
+            self,
+            self.ollama,
+            self.lex_mgr,
+            remote_snapshot=controller.snapshot(),
+        )
         dlg.context_pairs.setValue(int(self.settings.get("context_pairs", 25)))
         dlg.share_context.setChecked(self.settings.get("share_context", True))
         dlg.share_limit.setValue(int(self.settings.get("share_limit", 5)))
