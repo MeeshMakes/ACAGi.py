@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-09",
+  "last_updated": "2025-10-11",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -111,6 +111,15 @@
       "title": "Remote Access Controller Toggle",
       "summary": "Remote fan-out must route through the RemoteAccessController so UI state, safety policies, and ScriptSpeak notifications stay synchronised whenever remote actions are enabled or paused.",
       "applies_to": "remote-control"
+    },
+    {
+      "title": "Logic Inbox Startup Dispatch",
+      "summary": "During boot ACAGi scans memory/logic_inbox.jsonl, publishing events or scheduling buckets for actionable items while leaving deferred work persisted for later review.",
+      "applies_to": "workflow",
+      "metadata": {
+        "introduced": "2025-10-11",
+        "notes": "Ensure new inbox entries include action/topic metadata when special handling is required."
+      }
     },
     {
       "title": "Coordinated Shutdown Procedure",
