@@ -1419,6 +1419,7 @@ APP_NAME = "Agent Virtual Desktop — Codex-Terminal"
 VD_LOGGER_NAME = "VirtualDesktop"
 VD_LOG_FILENAME = "vd_system.log"
 VD_LOG_PATH: Path = Path()
+MEMORY_SERVICES: MemoryServices | None = None
 Excepthook = Callable[
     [type[BaseException], BaseException, Optional[TracebackType]],
     None,
@@ -1708,6 +1709,18 @@ class BootEnvironment:
 
         global VD_LOG_PATH
         VD_LOG_PATH = log_path
+
+        global MEMORY_SERVICES
+        if MEMORY_SERVICES is not None:
+            try:
+                sessions_dir = self.agent_subdir("sessions")
+                MEMORY_SERVICES.refresh(
+                    lessons_path=MEMORY_PATH,
+                    inbox_path=LOGIC_INBOX_PATH,
+                    sessions_root=sessions_dir,
+                )
+            except Exception:
+                logger.exception("Failed to refresh memory services during boot")
 
         return logger
 
@@ -4763,54 +4776,569 @@ def notify_dependency_missing(error: OptionalDependencyError) -> None:
     warnings.warn(error.user_message, RuntimeWarning, stacklevel=3)
     _DEPENDENCY_WARNINGS_EMITTED.add(error.module_name)
 MEMORY_PATH = here() / "memory" / "codex_memory.json"
+LOGIC_INBOX_PATH = here() / "memory" / "logic_inbox.jsonl"
 MEMORY_LOCK = threading.Lock()
 
-def _read_codex_memory() -> Dict[str, Any]:
-    if not MEMORY_PATH.exists():
-        return {"sessions": [], "work_items": []}
-    try:
-        data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"sessions": [], "work_items": []}
-    if not isinstance(data, dict):
-        return {"sessions": [], "work_items": []}
-    sessions = data.get("sessions")
-    if not isinstance(sessions, list):
-        sessions = []
-    work_items = data.get("work_items")
-    if not isinstance(work_items, list):
-        work_items = []
-    return {"sessions": sessions, "work_items": work_items}
+@dataclass(slots=True)
+class DurableLesson:
+    """Structured representation of a long-lived repository lesson."""
+
+    anchor: str
+    title: str
+    summary: str
+    applies_to: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class InstructionItem:
+    """Item stored in the logic inbox awaiting implementation."""
+
+    id: str
+    title: str
+    status: str
+    notes: str
+    created_at: float | None = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "id": self.id,
+            "title": self.title,
+            "status": self.status,
+            "notes": self.notes,
+        }
+        if self.created_at is not None:
+            payload["created_at"] = self.created_at
+        if self.metadata:
+            payload["metadata"] = self.metadata
+        return payload
+
+
+@dataclass(slots=True)
+class SessionTail:
+    """Tail view of a session conversation JSONL file."""
+
+    session_id: str
+    path: Path
+    entries: List[Dict[str, Any]]
+    updated_at: float
+
+
+class DurableMemoryStore:
+    """Manage durable lessons and session notes persisted in codex_memory.json."""
+
+    _DEFAULT_PAYLOAD: Dict[str, Any] = {
+        "version": "0.0.0",
+        "stable_lessons": [],
+        "sessions": [],
+        "work_items": [],
+    }
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        lock: threading.Lock | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.path = path
+        self._lock = lock or threading.Lock()
+        self._logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        self._payload: Dict[str, Any] = {}
+        self.lessons: Dict[str, DurableLesson] = {}
+        self.session_entries: List[Dict[str, Any]] = []
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Reload lessons and session entries from disk."""
+
+        payload = self._read()
+        lessons_payload = payload.get("stable_lessons", [])
+        lessons: Dict[str, DurableLesson] = {}
+        for index, item in enumerate(lessons_payload):
+            if not isinstance(item, Mapping):
+                continue
+            title = str(item.get("title", "")).strip()
+            summary = str(item.get("summary", "")).strip()
+            applies_to = str(item.get("applies_to", "")).strip()
+            anchor = self._derive_anchor(item.get("id"), title, index)
+            metadata = dict(item.get("metadata") or {})
+            lessons[anchor] = DurableLesson(
+                anchor=anchor,
+                title=title,
+                summary=summary,
+                applies_to=applies_to,
+                metadata=metadata,
+            )
+        self.lessons = lessons
+
+        sessions_payload = payload.get("sessions", [])
+        entries: List[Dict[str, str]] = []
+        for item in sessions_payload:
+            if not isinstance(item, Mapping):
+                continue
+            ts = item.get("timestamp")
+            note = item.get("notes")
+            if isinstance(note, str) and note.strip():
+                entries.append(
+                    {
+                        "timestamp": str(ts) if isinstance(ts, str) else str(ts or ""),
+                        "notes": note.strip(),
+                    }
+                )
+        self.session_entries = entries
+        self._payload = payload
+
+    def list_lessons(self) -> List[DurableLesson]:
+        """Return the loaded stable lessons in deterministic order."""
+
+        return [self.lessons[key] for key in sorted(self.lessons.keys())]
+
+    def get_lesson(self, anchor: str) -> DurableLesson | None:
+        """Retrieve a single lesson by anchor."""
+
+        return self.lessons.get(anchor)
+
+    def upsert_lesson(
+        self,
+        *,
+        title: str,
+        summary: str,
+        applies_to: str,
+        anchor: str | None = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> DurableLesson:
+        """Create or update a durable lesson entry."""
+
+        anchor_value = anchor or self._derive_anchor(None, title, len(self.lessons))
+        record = DurableLesson(
+            anchor=anchor_value,
+            title=title.strip(),
+            summary=summary.strip(),
+            applies_to=applies_to.strip(),
+            metadata=dict(metadata or {}),
+        )
+        with self._lock:
+            self.lessons[anchor_value] = record
+            self._persist()
+        return record
+
+    def delete_lesson(self, anchor: str) -> bool:
+        """Remove a lesson by anchor, returning ``True`` when deleted."""
+
+        with self._lock:
+            if anchor not in self.lessons:
+                return False
+            self.lessons.pop(anchor)
+            self._persist()
+        return True
+
+    def list_session_notes(self) -> List[Dict[str, str]]:
+        """Return the stored session note entries."""
+
+        return list(self.session_entries)
+
+    def append_session_note(self, note: str) -> Dict[str, str]:
+        """Append a session note and persist it to disk."""
+
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "notes": note.strip(),
+        }
+        with self._lock:
+            self.session_entries.append(entry)
+            self._persist()
+        return entry
+
+    def _derive_anchor(
+        self,
+        candidate: Any,
+        title: str,
+        index: int,
+    ) -> str:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        base = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        if not base:
+            base = f"lesson-{index + 1}"
+        anchor = base
+        counter = 1
+        while anchor in self.lessons and self.lessons[anchor].title != title:
+            counter += 1
+            anchor = f"{base}-{counter}"
+        return anchor
+
+    def _read(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            return dict(self._DEFAULT_PAYLOAD)
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            self._logger.exception("Failed to read codex memory")
+        return dict(self._DEFAULT_PAYLOAD)
+
+    def _persist(self) -> None:
+        payload = dict(self._payload)
+        payload.setdefault("version", self._DEFAULT_PAYLOAD["version"])
+        payload["stable_lessons"] = [
+            {
+                "id": lesson.anchor,
+                "title": lesson.title,
+                "summary": lesson.summary,
+                "applies_to": lesson.applies_to,
+                **({"metadata": lesson.metadata} if lesson.metadata else {}),
+            }
+            for lesson in self.lessons.values()
+        ]
+        payload["sessions"] = list(self.session_entries)
+        payload.setdefault("work_items", self._payload.get("work_items", []))
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            json.dump(payload, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, self.path)
+        self._payload = payload
+
+
+class InstructionInboxStore:
+    """Manage instruction inbox entries persisted as JSONL."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.path = path
+        self._logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        self.items: Dict[str, InstructionItem] = {}
+        self._order: List[str] = []
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Reload inbox items from disk."""
+
+        self.items.clear()
+        self._order.clear()
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        self._logger.debug(
+                            "Skipping malformed inbox entry: %s", line, exc_info=True
+                        )
+                        continue
+                    item = self._coerce(payload)
+                    self.items[item.id] = item
+                    self._order.append(item.id)
+        except Exception:
+            self._logger.exception("Failed to refresh instruction inbox")
+
+    def list_items(self) -> List[InstructionItem]:
+        """Return inbox items preserving their file order."""
+
+        return [self.items[item_id] for item_id in self._order if item_id in self.items]
+
+    def get_item(self, item_id: str) -> InstructionItem | None:
+        return self.items.get(item_id)
+
+    def upsert(
+        self,
+        *,
+        item_id: str,
+        title: str,
+        status: str,
+        notes: str,
+        created_at: float | None = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> InstructionItem:
+        """Insert or update an instruction inbox record."""
+
+        record = InstructionItem(
+            id=item_id,
+            title=title.strip(),
+            status=status.strip(),
+            notes=notes.strip(),
+            created_at=created_at,
+            metadata=dict(metadata or {}),
+        )
+        if item_id not in self.items:
+            self._order.append(item_id)
+        self.items[item_id] = record
+        self._flush()
+        return record
+
+    def mark_status(self, item_id: str, status: str) -> InstructionItem | None:
+        record = self.items.get(item_id)
+        if not record:
+            return None
+        updated = InstructionItem(
+            id=record.id,
+            title=record.title,
+            status=status.strip(),
+            notes=record.notes,
+            created_at=record.created_at,
+            metadata=dict(record.metadata),
+        )
+        self.items[item_id] = updated
+        self._flush()
+        return updated
+
+    def delete(self, item_id: str) -> bool:
+        if item_id not in self.items:
+            return False
+        self.items.pop(item_id)
+        self._order = [existing for existing in self._order if existing != item_id]
+        self._flush()
+        return True
+
+    def _coerce(self, payload: Mapping[str, Any]) -> InstructionItem:
+        item_id = str(payload.get("id") or uuid.uuid4().hex)
+        title = str(payload.get("title", "")).strip()
+        status = str(payload.get("status", "pending")).strip()
+        notes = str(payload.get("notes", "")).strip()
+        created_at_raw = payload.get("created_at")
+        created_at = float(created_at_raw) if isinstance(created_at_raw, (int, float)) else None
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+        return InstructionItem(
+            id=item_id,
+            title=title,
+            status=status or "pending",
+            notes=notes,
+            created_at=created_at,
+            metadata=dict(metadata),
+        )
+
+    def _flush(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            for item_id in self._order:
+                item = self.items.get(item_id)
+                if not item:
+                    continue
+                tmp.write(json.dumps(item.to_payload(), ensure_ascii=False) + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, self.path)
+
+
+class SessionTailStore:
+    """Load session conversation tails and expose CRUD helpers."""
+
+    def __init__(
+        self,
+        sessions_root: Path,
+        *,
+        tail_lines: int = 50,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.sessions_root = sessions_root
+        self.tail_lines = max(1, tail_lines)
+        self._logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        self._tails: Dict[str, SessionTail] = {}
+        self.refresh()
+
+    def refresh(self, sessions_root: Optional[Path] = None) -> None:
+        """Reload session tails from disk."""
+
+        if sessions_root is not None:
+            self.sessions_root = sessions_root
+        self.sessions_root.mkdir(parents=True, exist_ok=True)
+        tails: Dict[str, SessionTail] = {}
+        for session_dir in self.sessions_root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            jsonl_path = session_dir / "conversation.jsonl"
+            if not jsonl_path.exists():
+                continue
+            tail_entries = self._read_tail(jsonl_path)
+            updated_at = jsonl_path.stat().st_mtime
+            tails[session_dir.name] = SessionTail(
+                session_id=session_dir.name,
+                path=jsonl_path,
+                entries=tail_entries,
+                updated_at=updated_at,
+            )
+        self._tails = tails
+
+    def list_tails(self) -> List[SessionTail]:
+        """Return session tails sorted by modification time (desc)."""
+
+        return sorted(
+            self._tails.values(),
+            key=lambda tail: tail.updated_at,
+            reverse=True,
+        )
+
+    def get_tail(self, session_id: str) -> SessionTail | None:
+        return self._tails.get(session_id)
+
+    def append_entry(self, session_id: str, entry: Mapping[str, Any]) -> SessionTail:
+        """Append a JSONL entry to the session log and refresh its tail."""
+
+        jsonl_path = self._ensure_session_path(session_id)
+        with jsonl_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return self._refresh_single(session_id)
+
+    def overwrite_entries(
+        self,
+        session_id: str,
+        entries: Iterable[Mapping[str, Any]],
+    ) -> SessionTail:
+        """Rewrite the JSONL file for a session with the provided entries."""
+
+        jsonl_path = self._ensure_session_path(session_id)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            for entry in entries:
+                tmp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, jsonl_path)
+        return self._refresh_single(session_id)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete the JSONL file for the given session."""
+
+        tail = self._tails.get(session_id)
+        if not tail:
+            return False
+        try:
+            tail.path.unlink(missing_ok=True)
+        except Exception:
+            self._logger.exception("Failed to delete session jsonl", exc_info=True)
+            return False
+        self._tails.pop(session_id, None)
+        return True
+
+    def _ensure_session_path(self, session_id: str) -> Path:
+        session_dir = self.sessions_root / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = session_dir / "conversation.jsonl"
+        if not jsonl_path.exists():
+            jsonl_path.write_text("", encoding="utf-8")
+        return jsonl_path
+
+    def _refresh_single(self, session_id: str) -> SessionTail:
+        jsonl_path = self._ensure_session_path(session_id)
+        entries = self._read_tail(jsonl_path)
+        tail = SessionTail(
+            session_id=session_id,
+            path=jsonl_path,
+            entries=entries,
+            updated_at=jsonl_path.stat().st_mtime,
+        )
+        self._tails[session_id] = tail
+        return tail
+
+    def _read_tail(self, path: Path) -> List[Dict[str, Any]]:
+        rows: Deque[str] = deque(maxlen=self.tail_lines)
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped:
+                        rows.append(stripped)
+        except Exception:
+            self._logger.exception("Failed to read session tail", exc_info=True)
+            return []
+        entries: List[Dict[str, Any]] = []
+        for raw in rows:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                entries.append(data)
+        return entries
+
+
+class MemoryServices:
+    """Aggregate durable lessons, inbox items, and session tails."""
+
+    def __init__(
+        self,
+        *,
+        lessons_path: Path,
+        inbox_path: Path,
+        sessions_root: Path,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        self.lessons = DurableMemoryStore(lessons_path, lock=MEMORY_LOCK, logger=self.logger)
+        self.inbox = InstructionInboxStore(inbox_path, logger=self.logger)
+        self.sessions = SessionTailStore(sessions_root, logger=self.logger)
+
+    def refresh(
+        self,
+        *,
+        lessons_path: Optional[Path] = None,
+        inbox_path: Optional[Path] = None,
+        sessions_root: Optional[Path] = None,
+    ) -> None:
+        """Reload stores, updating paths when provided."""
+
+        if lessons_path is not None and lessons_path != self.lessons.path:
+            self.lessons.path = lessons_path
+        if inbox_path is not None and inbox_path != self.inbox.path:
+            self.inbox.path = inbox_path
+        if sessions_root is not None:
+            self.sessions.refresh(sessions_root=sessions_root)
+        else:
+            self.sessions.refresh()
+        self.lessons.refresh()
+        self.inbox.refresh()
+
+    def load_session_notes(self) -> List[Dict[str, str]]:
+        return self.lessons.list_session_notes()
+
+    def append_session_note(self, note: str) -> Dict[str, str]:
+        return self.lessons.append_session_note(note)
+
+
+def memory_services() -> MemoryServices:
+    """Return the shared memory services singleton, creating it if needed."""
+
+    global MEMORY_SERVICES
+    if MEMORY_SERVICES is None:
+        MEMORY_SERVICES = MemoryServices(
+            lessons_path=MEMORY_PATH,
+            inbox_path=LOGIC_INBOX_PATH,
+            sessions_root=agent_sessions_dir(),
+            logger=logging.getLogger(VD_LOGGER_NAME),
+        )
+    return MEMORY_SERVICES
+
 
 def load_session_notes() -> List[Dict[str, str]]:
-    data = _read_codex_memory()
-    notes: List[Dict[str, str]] = []
-    for entry in data.get("sessions", []):
-        if isinstance(entry, dict):
-            note = entry.get("notes", "")
-            ts = entry.get("timestamp", "")
-            if isinstance(note, str) and note.strip():
-                notes.append({
-                    "timestamp": str(ts) if isinstance(ts, str) else str(ts),
-                    "notes": note.strip(),
-                })
-    return notes
+    """Proxy to the session note list maintained by :class:`MemoryServices`."""
 
-def _utc_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return memory_services().load_session_notes()
 
 
 def append_session_note(note: str) -> Dict[str, str]:
-    entry = {"timestamp": _utc_iso(), "notes": note.strip()}
-    with MEMORY_LOCK:
-        data = _read_codex_memory()
-        sessions = data.get("sessions", [])
-        sessions.append(entry)
-        data["sessions"] = sessions
-        data.setdefault("work_items", [])
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return entry
+    """Append a session note via the shared memory services."""
+
+    return memory_services().append_session_note(note)
+
+
+MEMORY_SERVICES = memory_services()
+
 
 def is_windows() -> bool:
     return os.name == "nt" or platform.system().lower().startswith("win")
@@ -5315,8 +5843,338 @@ def cosine(a: List[float], b: List[float]) -> float:
     if da == 0 or db == 0: return 0.0
     return num / (da * db)
 
+
+@dataclass(slots=True)
+class DatasetNode:
+    """Representation of a persisted dataset node and its sidecars."""
+
+    anchor: str
+    core: Dict[str, Any]
+    embedding: List[float] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    vector_path: Optional[Path] = None
+    thumbnail_paths: List[Path] = field(default_factory=list)
+    meta_path: Optional[Path] = None
+
+
+class DatasetNodePersistence:
+    """Manage dataset JSONL cores with sidecar metadata and vectors."""
+
+    SIDECAR_DIRNAME = "dataset_nodes"
+    VECTOR_SUFFIX = ".vec.json"
+    META_SUFFIX = ".meta.json"
+    THUMBNAIL_DIRNAME = "thumbnails"
+
+    def __init__(
+        self,
+        dataset_path: Path,
+        *,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.dataset_path = dataset_path
+        self.logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        base_dir = ensure_dir(self.dataset_path.parent)
+        self.sidecar_root = ensure_dir(base_dir / self.SIDECAR_DIRNAME)
+        self.thumbnail_root = ensure_dir(self.sidecar_root / self.THUMBNAIL_DIRNAME)
+        self._ensure_gitignore(self.sidecar_root)
+        self._ensure_gitignore(self.thumbnail_root)
+
+    def append(
+        self,
+        core: Mapping[str, Any],
+        *,
+        embedding: Optional[List[float]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        thumbnails: Optional[Iterable[Path]] = None,
+    ) -> DatasetNode:
+        anchor = str(core.get("anchor") or core.get("id") or uuid.uuid4().hex)
+        sanitized = self._sanitize_core(core, anchor)
+        self.dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.dataset_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(sanitized, ensure_ascii=False) + "\n")
+
+        vector_path = self._write_embedding(anchor, embedding)
+        meta_path = self._write_metadata(anchor, metadata)
+        thumb_paths = self._register_thumbnails(anchor, thumbnails)
+        metadata_payload = self._read_metadata(anchor)
+        embedding_payload = list(embedding or self._read_embedding(anchor))
+        return DatasetNode(
+            anchor=anchor,
+            core=sanitized,
+            embedding=embedding_payload,
+            metadata=metadata_payload,
+            vector_path=vector_path,
+            thumbnail_paths=thumb_paths,
+            meta_path=meta_path,
+        )
+
+    def iter_nodes(self) -> Iterable[DatasetNode]:
+        for record in self._core_records():
+            anchor = str(record.get("anchor") or record.get("id") or "").strip()
+            if not anchor:
+                continue
+            raw_embedding = record.get("embedding")
+            sanitized = self._sanitize_core(record, anchor)
+            embedding = self._read_embedding(anchor)
+            if not embedding and isinstance(raw_embedding, list):
+                embedding = self._coerce_vector(raw_embedding)
+            metadata_payload = self._read_metadata(anchor)
+            thumbs = self._list_thumbnails(anchor)
+            yield DatasetNode(
+                anchor=anchor,
+                core=sanitized,
+                embedding=embedding,
+                metadata=metadata_payload,
+                vector_path=self._embedding_path(anchor) if embedding else None,
+                thumbnail_paths=thumbs,
+                meta_path=self._metadata_path(anchor) if metadata_payload else None,
+            )
+
+    def load(self, anchor: str) -> DatasetNode | None:
+        for node in self.iter_nodes():
+            if node.anchor == anchor:
+                return node
+        return None
+
+    def update(
+        self,
+        anchor: str,
+        *,
+        core_updates: Optional[Mapping[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        thumbnails: Optional[Iterable[Path]] = None,
+    ) -> DatasetNode | None:
+        records = self._core_records()
+        updated = None
+        rewritten: List[Dict[str, Any]] = []
+        for record in records:
+            record_anchor = str(record.get("anchor") or record.get("id") or "").strip()
+            if not record_anchor:
+                continue
+            if record_anchor == anchor:
+                merged = dict(record)
+                for key, value in (core_updates or {}).items():
+                    if key in {"embedding", "metadata", "thumbnails"}:
+                        continue
+                    merged[key] = value
+                sanitized = self._sanitize_core(merged, anchor)
+                rewritten.append(sanitized)
+                updated = sanitized
+            else:
+                rewritten.append(self._sanitize_core(record, record_anchor))
+
+        if updated is None:
+            return None
+
+        self._write_core_records(rewritten)
+        vector_path = self._write_embedding(anchor, embedding)
+        meta_path = self._write_metadata(anchor, metadata)
+        thumb_paths = self._register_thumbnails(anchor, thumbnails)
+        metadata_payload = self._read_metadata(anchor)
+        embedding_payload = list(embedding or self._read_embedding(anchor))
+        if not thumb_paths:
+            thumb_paths = self._list_thumbnails(anchor)
+        return DatasetNode(
+            anchor=anchor,
+            core=updated,
+            embedding=embedding_payload,
+            metadata=metadata_payload,
+            vector_path=vector_path,
+            thumbnail_paths=thumb_paths,
+            meta_path=meta_path,
+        )
+
+    def delete(self, anchor: str) -> bool:
+        records = self._core_records()
+        changed = False
+        rewritten: List[Dict[str, Any]] = []
+        for record in records:
+            record_anchor = str(record.get("anchor") or record.get("id") or "").strip()
+            if record_anchor == anchor:
+                changed = True
+                continue
+            rewritten.append(self._sanitize_core(record, record_anchor))
+        if not changed:
+            return False
+        self._write_core_records(rewritten)
+        self._cleanup_sidecars(anchor)
+        return True
+
+    def thumbnail_dir(self, anchor: str, *, ensure: bool = True) -> Path:
+        directory = self.thumbnail_root / anchor
+        if ensure:
+            directory.mkdir(parents=True, exist_ok=True)
+            self._ensure_gitignore(directory)
+        return directory
+
+    # ------------------------------------------------------------------
+    def _sanitize_core(self, core: Mapping[str, Any], anchor: str) -> Dict[str, Any]:
+        record = dict(core)
+        record["anchor"] = anchor
+        record.pop("embedding", None)
+        record.pop("metadata", None)
+        record.pop("thumbnails", None)
+        return record
+
+    def _core_records(self) -> List[Dict[str, Any]]:
+        if not self.dataset_path.exists():
+            return []
+        records: List[Dict[str, Any]] = []
+        with self.dataset_path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    records.append(payload)
+        return records
+
+    def _write_core_records(self, records: Iterable[Mapping[str, Any]]) -> None:
+        self.dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            for record in records:
+                tmp.write(json.dumps(record, ensure_ascii=False) + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, self.dataset_path)
+
+    def _write_embedding(
+        self, anchor: str, embedding: Optional[List[float]]
+    ) -> Optional[Path]:
+        path = self._embedding_path(anchor)
+        if embedding is None:
+            return path if path.exists() else None
+        vector = self._coerce_vector(embedding)
+        if not vector:
+            if path.exists():
+                path.unlink(missing_ok=True)
+            return None
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump({"embedding": vector}, fh, ensure_ascii=False)
+        return path
+
+    def _read_embedding(self, anchor: str) -> List[float]:
+        path = self._embedding_path(anchor)
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                payload = payload.get("embedding")
+            if isinstance(payload, list):
+                return self._coerce_vector(payload)
+        except Exception:
+            self.logger.debug("Failed to read embedding for %s", anchor, exc_info=True)
+        return []
+
+    def _write_metadata(
+        self, anchor: str, metadata: Optional[Mapping[str, Any]]
+    ) -> Path:
+        path = self._metadata_path(anchor)
+        if metadata is None and path.exists():
+            return path
+        payload = {
+            "anchor": anchor,
+            "stored_at": datetime.now(UTC).isoformat(),
+            "metadata": dict(metadata or self._read_metadata(anchor)),
+        }
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        return path
+
+    def _read_metadata(self, anchor: str) -> Dict[str, Any]:
+        path = self._metadata_path(anchor)
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self.logger.debug("Failed to read metadata for %s", anchor, exc_info=True)
+            return {}
+        data = payload.get("metadata") if isinstance(payload, dict) else {}
+        result = dict(data) if isinstance(data, Mapping) else {}
+        stored_at = payload.get("stored_at") if isinstance(payload, dict) else None
+        if isinstance(stored_at, str) and stored_at.strip():
+            result.setdefault("stored_at", stored_at)
+        return result
+
+    def _register_thumbnails(
+        self, anchor: str, thumbnails: Optional[Iterable[Path]]
+    ) -> List[Path]:
+        if not thumbnails:
+            return self._list_thumbnails(anchor)
+        dest_dir = self.thumbnail_dir(anchor)
+        results: List[Path] = []
+        for thumb in thumbnails:
+            try:
+                source = Path(thumb)
+            except Exception:
+                continue
+            if not source.exists():
+                continue
+            target = dest_dir / source.name
+            if source.resolve() != target.resolve():
+                try:
+                    shutil.copy2(source, target)
+                except Exception:
+                    self.logger.debug(
+                        "Failed to stage thumbnail %s", source, exc_info=True
+                    )
+                    continue
+            else:
+                target = source
+            results.append(target)
+        return results or self._list_thumbnails(anchor)
+
+    def _list_thumbnails(self, anchor: str) -> List[Path]:
+        directory = self.thumbnail_dir(anchor, ensure=False)
+        if not directory.exists():
+            return []
+        return sorted(p for p in directory.iterdir() if p.is_file())
+
+    def _cleanup_sidecars(self, anchor: str) -> None:
+        self._embedding_path(anchor).unlink(missing_ok=True)
+        self._metadata_path(anchor).unlink(missing_ok=True)
+        directory = self.thumbnail_dir(anchor, ensure=False)
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _embedding_path(self, anchor: str) -> Path:
+        return self.sidecar_root / f"{anchor}{self.VECTOR_SUFFIX}"
+
+    def _metadata_path(self, anchor: str) -> Path:
+        return self.sidecar_root / f"{anchor}{self.META_SUFFIX}"
+
+    def _ensure_gitignore(self, root: Path) -> None:
+        gitignore = root / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+
+    @staticmethod
+    def _coerce_vector(raw: Iterable[Any]) -> List[float]:
+        vector: List[float] = []
+        for value in raw:
+            if isinstance(value, (int, float)):
+                vector.append(float(value))
+        return vector
+
 class DatasetManager:
-    def __init__(self, session_dir: Path, embedder: str, ollama: OllamaClient, data_root: Optional[Path] = None, enable_semantic: bool = True):
+    """Persist dataset entries with Git-friendly cores and sidecars."""
+
+    def __init__(
+        self,
+        session_dir: Path,
+        embedder: str,
+        ollama: OllamaClient,
+        data_root: Optional[Path] = None,
+        enable_semantic: bool = True,
+    ) -> None:
         self.session_dir = ensure_dir(session_dir)
         self.dataset_path = self.session_dir / "dataset.jsonl"
         self.embedder = embedder
@@ -5324,49 +6182,144 @@ class DatasetManager:
         self.lock = threading.Lock()
         self.enable_semantic = enable_semantic
         self.data_root = ensure_dir(data_root) if data_root else self.session_dir.parent
+        self.persistence = DatasetNodePersistence(
+            self.dataset_path,
+            logger=logging.getLogger(VD_LOGGER_NAME),
+        )
 
-    def add_entry(self, role: str, text: str, images: List[Path], tags: Optional[List[str]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        entry: Dict[str, Any] = {
-            "id": uuid.uuid4().hex, "ts": time.time(),
-            "role": role, "text": text, "images": [ip.name for ip in images], "tags": tags or [], "embedding": [],
+    def add_entry(
+        self,
+        role: str,
+        text: str,
+        images: List[Path],
+        tags: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        anchor = uuid.uuid4().hex
+        core: Dict[str, Any] = {
+            "id": anchor,
+            "anchor": anchor,
+            "ts": time.time(),
+            "role": role,
+            "text": text,
+            "images": [img.name for img in images],
+            "tags": list(tags or []),
         }
-        if extra: entry.update(extra)
+        if extra:
+            for key, value in extra.items():
+                if key in {"embedding", "metadata", "thumbnails"}:
+                    continue
+                core[key] = value
+
+        embedding_vec: List[float] = []
         if self.enable_semantic and text.strip():
             ok, vec, _ = self.ollama.embeddings(self.embedder, text)
-            if ok and isinstance(vec, list): entry["embedding"] = vec
+            if ok and isinstance(vec, list):
+                embedding_vec = DatasetNodePersistence._coerce_vector(vec)
+
+        metadata: Dict[str, Any] = {
+            "images": [str(path) for path in images],
+            "tags": list(tags or []),
+        }
+        if extra:
+            metadata["extra"] = extra
+
+        thumbnails = self._generate_thumbnails(anchor, images)
+
         with self.lock:
-            with self.dataset_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return entry
+            node = self.persistence.append(
+                core,
+                embedding=embedding_vec or None,
+                metadata=metadata,
+                thumbnails=thumbnails,
+            )
+
+        if embedding_vec:
+            node.embedding = embedding_vec
+        if thumbnails:
+            node.thumbnail_paths = thumbnails
+
+        payload = dict(node.core)
+        payload["embedding"] = node.embedding
+        if node.metadata:
+            payload["metadata"] = node.metadata
+        if node.thumbnail_paths:
+            payload["thumbnails"] = [p.as_posix() for p in node.thumbnail_paths]
+        return payload
+
+    def _generate_thumbnails(self, anchor: str, images: List[Path]) -> List[Path]:
+        if not images or Image is None:
+            return []
+        thumb_dir = self.persistence.thumbnail_dir(anchor)
+        generated: List[Path] = []
+        for index, image_path in enumerate(images):
+            try:
+                source = Path(image_path)
+            except Exception:
+                continue
+            if not source.exists():
+                continue
+            try:
+                with Image.open(source) as handle:  # type: ignore[attr-defined]
+                    handle.thumbnail((320, 320))
+                    dest = thumb_dir / f"{index:02d}_{source.stem}.png"
+                    handle.save(dest)
+                    generated.append(dest)
+            except Exception:
+                logging.getLogger(VD_LOGGER_NAME).debug(
+                    "Failed to generate thumbnail for %s",
+                    source,
+                    exc_info=True,
+                )
+        return generated
 
     def _all_dataset_files(self) -> List[Path]:
         files: List[Path] = []
-        for p in self.data_root.rglob("dataset.jsonl"):
-            files.append(p)
+        for path in self.data_root.rglob("dataset.jsonl"):
+            files.append(path)
         if self.dataset_path not in files and self.dataset_path.exists():
             files.append(self.dataset_path)
         return files
 
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        if not self.enable_semantic:
+        if not self.enable_semantic or k <= 0:
             return []
-        ok, qvec, _ = self.ollama.embeddings(self.embedder, query)
-        if not ok: return []
-        rows: List[Dict[str, Any]] = []
-        for fp in self._all_dataset_files():
-            try:
-                with fp.open("r", encoding="utf-8") as f:
-                    for ln in f:
-                        rows.append(json.loads(ln))
-            except Exception:
-                continue
-        scored = []
-        for obj in rows:
-            vec = obj.get("embedding") or []
-            sc = cosine(qvec, vec) if isinstance(vec, list) and vec else 0.0
-            scored.append((sc, obj))
-        scored.sort(key=lambda t: t[0], reverse=True)
-        return [o for _, o in scored[:k]]
+        ok, vector, _ = self.ollama.embeddings(self.embedder, query)
+        if not ok or not isinstance(vector, list):
+            return []
+        query_vec = DatasetNodePersistence._coerce_vector(vector)
+        if not query_vec:
+            return []
+
+        scored: List[Tuple[float, DatasetNode]] = []
+        for dataset_file in self._all_dataset_files():
+            persistence = DatasetNodePersistence(
+                dataset_file,
+                logger=logging.getLogger(VD_LOGGER_NAME),
+            )
+            for node in persistence.iter_nodes():
+                embedding = node.embedding
+                if not embedding and isinstance(node.core.get("embedding"), list):
+                    embedding = DatasetNodePersistence._coerce_vector(
+                        node.core.get("embedding")  # type: ignore[arg-type]
+                    )
+                if not embedding:
+                    continue
+                score = cosine(query_vec, embedding)
+                scored.append((score, node))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        results: List[Dict[str, Any]] = []
+        for score, node in scored[:k]:
+            payload = dict(node.core)
+            payload["embedding"] = node.embedding
+            if node.metadata:
+                payload["metadata"] = node.metadata
+            if node.thumbnail_paths:
+                payload["thumbnails"] = [p.as_posix() for p in node.thumbnail_paths]
+            payload["similarity"] = score
+            results.append(payload)
+        return results
 
 @dataclass(slots=True)
 class ConversationPaths:
