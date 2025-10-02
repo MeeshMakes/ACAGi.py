@@ -1,4 +1,16 @@
 # Changelog
+## [0.1.16] - 2025-10-06
+### Added
+- Extended the main window status bar with a telemetry panel that surfaces
+  remote fan-out toggles, sandbox posture, CPU/RAM meters, attention mix, and
+  OCR duty cycle readouts.
+- Subscribed the telemetry panel to Gate/Scheduler updates on the Thalamus
+  `system.metrics` topic and documented remote pause/resume handling.
+
+### Validation
+- Validated syntax with `python -m compileall ACAGi.py` and recorded telemetry
+  smoke checks in `logs/session_2025-10-06.md`.
+
 ## [0.1.15] - 2025-10-05
 ### Added
 - Added a Ctrl+K command palette overlay that lists policy-reviewed commands and persisted playbook macros while dispatching selections through the event bus.

@@ -156,6 +156,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QAbstractItemView,
     QStatusBar,
+    QProgressBar,
     QSplitter,
     QGraphicsView,
     QGraphicsScene,
@@ -3203,6 +3204,23 @@ class EventDispatcher:
         self._remote_history: Deque[float] = deque()
         self._remote_url = RUNTIME_SETTINGS.remote_event_bus
         self._rate_limit = max(1, RUNTIME_SETTINGS.event_rate_per_minute)
+        self._remote_enabled = bool(self._remote_url) and not RUNTIME_SETTINGS.offline
+
+    # ------------------------------------------------------------------
+    def set_remote_enabled(self, enabled: bool) -> None:
+        """Toggle remote fan-out regardless of runtime config."""
+
+        with self._lock:
+            self._remote_enabled = bool(enabled)
+        state = "enabled" if self._remote_enabled else "disabled"
+        self._logger.info("Remote fan-out %s", state)
+
+    # ------------------------------------------------------------------
+    def remote_enabled(self) -> bool:
+        """Return whether remote fan-out is currently permitted."""
+
+        with self._lock:
+            return self._remote_enabled
 
     # ------------------------------------------------------------------
     def register_topic(self, topic: str) -> None:
@@ -3312,7 +3330,11 @@ class EventDispatcher:
 
     # ------------------------------------------------------------------
     def _fan_out_remote(self, topic: str, payload: dict) -> None:
-        if not self._remote_url or RUNTIME_SETTINGS.offline:
+        if (
+            not self._remote_url
+            or RUNTIME_SETTINGS.offline
+            or not self.remote_enabled()
+        ):
             return
 
         now = time.monotonic()
@@ -3357,6 +3379,18 @@ def publish(topic: str, payload: dict) -> None:
     """Broadcast ``payload`` to subscribers registered for ``topic``."""
 
     EVENT_DISPATCHER.publish(topic, payload)
+
+
+def set_remote_fanout_enabled(enabled: bool) -> None:
+    """Toggle remote event propagation on the dispatcher."""
+
+    EVENT_DISPATCHER.set_remote_enabled(enabled)
+
+
+def is_remote_fanout_enabled() -> bool:
+    """Return the dispatcher remote fan-out flag for UI consumers."""
+
+    return EVENT_DISPATCHER.remote_enabled()
 
 
 @dataclass(slots=True)
@@ -15457,6 +15491,300 @@ class CommandPaletteDialog(QDialog):
         self._detail.setText("\n".join(lines))
 
 
+class StatusBarTelemetryPanel(QFrame):
+    """Compact status bar cluster fed by Gate/Scheduler telemetry."""
+
+    remoteToggled = Signal(bool)
+
+    def __init__(
+        self,
+        runtime: RuntimeSettings,
+        remote_enabled: bool,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("StatusBarTelemetryPanel")
+        self._runtime = runtime
+        self._remote_configured = bool(runtime.remote_event_bus)
+        self._latest_metrics: Dict[str, Any] = {}
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(8)
+
+        self._remote_button = QToolButton(self)
+        self._remote_button.setObjectName("StatusRemoteToggle")
+        self._remote_button.setCheckable(True)
+        self._remote_button.setAutoRaise(True)
+        self._remote_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._remote_button.setSizePolicy(
+            QSizePolicy.Maximum, QSizePolicy.Preferred
+        )
+        self._remote_button.toggled.connect(self._handle_remote_toggled)
+        layout.addWidget(self._remote_button)
+
+        self._sandbox_label = QLabel("Sandbox: —", self)
+        self._sandbox_label.setObjectName("StatusSandboxLabel")
+        self._sandbox_label.setMinimumWidth(120)
+        layout.addWidget(self._sandbox_label)
+
+        self._cpu_bar = self._build_meter("CPU")
+        layout.addWidget(self._cpu_bar)
+
+        self._mem_bar = self._build_meter("RAM")
+        layout.addWidget(self._mem_bar)
+
+        self._attention_label = QLabel("Attention –", self)
+        self._attention_label.setObjectName("StatusAttentionLabel")
+        self._attention_label.setMinimumWidth(160)
+        self._attention_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
+        )
+        layout.addWidget(self._attention_label)
+
+        self._ocr_bar = self._build_meter("OCR")
+        layout.addWidget(self._ocr_bar)
+
+        layout.addStretch(1)
+
+        self.update_runtime(runtime, remote_enabled)
+
+    # ------------------------------------------------------------------
+    def update_runtime(self, runtime: RuntimeSettings, remote_enabled: bool) -> None:
+        """Refresh runtime-dependent toggles (remote link, sandbox posture)."""
+
+        self._runtime = runtime
+        self._remote_configured = bool(runtime.remote_event_bus)
+        offline = runtime.offline
+        should_enable = self._remote_configured and not offline
+        self._remote_button.blockSignals(True)
+        self._remote_button.setEnabled(should_enable)
+        self._remote_button.setChecked(remote_enabled and should_enable)
+        self._remote_button.blockSignals(False)
+        self._sync_remote_button(
+            self._remote_button.isChecked(), should_enable, offline
+        )
+
+        sandbox_label = runtime.sandbox.capitalize() or "Unknown"
+        self._sandbox_label.setText(f"Sandbox: {sandbox_label}")
+        sandbox_tip = [
+            f"Profile: {sandbox_label}",
+            f"Auto-approve: {runtime.auto_approve}",
+            f"Share limit: {runtime.share_limit}",
+        ]
+        self._sandbox_label.setToolTip("\n".join(sandbox_tip))
+
+    # ------------------------------------------------------------------
+    def update_metrics(self, metrics: Mapping[str, Any]) -> None:
+        """Render Gate/Scheduler telemetry values into the UI cluster."""
+
+        self._latest_metrics = dict(metrics)
+        cpu = self._find_percentage(
+            metrics,
+            (
+                ("cpu",),
+                ("cpu_percent",),
+                ("resources", "cpu"),
+                ("resources", "cpu_percent"),
+            ),
+        )
+        mem = self._find_percentage(
+            metrics,
+            (
+                ("memory",),
+                ("ram",),
+                ("resources", "memory"),
+                ("resources", "ram"),
+                ("resources", "memory_percent"),
+            ),
+        )
+        ocr = self._find_percentage(
+            metrics,
+            (
+                ("ocr_duty_cycle",),
+                ("ocr", "duty_cycle"),
+                ("scheduler", "ocr", "duty_cycle"),
+            ),
+        )
+
+        self._update_meter(self._cpu_bar, cpu, "CPU")
+        self._update_meter(self._mem_bar, mem, "RAM")
+        self._update_meter(self._ocr_bar, ocr, "OCR")
+
+        attention = self._find_mapping(
+            metrics,
+            (
+                ("attention",),
+                ("attention_distribution",),
+                ("gate", "attention"),
+                ("gate", "attention_distribution"),
+            ),
+        )
+        self._update_attention(attention)
+
+    # ------------------------------------------------------------------
+    def _build_meter(self, label: str) -> QProgressBar:
+        """Return a progress bar configured for compact status display."""
+
+        meter = QProgressBar(self)
+        meter.setObjectName(f"Status{label.title()}Meter")
+        meter.setRange(0, 100)
+        meter.setValue(0)
+        meter.setFormat(f"{label} –")
+        meter.setAlignment(Qt.AlignCenter)
+        meter.setTextVisible(True)
+        meter.setMaximumWidth(120)
+        meter.setMinimumWidth(96)
+        meter.setFixedHeight(16)
+        meter.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        return meter
+
+    # ------------------------------------------------------------------
+    def _handle_remote_toggled(self, checked: bool) -> None:
+        """Emit toggle events and keep button text in sync."""
+
+        self.remoteToggled.emit(checked)
+        self._sync_remote_button(
+            checked,
+            self._remote_button.isEnabled(),
+            self._runtime.offline,
+        )
+
+    # ------------------------------------------------------------------
+    def _sync_remote_button(
+        self,
+        checked: bool,
+        enabled: bool,
+        offline: bool,
+    ) -> None:
+        """Update remote button text and tooltip based on state."""
+
+        label = "Remote On" if checked else "Remote Off"
+        self._remote_button.setText(label)
+        remote_url = self._runtime.remote_event_bus or "(not configured)"
+        tooltip = [
+            f"Remote bus: {remote_url}",
+            f"Enabled: {enabled}",
+            f"Offline mode: {offline}",
+        ]
+        self._remote_button.setToolTip("\n".join(tooltip))
+
+    # ------------------------------------------------------------------
+    def _update_meter(
+        self, meter: QProgressBar, value: Optional[int], label: str
+    ) -> None:
+        """Set meter value and descriptive format safely."""
+
+        if value is None:
+            meter.setValue(0)
+            meter.setFormat(f"{label} –")
+            return
+        meter.setValue(value)
+        meter.setFormat(f"{label} {value}%")
+        meter.setToolTip(f"{label} utilisation at {value}%")
+
+    # ------------------------------------------------------------------
+    def _update_attention(self, data: Optional[Mapping[str, Any]]) -> None:
+        """Render top attention buckets in descending order."""
+
+        if not data:
+            self._attention_label.setText("Attention –")
+            self._attention_label.setToolTip("No attention telemetry received yet.")
+            return
+        entries: List[str] = []
+        tooltip_lines: List[str] = []
+        sorted_items = sorted(
+            (
+                (str(name), self._coerce_ratio(score))
+                for name, score in data.items()
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for name, pct in sorted_items[:3]:
+            entries.append(f"{name}:{pct}%")
+        for name, pct in sorted_items:
+            tooltip_lines.append(f"{name}: {pct}%")
+        self._attention_label.setText("Attention " + ", ".join(entries))
+        self._attention_label.setToolTip("\n".join(tooltip_lines))
+
+    # ------------------------------------------------------------------
+    def _find_percentage(
+        self,
+        payload: Mapping[str, Any],
+        paths: Sequence[Sequence[str]],
+    ) -> Optional[int]:
+        """Return the first usable percentage value from ``paths``."""
+
+        for path in paths:
+            value = self._drill(payload, path)
+            percent = self._coerce_percent(value)
+            if percent is not None:
+                return percent
+        return None
+
+    # ------------------------------------------------------------------
+    def _find_mapping(
+        self,
+        payload: Mapping[str, Any],
+        paths: Sequence[Sequence[str]],
+    ) -> Optional[Mapping[str, Any]]:
+        """Return the first nested mapping at the provided ``paths``."""
+
+        for path in paths:
+            value = self._drill(payload, path)
+            if isinstance(value, Mapping):
+                return value
+        return None
+
+    # ------------------------------------------------------------------
+    def _drill(
+        self,
+        payload: Mapping[str, Any],
+        path: Sequence[str],
+    ) -> Any:
+        """Traverse ``payload`` using ``path`` keys, returning ``None`` on gaps."""
+
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, Mapping):
+                return None
+            current = current.get(key)
+        return current
+
+    # ------------------------------------------------------------------
+    def _coerce_percent(self, value: Any) -> Optional[int]:
+        """Normalise assorted numeric/string inputs into 0-100 integers."""
+
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return None
+            if cleaned.endswith("%"):
+                cleaned = cleaned[:-1]
+            try:
+                value = float(cleaned)
+            except ValueError:
+                return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if 0.0 <= number <= 1.0:
+            number *= 100.0
+        number = max(0.0, min(number, 100.0))
+        return int(round(number))
+
+    # ------------------------------------------------------------------
+    def _coerce_ratio(self, value: Any) -> int:
+        """Convert attention ratio/percent values into an integer percent."""
+
+        percent = self._coerce_percent(value)
+        return percent if percent is not None else 0
+
+
 class MainWindow(QMainWindow):
     def __init__(self, theme: Theme, parent: Optional[QWidget] = None, *, embedded: bool = False):
         super().__init__(parent)
@@ -15561,6 +15889,25 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(self.virtual_desktop_dock, self.brain_map_dock)
         safety_manager.set_confirmer(self._confirm_risky_command)
         self.status_indicator: QStatusBar = self.statusBar()
+        remote_enabled = is_remote_fanout_enabled()
+        self._status_panel = StatusBarTelemetryPanel(
+            self.feature_flags,
+            remote_enabled,
+            self,
+        )
+        self._status_panel.remoteToggled.connect(
+            self._on_remote_toggle_requested
+        )
+        self.status_indicator.addPermanentWidget(self._status_panel, 0)
+        self._status_subscriptions: List[Subscription] = []
+        try:
+            metrics_handle = subscribe("system.metrics", self._on_system_metrics)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to subscribe status bar to system.metrics",
+            )
+        else:
+            self._status_subscriptions.append(metrics_handle)
         self._refresh_status_bar()
 
         self._palette_logger = logging.getLogger(f"{VD_LOGGER_NAME}.palette.ui")
@@ -15860,11 +16207,20 @@ class MainWindow(QMainWindow):
     def _refresh_status_bar(self) -> None:
         if not hasattr(self, "status_indicator"):
             return
+        remote_enabled = is_remote_fanout_enabled()
+        if hasattr(self, "_status_panel"):
+            self._status_panel.update_runtime(
+                self.feature_flags,
+                remote_enabled,
+            )
         offline_state = "Offline" if self.feature_flags.offline else "Online"
         sandbox_state = self.feature_flags.sandbox.capitalize()
         limit = self.settings.get("share_limit", self.feature_flags.share_limit)
         policy = self.feature_flags.sentinel_policy.capitalize()
-        remote_flag = "Remote bus linked" if self.feature_flags.remote_event_bus else "Local events"
+        if self.feature_flags.remote_event_bus:
+            remote_flag = "Remote linked" if remote_enabled else "Remote paused"
+        else:
+            remote_flag = "Local events"
         summary = " • ".join(
             [
                 offline_state,
@@ -15875,6 +16231,35 @@ class MainWindow(QMainWindow):
             ]
         )
         self.status_indicator.showMessage(summary)
+
+    # ------------------------------------------------------------------
+    def _on_remote_toggle_requested(self, enabled: bool) -> None:
+        """Handle remote fan-out toggles emitted from the status panel."""
+
+        set_remote_fanout_enabled(enabled)
+        logging.getLogger(__name__).info(
+            "Remote fan-out toggled to %s", "enabled" if enabled else "disabled"
+        )
+        self._refresh_status_bar()
+
+    # ------------------------------------------------------------------
+    def _on_system_metrics(self, payload: Mapping[str, Any]) -> None:
+        """Schedule UI-safe handling for incoming telemetry payloads."""
+
+        snapshot = dict(payload)
+
+        def _deliver() -> None:
+            self._apply_system_metrics(snapshot)
+
+        QTimer.singleShot(0, _deliver)
+
+    # ------------------------------------------------------------------
+    def _apply_system_metrics(self, payload: Mapping[str, Any]) -> None:
+        """Feed Gate/Scheduler telemetry into the status bar panel."""
+
+        if not hasattr(self, "_status_panel"):
+            return
+        self._status_panel.update_metrics(payload)
 
     # ------------------------------------------------------------------
     def _handle_exception(self, exc_type, exc, tb) -> None:
@@ -16043,6 +16428,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 continue
         self._palette_subscriptions = []
+
+        for subscription in getattr(self, "_status_subscriptions", []):
+            try:
+                subscription.unsubscribe()
+            except Exception:
+                continue
+        self._status_subscriptions = []
 
         if hasattr(self, "chat") and hasattr(self.chat, "detach_safety_notifier"):
             self.chat.detach_safety_notifier()

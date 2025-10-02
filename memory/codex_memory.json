@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-05",
+  "last_updated": "2025-10-06",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -71,6 +71,11 @@
       "title": "Command Palette Dispatch Pattern",
       "summary": "Palette-triggered commands and macros must register PaletteEntry descriptors, run safety_manager.ensure_action_allowed before publishing to the event bus, and log manual macro notes for follow-up review.",
       "applies_to": "ui-command-palette"
+    },
+    {
+      "title": "Status Bar Telemetry Panel",
+      "summary": "The main window status bar now embeds a StatusBarTelemetryPanel that consumes system.metrics telemetry to display remote fan-out state, sandbox posture, CPU/RAM meters, attention mix, and OCR duty cycle readings while exposing a remote pause/resume toggle.",
+      "applies_to": "ui-status-bar"
     }
   ],
   "procedures": [
