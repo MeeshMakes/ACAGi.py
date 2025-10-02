@@ -1,4 +1,12 @@
 # Changelog
+## [0.1.15] - 2025-10-05
+### Added
+- Added a Ctrl+K command palette overlay that lists policy-reviewed commands and persisted playbook macros while dispatching selections through the event bus.
+- Introduced Dev Space playbook management with JSONL-backed promotion flows and manual macro execution note tracking.
+
+### Changed
+- Extended safety policies with action-level enforcement for palette triggers and seeded macro defaults in the policy bundle.
+
 ## [0.1.14] - 2025-10-05
 ### Added
 - Introduced a Brain Map dock that lazily initialises a graphics scene to render

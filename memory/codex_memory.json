@@ -66,6 +66,11 @@
       "title": "Brain Map Dock",
       "summary": "ACAGi includes a BrainMapDock that lazily renders Hippocampus nodes and typed edges with energy/salience overlays and Dev Space focus callbacks when nodes are selected.",
       "applies_to": "ui-brain-map"
+    },
+    {
+      "title": "Command Palette Dispatch Pattern",
+      "summary": "Palette-triggered commands and macros must register PaletteEntry descriptors, run safety_manager.ensure_action_allowed before publishing to the event bus, and log manual macro notes for follow-up review.",
+      "applies_to": "ui-command-palette"
     }
   ],
   "procedures": [

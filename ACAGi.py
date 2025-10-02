@@ -467,6 +467,50 @@ class SafetyManager:
         self._dispatch(message)
         raise SafetyViolation(message)
 
+    def ensure_action_allowed(self, operation: str, action: str) -> None:
+        """Validate that a high-level *operation* may trigger *action*."""
+
+        if not operation or not action:
+            return
+
+        with self._lock:
+            policy = self._operation_policies.get(operation.lower())
+            runtime = self._runtime_settings
+
+        if policy is None:
+            return
+
+        normalized = action.strip().lower()
+
+        if normalized in policy.deny_commands:
+            message = f"[POLICY] {operation} denylist violation: {action}"
+            self._dispatch(message)
+            raise SafetyViolation(message)
+
+        reasons: List[str] = []
+        if policy.allow_commands and normalized not in policy.allow_commands:
+            reasons.append("action not allowlisted")
+
+        if policy.approval_commands and normalized in policy.approval_commands:
+            reasons.append("action requires approval")
+
+        if policy.sandbox_modes:
+            current_mode = (runtime.sandbox if runtime else "trusted").lower()
+            if current_mode not in policy.sandbox_modes:
+                allowed = ", ".join(sorted(policy.sandbox_modes))
+                reasons.append(
+                    f"sandbox must be one of [{allowed}] (current={current_mode})"
+                )
+
+        if reasons:
+            self._request_policy_approval(operation, [action], "; ".join(reasons))
+            return
+
+        if policy.notes:
+            self._dispatch(
+                f"[POLICY] {operation}: {policy.notes} (action={action})"
+            )
+
     def _match_risky(self, lowered: str, tokens: Sequence[str]) -> Optional[str]:
         for pattern in self._risk_patterns:
             if pattern.search(lowered):
@@ -2000,6 +2044,13 @@ DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
             "sandbox_modes": ["isolated", "restricted", "trusted"],
             "notes": "Tests should stay non-destructive; blocked commands remain explicit.",
         },
+        "macro": {
+            "allow": [],
+            "deny": [],
+            "approval": [],
+            "sandbox_modes": ["isolated", "restricted", "trusted"],
+            "notes": "Command palette macros publish through the event bus with sentinel oversight.",
+        },
     },
     "metadata": {"generated": "default"},
 }
@@ -2478,6 +2529,7 @@ TASKS_FILE = TASKS_DATA_ROOT / "tasks.jsonl"
 EVENTS_FILE = TASKS_DATA_ROOT / "task_events.jsonl"
 DIFFS_FILE = TASKS_DATA_ROOT / "diffs.jsonl"
 ERRORS_FILE = TASKS_DATA_ROOT / "errors.jsonl"
+MACRO_PLAYBOOK_FILE = TASKS_DATA_ROOT / "macro_playbooks.jsonl"
 _RUNS_SUBDIR = "runs"
 _RUN_LOG_FILENAME = "run.log"
 
@@ -2579,6 +2631,67 @@ class TaskEvent:
 
 
 @dataclass(slots=True)
+class MacroStep:
+    """Represents a single ordered step within a macro playbook."""
+
+    order: int
+    action: str
+    arguments: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_record(
+        self,
+        playbook_id: str,
+        title: str,
+        description: str,
+    ) -> Dict[str, Any]:
+        """Materialise the step as a JSONL-friendly dictionary."""
+
+        record: Dict[str, Any] = {
+            "id": playbook_id,
+            "title": title,
+            "description": description,
+            "order": int(self.order),
+            "action": self.action,
+            "arguments": dict(self.arguments),
+        }
+        return record
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Return a serialisable payload for event dispatches."""
+
+        return {
+            "order": int(self.order),
+            "action": self.action,
+            "arguments": dict(self.arguments),
+        }
+
+
+@dataclass(slots=True)
+class MacroPlaybook:
+    """Ordered collection of macro steps promoted into a playbook."""
+
+    identifier: str
+    title: str
+    description: str
+    steps: List[MacroStep] = field(default_factory=list)
+
+    def to_records(self) -> List[Dict[str, Any]]:
+        """Serialise the playbook into ordered JSONL records."""
+
+        return [step.to_record(self.identifier, self.title, self.description) for step in self.steps]
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Produce an event payload describing this playbook."""
+
+        return {
+            "id": self.identifier,
+            "title": self.title,
+            "description": self.description,
+            "steps": [step.to_payload() for step in sorted(self.steps, key=lambda s: s.order)],
+        }
+
+
+@dataclass(slots=True)
 class DiffSnapshot:
     """Snapshot of diff statistics emitted during a task run."""
 
@@ -2656,6 +2769,156 @@ def _write_jsonl_atomic(path: Path, records: Iterable[Dict[str, Any]]) -> None:
         for record in records:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     os.replace(tmp_path, path)
+
+
+def load_macro_playbooks(path: Path = MACRO_PLAYBOOK_FILE) -> Dict[str, MacroPlaybook]:
+    """Load persisted macro playbooks, preserving declared step ordering."""
+
+    raw_records = _read_jsonl(path)
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for record in raw_records:
+        playbook_id = str(record.get("id") or record.get("playbook_id") or "").strip()
+        if not playbook_id:
+            continue
+
+        bucket = grouped.setdefault(
+            playbook_id,
+            {
+                "title": str(record.get("title") or playbook_id),
+                "description": str(record.get("description") or ""),
+                "steps": [],
+            },
+        )
+
+        # Allow later records to update metadata while ignoring empty strings.
+        if record.get("title"):
+            bucket["title"] = str(record["title"])
+        if record.get("description"):
+            bucket["description"] = str(record["description"])
+
+        action = str(record.get("action") or "").strip()
+        if not action:
+            continue
+
+        arguments_payload = record.get("arguments")
+        if not isinstance(arguments_payload, Mapping):
+            arguments_payload = {}
+
+        order_value = record.get("order")
+        try:
+            order_index = int(order_value)
+        except Exception:
+            order_index = len(bucket["steps"])
+
+        bucket["steps"].append(
+            MacroStep(
+                order=order_index,
+                action=action,
+                arguments=dict(arguments_payload),
+            )
+        )
+
+    playbooks: Dict[str, MacroPlaybook] = {}
+    for playbook_id, info in grouped.items():
+        ordered_steps = sorted(info["steps"], key=lambda step: step.order)
+        normalised: List[MacroStep] = []
+        for idx, step in enumerate(ordered_steps):
+            # Re-number the steps sequentially to avoid gaps from manual edits.
+            normalised.append(
+                MacroStep(
+                    order=idx,
+                    action=step.action,
+                    arguments=dict(step.arguments),
+                )
+            )
+        playbooks[playbook_id] = MacroPlaybook(
+            identifier=playbook_id,
+            title=str(info.get("title") or playbook_id),
+            description=str(info.get("description") or ""),
+            steps=normalised,
+        )
+
+    return playbooks
+
+
+def save_macro_playbooks(
+    playbooks: Mapping[str, MacroPlaybook],
+    path: Path = MACRO_PLAYBOOK_FILE,
+) -> None:
+    """Persist *playbooks* as ordered JSONL records."""
+
+    records: List[Dict[str, Any]] = []
+    for playbook_id, playbook in sorted(playbooks.items()):
+        for idx, step in enumerate(sorted(playbook.steps, key=lambda item: item.order)):
+            normalised = MacroStep(
+                order=idx,
+                action=step.action,
+                arguments=dict(step.arguments),
+            )
+            records.append(normalised.to_record(playbook_id, playbook.title, playbook.description))
+
+    # Sorting by playbook identifier then order ensures deterministic file layouts.
+    records.sort(key=lambda record: (record["id"], record.get("order", 0)))
+    _write_jsonl_atomic(path, records)
+
+
+def persist_macro_playbook(
+    playbook: MacroPlaybook,
+    *,
+    path: Path = MACRO_PLAYBOOK_FILE,
+) -> MacroPlaybook:
+    """Store *playbook* alongside existing entries and return the final model."""
+
+    current = load_macro_playbooks(path)
+    current[playbook.identifier] = playbook
+    save_macro_playbooks(current, path)
+    return current[playbook.identifier]
+
+
+def promote_macro_definition(
+    identifier: str,
+    title: str,
+    description: str,
+    steps: Sequence[Mapping[str, Any]],
+    *,
+    path: Path = MACRO_PLAYBOOK_FILE,
+) -> MacroPlaybook:
+    """Convert an ad-hoc macro definition into a persisted playbook."""
+
+    cleaned_identifier = str(identifier or "").strip() or uuid.uuid4().hex
+    cleaned_title = str(title or cleaned_identifier).strip()
+    cleaned_description = str(description or "").strip()
+
+    prepared_steps: List[MacroStep] = []
+    for idx, step in enumerate(steps):
+        action = str(step.get("action") or step.get("command") or "").strip()
+        if not action:
+            continue
+        arguments_payload = step.get("arguments") or step.get("params") or {}
+        if not isinstance(arguments_payload, Mapping):
+            arguments_payload = {"value": arguments_payload}
+        prepared_steps.append(
+            MacroStep(
+                order=idx,
+                action=action,
+                arguments=dict(arguments_payload),
+            )
+        )
+
+    playbook = MacroPlaybook(
+        identifier=cleaned_identifier,
+        title=cleaned_title,
+        description=cleaned_description,
+        steps=prepared_steps,
+    )
+    return persist_macro_playbook(playbook, path=path)
+
+
+def _utc_iso() -> str:
+    """Return the current UTC timestamp formatted for logs and telemetry."""
+
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _dataset_root(candidate: Optional[Path]) -> Path:
@@ -3094,6 +3357,84 @@ def publish(topic: str, payload: dict) -> None:
     """Broadcast ``payload`` to subscribers registered for ``topic``."""
 
     EVENT_DISPATCHER.publish(topic, payload)
+
+
+@dataclass(slots=True)
+class PaletteEntry:
+    """Descriptor for palette-triggered commands and macros."""
+
+    identifier: str
+    title: str
+    subtitle: str
+    topic: str
+    category: str = "command"
+    policy_operation: Optional[str] = None
+    payload: Optional[Mapping[str, Any]] = None
+    payload_factory: Optional[Callable[[], Mapping[str, Any]]] = None
+
+    def materialise_payload(self) -> Dict[str, Any]:
+        """Return a dictionary payload, calling the factory when provided."""
+
+        if self.payload_factory is not None:
+            result = self.payload_factory()
+            return dict(result) if isinstance(result, Mapping) else {}
+        if self.payload is not None:
+            return dict(self.payload)
+        return {}
+
+
+_PALETTE_LOCK = RLock()
+_PALETTE_REGISTRY: Dict[str, PaletteEntry] = {}
+
+
+def register_palette_entry(entry: PaletteEntry) -> None:
+    """Register ``entry`` for inclusion within the command palette."""
+
+    key = entry.identifier.strip().lower()
+    if not key:
+        raise ValueError("Palette entry identifier must be a non-empty string")
+
+    with _PALETTE_LOCK:
+        _PALETTE_REGISTRY[key] = entry
+
+
+def iter_registered_palette_entries() -> List[PaletteEntry]:
+    """Return registered palette entries sorted by title."""
+
+    with _PALETTE_LOCK:
+        entries = list(_PALETTE_REGISTRY.values())
+    return sorted(entries, key=lambda item: (item.category, item.title.lower()))
+
+
+def compose_palette_entries() -> List[PaletteEntry]:
+    """Combine registered commands with persisted macro playbooks."""
+
+    entries = iter_registered_palette_entries()
+    try:
+        playbooks = load_macro_playbooks()
+    except Exception:
+        logging.getLogger(f"{VD_LOGGER_NAME}.palette").exception(
+            "Failed to load macro playbooks for command palette"
+        )
+        playbooks = {}
+
+    for playbook in playbooks.values():
+        entries.append(
+            PaletteEntry(
+                identifier=f"playbook:{playbook.identifier}",
+                title=f"Run Playbook · {playbook.title}",
+                subtitle=playbook.description or "Persisted macro playbook",
+                topic="system.macro",
+                category="macro",
+                policy_operation="macro",
+                payload={
+                    "playbook": playbook.to_payload(),
+                    "invoked_at": _utc_iso(),
+                },
+            )
+        )
+
+    return sorted(entries, key=lambda item: item.title.lower())
 
 
 class ImmuneResponse(Enum):
@@ -4674,6 +5015,14 @@ class VirtualDesktopDock(QDockWidget):
         self._data_view: Optional[QTextBrowser] = None
         self._code_view: Optional[QTextBrowser] = None
         self._graph_view: Optional[QPlainTextEdit] = None
+        self._playbooks: Dict[str, MacroPlaybook] = {}
+        self._playbook_list: Optional[QListWidget] = None
+        self._playbook_steps_view: Optional[QPlainTextEdit] = None
+        self._macro_title_input: Optional[QLineEdit] = None
+        self._macro_desc_input: Optional[QLineEdit] = None
+        self._macro_steps_input: Optional[QPlainTextEdit] = None
+        self._macro_notes: List[str] = []
+        self._macro_notes_list: Optional[QListWidget] = None
         self._ocr_path: Optional[QLineEdit] = None
         self._ocr_output: Optional[QTextBrowser] = None
         self._ocr_history_list: Optional[QListWidget] = None
@@ -4841,7 +5190,256 @@ class VirtualDesktopDock(QDockWidget):
         graph_layout.addWidget(self._graph_view, 1)
         self._devspace_tabs.addTab(graph_widget, "Graph")
 
+        playbook_widget = QWidget(self._devspace_tabs)
+        playbook_layout = QVBoxLayout(playbook_widget)
+        playbook_layout.setContentsMargins(0, 0, 0, 0)
+        playbook_layout.setSpacing(6)
+
+        splitter = QSplitter(Qt.Horizontal, playbook_widget)
+
+        library_container = QWidget(splitter)
+        library_layout = QVBoxLayout(library_container)
+        library_layout.setContentsMargins(0, 0, 0, 0)
+        library_layout.setSpacing(4)
+
+        library_intro = QLabel(
+            "Persisted playbooks appear here. Select an entry to review its ordered steps.",
+            library_container,
+        )
+        library_intro.setWordWrap(True)
+        library_layout.addWidget(library_intro)
+
+        self._playbook_list = QListWidget(library_container)
+        self._playbook_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._playbook_list.itemSelectionChanged.connect(self._on_playbook_selected)
+        library_layout.addWidget(self._playbook_list, 1)
+
+        self._playbook_steps_view = QPlainTextEdit(library_container)
+        self._playbook_steps_view.setReadOnly(True)
+        self._playbook_steps_view.setPlaceholderText(
+            "Select a playbook to inspect its step ordering and arguments."
+        )
+        library_layout.addWidget(self._playbook_steps_view, 2)
+
+        splitter.addWidget(library_container)
+
+        form_container = QWidget(splitter)
+        form_layout = QVBoxLayout(form_container)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(6)
+
+        form_intro = QLabel(
+            "Promote ad-hoc macros into reusable playbooks."
+            " Steps accept optional JSON payloads after '::'.",
+            form_container,
+        )
+        form_intro.setWordWrap(True)
+        form_layout.addWidget(form_intro)
+
+        form = QFormLayout()
+        form.setSpacing(4)
+        self._macro_title_input = QLineEdit(form_container)
+        self._macro_title_input.setPlaceholderText("Restart bridge services")
+        form.addRow("Title", self._macro_title_input)
+        self._macro_desc_input = QLineEdit(form_container)
+        self._macro_desc_input.setPlaceholderText("Describe the macro's purpose")
+        form.addRow("Description", self._macro_desc_input)
+        self._macro_steps_input = QPlainTextEdit(form_container)
+        self._macro_steps_input.setPlaceholderText(
+            "Enter one step per line. Optional JSON arguments can follow '::'."
+            " Example: trigger_event::{\"topic\": \"system.command\"}"
+        )
+        form.addRow("Steps", self._macro_steps_input)
+        form_layout.addLayout(form)
+
+        promote_btn = QPushButton("Promote to Playbook", form_container)
+        promote_btn.clicked.connect(self._handle_promote_playbook)
+        form_layout.addWidget(promote_btn, 0, Qt.AlignRight)
+
+        notes_label = QLabel("Manual macro execution notes", form_container)
+        notes_label.setStyleSheet("color:#9db3d6;")
+        form_layout.addWidget(notes_label)
+
+        self._macro_notes_list = QListWidget(form_container)
+        self._macro_notes_list.setSelectionMode(QAbstractItemView.NoSelection)
+        form_layout.addWidget(self._macro_notes_list, 1)
+
+        splitter.addWidget(form_container)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+
+        playbook_layout.addWidget(splitter, 1)
+        self._devspace_tabs.addTab(playbook_widget, "Playbooks")
+
         self._update_devspace_views()
+        self._refresh_playbook_list()
+        self._refresh_macro_notes_view()
+
+    # ------------------------------------------------------------------
+    def _refresh_playbook_list(self) -> None:
+        if self._playbook_list is None:
+            return
+        try:
+            self._playbooks = load_macro_playbooks()
+        except Exception as exc:
+            self._logger.exception("Failed to load macro playbooks", exc_info=exc)
+            self._playbooks = {}
+            self._playbook_list.clear()
+            if self._playbook_steps_view:
+                self._playbook_steps_view.setPlainText("Failed to load playbooks; see logs.")
+            return
+
+        self._playbook_list.clear()
+        for playbook in sorted(
+            self._playbooks.values(), key=lambda item: (item.title or item.identifier).lower()
+        ):
+            item = QListWidgetItem(playbook.title or playbook.identifier, self._playbook_list)
+            item.setData(Qt.UserRole, playbook.identifier)
+            if playbook.description:
+                item.setToolTip(playbook.description)
+
+        if self._playbook_list.count():
+            self._playbook_list.setCurrentRow(0)
+        else:
+            if self._playbook_steps_view:
+                self._playbook_steps_view.setPlainText(
+                    "No playbooks saved yet. Promote a macro to capture one."
+                )
+
+    # ------------------------------------------------------------------
+    def _on_playbook_selected(self) -> None:
+        if not self._playbook_list or not self._playbook_steps_view:
+            return
+        item = self._playbook_list.currentItem()
+        if item is None:
+            self._playbook_steps_view.setPlainText(
+                "Select a playbook to inspect its step ordering and arguments."
+            )
+            return
+        identifier = str(item.data(Qt.UserRole) or "").strip()
+        playbook = self._playbooks.get(identifier)
+        if playbook is None:
+            self._playbook_steps_view.setPlainText("Playbook metadata unavailable.")
+            return
+
+        lines: List[str] = []
+        for step in playbook.steps:
+            args_text = ""
+            if step.arguments:
+                try:
+                    args_text = json.dumps(step.arguments, ensure_ascii=False)
+                except Exception:
+                    args_text = str(step.arguments)
+            lines.append(f"{step.order + 1}. {step.action}")
+            if args_text:
+                lines.append(f"    args: {args_text}")
+        if not lines:
+            lines.append("Playbook contains no steps yet.")
+        self._playbook_steps_view.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    def _handle_promote_playbook(self) -> None:
+        if not self._macro_title_input or not self._macro_steps_input:
+            return
+        title = self._macro_title_input.text().strip()
+        if not title:
+            QMessageBox.warning(self, "Promote to Playbook", "Provide a title for the playbook.")
+            return
+        description = (
+            self._macro_desc_input.text().strip() if self._macro_desc_input else ""
+        )
+        raw_steps = self._macro_steps_input.toPlainText().splitlines()
+        prepared: List[Mapping[str, Any]] = []
+        for idx, line in enumerate(raw_steps, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            action = text
+            arguments: Mapping[str, Any] = {}
+            if "::" in text:
+                action_part, args_part = text.split("::", 1)
+                action = action_part.strip()
+                args_part = args_part.strip()
+                if args_part:
+                    try:
+                        parsed = json.loads(args_part)
+                    except json.JSONDecodeError as exc:
+                        QMessageBox.warning(
+                            self,
+                            "Invalid Step",
+                            f"Step {idx} arguments must be valid JSON: {exc}",
+                        )
+                        return
+                    if not isinstance(parsed, Mapping):
+                        QMessageBox.warning(
+                            self,
+                            "Invalid Step",
+                            f"Step {idx} arguments must be a JSON object, not {type(parsed).__name__}.",
+                        )
+                        return
+                    arguments = dict(parsed)
+            if not action:
+                QMessageBox.warning(
+                    self, "Invalid Step", f"Step {idx} is missing an action name."
+                )
+                return
+            prepared.append({"action": action, "arguments": arguments})
+
+        if not prepared:
+            QMessageBox.warning(
+                self, "Promote to Playbook", "Define at least one non-empty step."
+            )
+            return
+
+        identifier = slug(title) or uuid.uuid4().hex
+        try:
+            playbook = promote_macro_definition(
+                identifier,
+                title,
+                description,
+                prepared,
+            )
+        except Exception as exc:
+            self._logger.exception("Failed to promote macro to playbook", exc_info=exc)
+            QMessageBox.critical(
+                self,
+                "Promote to Playbook",
+                f"Failed to persist playbook: {exc}",
+            )
+            return
+
+        self._logger.info(
+            "Macro promoted to playbook",
+            extra={"id": playbook.identifier, "steps": len(playbook.steps)},
+        )
+        self._macro_title_input.clear()
+        if self._macro_desc_input:
+            self._macro_desc_input.clear()
+        self._macro_steps_input.clear()
+        self._refresh_playbook_list()
+        QMessageBox.information(
+            self,
+            "Promote to Playbook",
+            f"Saved playbook '{playbook.title}' with {len(playbook.steps)} steps.",
+        )
+
+    # ------------------------------------------------------------------
+    def _refresh_macro_notes_view(self) -> None:
+        if self._macro_notes_list is None:
+            return
+        self._macro_notes_list.clear()
+        for note in self._macro_notes:
+            self._macro_notes_list.addItem(note)
+        if self._macro_notes_list.count():
+            self._macro_notes_list.scrollToBottom()
+
+    # ------------------------------------------------------------------
+    def record_manual_macro_note(self, note: str) -> None:
+        self._macro_notes.append(note)
+        self._macro_notes = self._macro_notes[-100:]
+        if self._macro_notes_list is not None:
+            self._macro_notes_list.addItem(note)
+            self._macro_notes_list.scrollToBottom()
 
     # ------------------------------------------------------------------
     def _ensure_ocr_panel(self) -> None:
@@ -14727,6 +15325,138 @@ def _default_settings() -> Dict[str, Any]:
     }
 
 
+class CommandPaletteDialog(QDialog):
+    """Modal overlay providing a searchable command and macro list."""
+
+    entry_triggered = Signal(PaletteEntry)
+
+    def __init__(self, entries: Sequence[PaletteEntry], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Command Palette")
+        self.setModal(True)
+        self.setObjectName("CommandPaletteDialog")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.resize(520, 480)
+
+        self._entries: List[PaletteEntry] = list(entries)
+        self._filtered: List[PaletteEntry] = []
+        self._entry_map: Dict[str, PaletteEntry] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Search commands and playbooks. Press Enter to execute the highlighted action.",
+            self,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self._search = QLineEdit(self)
+        self._search.setPlaceholderText("Type to filter…")
+        self._search.textChanged.connect(self._apply_filter)
+        layout.addWidget(self._search)
+
+        self._list = QListWidget(self)
+        self._list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._list.itemActivated.connect(self._activate_item)
+        self._list.itemSelectionChanged.connect(self._refresh_detail)
+        layout.addWidget(self._list, 1)
+
+        self._detail = QLabel("Select an entry to inspect details.", self)
+        self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color: #9db3d6;")
+        layout.addWidget(self._detail)
+
+        self._apply_filter("")
+
+    # ------------------------------------------------------------------
+    def showEvent(self, event) -> None:  # pragma: no cover - Qt manages rendering
+        super().showEvent(event)
+        self._search.setFocus(Qt.ShortcutFocusReason)
+
+    # ------------------------------------------------------------------
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # pragma: no cover - interactive
+        if event.key() == Qt.Key_Escape:
+            self.reject()
+            return
+        if event.key() in (Qt.Key_Down, Qt.Key_Up):
+            self._cycle_selection(event.key() == Qt.Key_Down)
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
+    def _cycle_selection(self, forward: bool) -> None:
+        count = self._list.count()
+        if count == 0:
+            return
+        current = self._list.currentRow()
+        current = (current + (1 if forward else -1)) % count
+        self._list.setCurrentRow(current)
+
+    # ------------------------------------------------------------------
+    def _apply_filter(self, text: str) -> None:
+        terms = [term for term in text.lower().split() if term]
+
+        def haystack(entry: PaletteEntry) -> str:
+            return " ".join(
+                [entry.title.lower(), entry.subtitle.lower(), entry.category.lower()]
+            )
+
+        if not terms:
+            self._filtered = list(self._entries)
+        else:
+            self._filtered = [
+                entry for entry in self._entries if all(term in haystack(entry) for term in terms)
+            ]
+
+        self._list.clear()
+        self._entry_map.clear()
+
+        for entry in self._filtered:
+            item = QListWidgetItem(entry.title, self._list)
+            item.setData(Qt.UserRole, entry.identifier)
+            item.setToolTip(entry.subtitle or entry.title)
+            category = entry.category.capitalize()
+            item.setText(f"{entry.title}    · {category}")
+            self._entry_map[entry.identifier.lower()] = entry
+
+        if self._list.count():
+            self._list.setCurrentRow(0)
+            self._refresh_detail()
+        else:
+            self._detail.setText("No entries match the current query.")
+
+    # ------------------------------------------------------------------
+    def _activate_item(self, item: QListWidgetItem) -> None:
+        identifier = str(item.data(Qt.UserRole) or "").strip().lower()
+        entry = self._entry_map.get(identifier)
+        if entry is None:
+            return
+        self.entry_triggered.emit(entry)
+        self.accept()
+
+    # ------------------------------------------------------------------
+    def _refresh_detail(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            self._detail.setText("Select an entry to inspect details.")
+            return
+        identifier = str(item.data(Qt.UserRole) or "").strip().lower()
+        entry = self._entry_map.get(identifier)
+        if entry is None:
+            self._detail.setText("Select an entry to inspect details.")
+            return
+
+        lines = [entry.subtitle or "No description provided."]
+        lines.append(f"Topic: {entry.topic}")
+        lines.append(f"Category: {entry.category}")
+        if entry.policy_operation:
+            lines.append(f"Policy: {entry.policy_operation}")
+        self._detail.setText("\n".join(lines))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, theme: Theme, parent: Optional[QWidget] = None, *, embedded: bool = False):
         super().__init__(parent)
@@ -14833,6 +15563,16 @@ class MainWindow(QMainWindow):
         self.status_indicator: QStatusBar = self.statusBar()
         self._refresh_status_bar()
 
+        self._palette_logger = logging.getLogger(f"{VD_LOGGER_NAME}.palette.ui")
+        self._palette_dialog: Optional[CommandPaletteDialog] = None
+        self._palette_subscriptions: List[Subscription] = []
+        self._manual_macro_notes: List[str] = []
+
+        self._register_palette_commands()
+
+        self._palette_subscriptions.append(subscribe("system.command", self._on_command_event))
+        self._palette_subscriptions.append(subscribe("system.macro", self._on_macro_event))
+
         self._init_menu()
         self._init_shortcuts()
         self._check_ollama()
@@ -14886,6 +15626,12 @@ class MainWindow(QMainWindow):
                 pass
 
     def _init_shortcuts(self):
+        palette_action = QAction(self)
+        palette_action.setShortcut(QKeySequence("Ctrl+K"))
+        palette_action.setText("Command Palette")
+        palette_action.triggered.connect(self._open_command_palette)
+        self.addAction(palette_action)
+
         focus_input = QAction(self); focus_input.setShortcut(QKeySequence("Ctrl+`"))
         focus_input.triggered.connect(lambda: self.chat.input.setFocus(Qt.ShortcutFocusReason)); self.addAction(focus_input)
 
@@ -14894,6 +15640,193 @@ class MainWindow(QMainWindow):
 
         send_local = QAction(self); send_local.setShortcut(QKeySequence("Alt+Return"))
         send_local.triggered.connect(self.chat._on_send_local); self.addAction(send_local)
+
+    # ------------------------------------------------------------------
+    def _register_palette_commands(self) -> None:
+        commands = [
+            PaletteEntry(
+                identifier="focus_chat_input",
+                title="Focus Chat Input",
+                subtitle="Move keyboard focus to the chat composer input field.",
+                topic="system.command",
+                category="command",
+                policy_operation="macro",
+                payload={"command": "focus_chat_input"},
+            ),
+            PaletteEntry(
+                identifier="toggle_dataset_dock",
+                title="Toggle Dataset Manager",
+                subtitle="Show or hide the dataset manager dock.",
+                topic="system.command",
+                category="command",
+                policy_operation="macro",
+                payload={"command": "toggle_dataset_dock"},
+            ),
+            PaletteEntry(
+                identifier="toggle_virtual_desktop",
+                title="Toggle Virtual Desktop",
+                subtitle="Show or hide the Virtual Desktop dock.",
+                topic="system.command",
+                category="command",
+                policy_operation="macro",
+                payload={"command": "toggle_virtual_desktop"},
+            ),
+            PaletteEntry(
+                identifier="toggle_log_observatory",
+                title="Toggle Log Observatory",
+                subtitle="Show or hide the Log Observatory dock for stream monitoring.",
+                topic="system.command",
+                category="command",
+                policy_operation="macro",
+                payload={"command": "toggle_log_observatory"},
+            ),
+            PaletteEntry(
+                identifier="toggle_brain_map",
+                title="Toggle Brain Map",
+                subtitle="Show or hide the brain map dock and focus Dev Space nodes.",
+                topic="system.command",
+                category="command",
+                policy_operation="macro",
+                payload={"command": "toggle_brain_map"},
+            ),
+            PaletteEntry(
+                identifier="show_error_console",
+                title="Reveal Error Console",
+                subtitle="Raise the error console dock for immediate diagnostics.",
+                topic="system.command",
+                category="command",
+                policy_operation="macro",
+                payload={"command": "show_error_console"},
+            ),
+        ]
+
+        for entry in commands:
+            register_palette_entry(entry)
+
+    # ------------------------------------------------------------------
+    def _open_command_palette(self) -> None:
+        try:
+            entries = compose_palette_entries()
+        except Exception:
+            self._palette_logger.exception("Failed to compose command palette entries")
+            QMessageBox.critical(
+                self,
+                "Command Palette",
+                "Unable to load the command palette entries. Review logs for details.",
+            )
+            return
+
+        if not entries:
+            QMessageBox.information(
+                self,
+                "Command Palette",
+                "No commands or playbooks are registered yet.",
+            )
+            return
+
+        dialog = CommandPaletteDialog(entries, self)
+        dialog.entry_triggered.connect(self._execute_palette_entry)
+        self._palette_dialog = dialog
+        dialog.exec()
+        self._palette_dialog = None
+
+    # ------------------------------------------------------------------
+    def _execute_palette_entry(self, entry: PaletteEntry) -> None:
+        try:
+            if entry.policy_operation:
+                safety_manager.ensure_action_allowed(entry.policy_operation, entry.identifier)
+        except SafetyViolation as exc:
+            self._palette_logger.warning("Palette entry blocked: %s", exc)
+            QMessageBox.warning(self, "Command Blocked", str(exc))
+            return
+
+        payload = entry.materialise_payload()
+        try:
+            publish(entry.topic, payload)
+            self._palette_logger.info(
+                "Palette dispatched entry", extra={"entry": entry.identifier, "topic": entry.topic}
+            )
+        except Exception:
+            self._palette_logger.exception(
+                "Failed to publish palette entry", extra={"entry": entry.identifier}
+            )
+            QMessageBox.critical(
+                self,
+                "Palette Dispatch Failed",
+                "The selected action could not be published to the event bus.",
+            )
+
+    # ------------------------------------------------------------------
+    def _on_command_event(self, payload: Mapping[str, Any]) -> None:
+        command = str(payload.get("command") or "").strip().lower()
+        if not command:
+            return
+        self._palette_logger.info("Command event received", extra={"command": command})
+
+        if command == "focus_chat_input":
+            self.chat.input.setFocus(Qt.ShortcutFocusReason)
+            self.status_indicator.showMessage("Focused chat input", 6000)
+        elif command == "toggle_dataset_dock":
+            self._toggle_dock(getattr(self, "dataset_dock", None))
+        elif command == "toggle_virtual_desktop":
+            self._toggle_dock(getattr(self, "virtual_desktop_dock", None))
+        elif command == "toggle_log_observatory":
+            self._toggle_dock(getattr(self, "log_dock", None))
+        elif command == "toggle_brain_map":
+            self._toggle_dock(getattr(self, "brain_map_dock", None))
+        elif command == "show_error_console":
+            dock = getattr(self, "error_console", None)
+            if dock is not None:
+                dock.show()
+                try:
+                    dock.raise_()
+                except Exception:
+                    pass
+                self.status_indicator.showMessage("Error console raised", 6000)
+        else:
+            self._palette_logger.debug("Unhandled palette command", extra={"command": command})
+
+    # ------------------------------------------------------------------
+    def _toggle_dock(self, dock: Optional[QDockWidget]) -> None:
+        if dock is None:
+            return
+        if dock.isVisible():
+            dock.hide()
+            self.status_indicator.showMessage(f"Hid {dock.windowTitle()} dock", 6000)
+        else:
+            dock.show()
+            try:
+                dock.raise_()
+            except Exception:
+                pass
+            self.status_indicator.showMessage(f"Shown {dock.windowTitle()} dock", 6000)
+
+    # ------------------------------------------------------------------
+    def _on_macro_event(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping):
+            return
+
+        playbook = payload.get("playbook") if isinstance(payload.get("playbook"), Mapping) else None
+        title = ""
+        if isinstance(playbook, Mapping):
+            title = str(playbook.get("title") or playbook.get("id") or "macro")
+        else:
+            title = str(payload.get("title") or payload.get("id") or "macro")
+
+        summary = f"{_utc_iso()} • Macro '{title}' queued for manual execution review."
+        self._manual_macro_notes.append(summary)
+        self._manual_macro_notes = self._manual_macro_notes[-50:]
+        self._palette_logger.info("Macro execution scheduled", extra={"title": title})
+        self.status_indicator.showMessage(f"Macro '{title}' queued for manual review", 8000)
+
+        target = getattr(self, "virtual_desktop_dock", None)
+        if target and hasattr(target, "record_manual_macro_note"):
+            try:
+                target.record_manual_macro_note(summary)
+            except Exception:
+                self._palette_logger.debug(
+                    "Failed to propagate macro note to Dev Space", exc_info=True
+                )
 
     def _check_ollama(self):
         ok, msg = self.ollama.health()
@@ -15104,6 +16037,13 @@ class MainWindow(QMainWindow):
             self._refresh_status_bar()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        for subscription in getattr(self, "_palette_subscriptions", []):
+            try:
+                subscription.unsubscribe()
+            except Exception:
+                continue
+        self._palette_subscriptions = []
+
         if hasattr(self, "chat") and hasattr(self.chat, "detach_safety_notifier"):
             self.chat.detach_safety_notifier()
         if self._orig_stderr is not None:
