@@ -1,4 +1,22 @@
 # Changelog
+## [0.1.26] - 2025-10-12
+### Added
+- Introduced reusable helpers to load and persist `policies.json`, regenerating
+  defaults when missing and writing sorted, indented JSON for review-friendly
+  diffs.
+
+### Changed
+- Updated coder/test/macro policy defaults with explicit duration caps,
+  parallel slot limits, and a shared network command blocklist consumed by the
+  safety manager and sentinel monitors.
+- Enhanced `SafetyManager` and `run_checked` so operation policies now acquire
+  parallel slots, clamp timeouts, strip network proxies, and emit sentinel
+  events when bans or timeouts trigger.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+- Logged planned policy override tests in `logs/session_2025-10-02.md`.
+
 ## [0.1.25] - 2025-10-11
 ### Added
 - Automated startup processing of `memory/logic_inbox.jsonl`, publishing events or scheduling task buckets for actionable inbox entries while preserving deferred instructions on disk.

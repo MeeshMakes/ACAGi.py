@@ -35,7 +35,27 @@
         "isolated",
         "restricted"
       ],
-      "notes": "Coder operations must run in restricted sandboxes and request approval before mutating repositories."
+      "notes": "Coder operations must run in restricted sandboxes and request approval before mutating repositories.",
+      "limits": {
+        "max_duration_seconds": 900,
+        "max_parallel_tasks": 2,
+        "network": "deny",
+        "network_blocklist": [
+          "aria2c",
+          "curl",
+          "ftp",
+          "netcat",
+          "nc",
+          "ping",
+          "rsync",
+          "scp",
+          "sftp",
+          "ssh",
+          "telnet",
+          "traceroute",
+          "wget"
+        ]
+      }
     },
     "test": {
       "allow": [
@@ -64,12 +84,32 @@
         "restricted",
         "trusted"
       ],
-      "notes": "Test operations focus on non-destructive tooling; destructive commands remain blocked."
+      "notes": "Test operations focus on non-destructive tooling; destructive commands remain blocked.",
+      "limits": {
+        "max_duration_seconds": 1800,
+        "max_parallel_tasks": 3,
+        "network": "deny",
+        "network_blocklist": [
+          "aria2c",
+          "curl",
+          "ftp",
+          "netcat",
+          "nc",
+          "ping",
+          "rsync",
+          "scp",
+          "sftp",
+          "ssh",
+          "telnet",
+          "traceroute",
+          "wget"
+        ]
+      }
     }
   },
   "metadata": {
     "generated": "repository default",
-    "updated": "2025-10-04",
+    "updated": "2025-10-12",
     "description": "Policies used by the safety manager to gate coder and tester operations."
   }
 }

@@ -62,6 +62,7 @@ from typing import (
     Deque,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     MutableMapping,
@@ -70,6 +71,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Union,
 )
 
 # Optional dependencies are resolved via runtime checks instead of guarded imports
@@ -301,6 +303,35 @@ class SafetyViolation(RuntimeError):
 class SafetyManager:
     """Coordinates safety guardrails for file writes and shell commands."""
 
+    @dataclass
+    class _OperationThrottle:
+        """Track parallel execution slots for a single operation."""
+
+        limit: int
+        in_flight: int = 0
+
+        def acquire(self) -> bool:
+            if self.limit <= 0:
+                return True
+            if self.in_flight >= self.limit:
+                return False
+            self.in_flight += 1
+            return True
+
+        def release(self) -> None:
+            if self.in_flight > 0:
+                self.in_flight -= 1
+
+        def update_limit(self, limit: int) -> None:
+            self.limit = max(0, int(limit))
+            if self.limit == 0:
+                self.in_flight = 0
+            else:
+                self.in_flight = min(self.in_flight, self.limit)
+
+        def snapshot(self) -> Dict[str, int]:
+            return {"limit": self.limit, "in_flight": self.in_flight}
+
     def __init__(self) -> None:
         self._lock = RLock()
         self._protected_files: set[Path] = set()
@@ -320,6 +351,10 @@ class SafetyManager:
         self._operation_policies: Dict[str, "OperationPolicy"] = {}
         self._runtime_settings: Optional["RuntimeSettings"] = None
         self._remote_allowed = False
+        self._operation_throttles: Dict[str, SafetyManager._OperationThrottle] = {}
+        self._policy_logger = logging.getLogger(
+            f"{VD_LOGGER_NAME}.safety.policy"
+        )
 
     def install_file_guard(self) -> None:
         """Monkey patch :func:`open` so destructive writes are intercepted."""
@@ -386,14 +421,28 @@ class SafetyManager:
         self, policies: Mapping[str, "OperationPolicy"]
     ) -> None:
         with self._lock:
-            self._operation_policies = {
-                key.lower(): value for key, value in policies.items()
-            }
+            normalized = {key.lower(): value for key, value in policies.items()}
+            self._operation_policies = normalized
+            self._configure_operation_throttles_locked()
 
     def set_runtime_settings(self, settings: "RuntimeSettings") -> None:
         with self._lock:
             self._runtime_settings = settings
             self._remote_allowed = not settings.offline
+
+    def _configure_operation_throttles_locked(self) -> None:
+        throttles: Dict[str, SafetyManager._OperationThrottle] = {}
+        for name, policy in self._operation_policies.items():
+            limit = policy.max_parallel_tasks
+            if limit is None or limit <= 0:
+                continue
+            existing = self._operation_throttles.get(name)
+            if existing is None:
+                throttles[name] = SafetyManager._OperationThrottle(limit=int(limit))
+            else:
+                existing.update_limit(int(limit))
+                throttles[name] = existing
+        self._operation_throttles = throttles
 
     def remote_allowed(self) -> bool:
         """Return whether remote actions are permitted by current policy."""
@@ -414,6 +463,57 @@ class SafetyManager:
 
         state = "enabled" if normalized else "disabled"
         self._dispatch(f"[POLICY] Remote access {state}")
+
+    @contextlib.contextmanager
+    def operation_guard(
+        self, operation: Optional[str]
+    ) -> Iterator[Optional["OperationPolicy"]]:
+        """Acquire execution slots for ``operation`` enforcing parallel limits."""
+
+        policy: Optional[OperationPolicy] = None
+        throttle: Optional[SafetyManager._OperationThrottle] = None
+        acquired = False
+        normalized = (operation or "").strip().lower()
+        if normalized:
+            with self._lock:
+                policy = self._operation_policies.get(normalized)
+                throttle = self._operation_throttles.get(normalized)
+                if throttle is not None:
+                    acquired = throttle.acquire()
+        if throttle is not None and not acquired:
+            snapshot = throttle.snapshot()
+            limit = snapshot.get("limit", 0)
+            in_flight = snapshot.get("in_flight", 0)
+            message = (
+                f"[POLICY] {normalized or 'command'} parallel limit reached "
+                f"(limit={limit}, active={in_flight})"
+            )
+            self._dispatch(message)
+            summary = f"{(operation or 'command').title()} parallel limit reached"
+            recovery = (
+                "Wait for existing work to complete or raise the parallel limit in "
+                "policies.json before retrying."
+            )
+            self._emit_policy_event(
+                "operation.parallel_limit",
+                severity="warning",
+                summary=summary,
+                detail=message,
+                recovery=recovery,
+                metadata={
+                    "operation": normalized or "command",
+                    "limit": limit,
+                    "in_flight": in_flight,
+                },
+            )
+            raise SafetyViolation(message)
+
+        try:
+            yield policy
+        finally:
+            if throttle is not None and acquired:
+                with self._lock:
+                    throttle.release()
 
     def ensure_command_allowed(
         self, cmd: Sequence[str], *, operation: Optional[str] = None
@@ -480,6 +580,38 @@ class SafetyManager:
 
         if command_name in policy.approval_commands:
             reasons.append("command requires manual approval")
+
+        if policy.network_mode == "deny":
+            blocklist = (
+                policy.network_blocklist
+                if policy.network_blocklist
+                else frozenset(DEFAULT_POLICY_NETWORK_BLOCKLIST)
+            )
+            network_violation = command_name in blocklist or self._contains_network_arguments(
+                canonical
+            )
+            if network_violation:
+                message = (
+                    f"[POLICY] {operation} network banned: {shlex.join(canonical)}"
+                )
+                self._dispatch(message)
+                recovery = (
+                    "Run the command without external network access or update the "
+                    "network setting in policies.json if connectivity is required."
+                )
+                self._emit_policy_event(
+                    "operation.network_blocked",
+                    severity="warning",
+                    summary=f"{(operation or 'command').title()} network ban enforced",
+                    detail=message,
+                    recovery=recovery,
+                    metadata={
+                        "operation": (operation or "command"),
+                        "command": shlex.join(canonical),
+                        "reason": "blocklist" if command_name in blocklist else "url",
+                    },
+                )
+                raise SafetyViolation(message)
 
         if policy.sandbox_modes:
             current_mode = (runtime.sandbox if runtime else "trusted").lower()
@@ -580,6 +712,20 @@ class SafetyManager:
     def _has_flag(tokens: Sequence[str], flag: str) -> bool:
         return any(token.startswith("-") and flag in token for token in tokens)
 
+    @staticmethod
+    def _contains_network_arguments(canonical: Sequence[str]) -> bool:
+        """Return True when command arguments reference external network endpoints."""
+
+        for token in canonical[1:]:
+            lowered = str(token).strip().lower()
+            if any(proto in lowered for proto in ("http://", "https://", "ftp://")):
+                return True
+            if lowered.startswith("ssh://") or lowered.startswith("git@"):
+                return True
+            if lowered.startswith("rsync://"):
+                return True
+        return False
+
     def _dispatch(self, message: str) -> None:
         with self._lock:
             callbacks = list(self._notifiers.values())
@@ -588,6 +734,76 @@ class SafetyManager:
                 cb(message)
             except Exception:  # pragma: no cover - defensive
                 continue
+
+    def record_timeout(
+        self,
+        operation: Optional[str],
+        canonical: Sequence[str],
+        limit_seconds: int,
+    ) -> None:
+        """Log and broadcast when a command exceeds the configured duration."""
+
+        joined = shlex.join([str(part) for part in canonical])
+        label = (operation or "command").strip() or "command"
+        detail = (
+            f"[POLICY] {label} command exceeded {limit_seconds}s limit: {joined}"
+        )
+        self._dispatch(detail)
+        recovery = (
+            "Review the command output for hangs or raise the max_duration_seconds "
+            "value in policies.json if additional time is warranted."
+        )
+        self._emit_policy_event(
+            "operation.timeout",
+            severity="error",
+            summary=f"{label.title()} command exceeded policy duration",
+            detail=detail,
+            recovery=recovery,
+            metadata={
+                "operation": label.lower(),
+                "limit_seconds": int(limit_seconds),
+                "command": joined,
+            },
+        )
+
+    def _emit_policy_event(
+        self,
+        kind: str,
+        *,
+        severity: str,
+        summary: str,
+        detail: str,
+        recovery: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Forward policy escalations to the sentinel event stream when available."""
+
+        log_method = (
+            self._policy_logger.error
+            if severity in {"error", "critical"}
+            else self._policy_logger.warning
+            if severity == "warning"
+            else self._policy_logger.info
+        )
+        log_method("%s — %s", kind, detail)
+
+        emitter = globals().get("emit_sentinel_event")
+        if not callable(emitter):
+            return
+        try:
+            emitter(
+                kind,
+                severity=severity,
+                summary=summary,
+                detail=detail,
+                recovery=recovery,
+                source="safety_manager",
+                metadata=dict(metadata or {}),
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            self._policy_logger.debug(
+                "Unable to emit sentinel event kind=%s", kind, exc_info=True
+            )
 
     def _enforce_protected(self, path: Path, mode: str) -> None:
         if not self._is_protected(path):
@@ -2260,6 +2476,22 @@ REMOTE_ACCESS: Optional["RemoteAccessController"] = None
 
 POLICIES_FILENAME = "policies.json"
 
+DEFAULT_POLICY_NETWORK_BLOCKLIST: Tuple[str, ...] = (
+    "curl",
+    "wget",
+    "aria2c",
+    "scp",
+    "sftp",
+    "ftp",
+    "rsync",
+    "ssh",
+    "telnet",
+    "nc",
+    "netcat",
+    "ping",
+    "traceroute",
+)
+
 DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
     "version": "0.1.0",
     "operations": {
@@ -2290,6 +2522,12 @@ DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
                 "Coder operations must run in restricted sandboxes and prompt before "
                 "mutating repositories."
             ),
+            "limits": {
+                "max_duration_seconds": 900,
+                "max_parallel_tasks": 2,
+                "network": "deny",
+                "network_blocklist": list(DEFAULT_POLICY_NETWORK_BLOCKLIST),
+            },
         },
         "test": {
             "allow": [
@@ -2311,6 +2549,12 @@ DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
             "approval": [],
             "sandbox_modes": ["isolated", "restricted", "trusted"],
             "notes": "Tests should stay non-destructive; blocked commands remain explicit.",
+            "limits": {
+                "max_duration_seconds": 1800,
+                "max_parallel_tasks": 3,
+                "network": "deny",
+                "network_blocklist": list(DEFAULT_POLICY_NETWORK_BLOCKLIST),
+            },
         },
         "macro": {
             "allow": [],
@@ -2318,6 +2562,12 @@ DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
             "approval": [],
             "sandbox_modes": ["isolated", "restricted", "trusted"],
             "notes": "Command palette macros publish through the event bus with sentinel oversight.",
+            "limits": {
+                "max_duration_seconds": 120,
+                "max_parallel_tasks": 1,
+                "network": "deny",
+                "network_blocklist": list(DEFAULT_POLICY_NETWORK_BLOCKLIST),
+            },
         },
     },
     "metadata": {"generated": "default"},
@@ -2326,7 +2576,7 @@ DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
 
 @dataclass(frozen=True, slots=True)
 class OperationPolicy:
-    """Allowlist, denylist, and sandbox requirements for an operation."""
+    """Allowlist, denylist, sandbox, and runtime controls for an operation."""
 
     name: str
     allow_commands: frozenset[str] = field(default_factory=frozenset)
@@ -2334,6 +2584,10 @@ class OperationPolicy:
     approval_commands: frozenset[str] = field(default_factory=frozenset)
     sandbox_modes: frozenset[str] = field(default_factory=frozenset)
     notes: str = ""
+    max_duration_seconds: Optional[int] = None
+    max_parallel_tasks: Optional[int] = None
+    network_mode: str = "allow"
+    network_blocklist: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_mapping(cls, name: str, payload: Mapping[str, Any]) -> "OperationPolicy":
@@ -2345,11 +2599,43 @@ class OperationPolicy:
             }
             return frozenset(cleaned)
 
+        def _coerce_positive_int(value: Any) -> Optional[int]:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                return None
+            return number if number > 0 else None
+
         allow = _normalize(payload.get("allow"))
         deny = _normalize(payload.get("deny"))
         approval = _normalize(payload.get("approval"))
         sandbox = _normalize(payload.get("sandbox_modes"))
         notes = str(payload.get("notes") or "").strip()
+
+        limits_payload = payload.get("limits") if isinstance(payload, Mapping) else None
+        max_duration = None
+        max_parallel = None
+        network_mode = "allow"
+        network_blocklist = frozenset(DEFAULT_POLICY_NETWORK_BLOCKLIST)
+        if isinstance(limits_payload, Mapping):
+            max_duration = _coerce_positive_int(
+                limits_payload.get("max_duration_seconds")
+            )
+            max_parallel = _coerce_positive_int(
+                limits_payload.get("max_parallel_tasks")
+            )
+            network_raw = str(limits_payload.get("network", "allow")).strip().lower()
+            if network_raw in {"deny", "blocked", "ban"}:
+                network_mode = "deny"
+            elif network_raw in {"allow", "permissive"}:
+                network_mode = "allow"
+            else:
+                network_mode = "allow"
+            blocklist_values = limits_payload.get("network_blocklist")
+            normalized_block = _normalize(blocklist_values)
+            if normalized_block:
+                network_blocklist = normalized_block
+
         return cls(
             name=name,
             allow_commands=allow,
@@ -2357,7 +2643,34 @@ class OperationPolicy:
             approval_commands=approval,
             sandbox_modes=sandbox,
             notes=notes,
+            max_duration_seconds=max_duration,
+            max_parallel_tasks=max_parallel,
+            network_mode=network_mode,
+            network_blocklist=network_blocklist,
         )
+
+    # ------------------------------------------------------------------
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialise the policy for persistence with stable ordering."""
+
+        payload: Dict[str, Any] = {
+            "allow": sorted(self.allow_commands),
+            "deny": sorted(self.deny_commands),
+            "approval": sorted(self.approval_commands),
+            "sandbox_modes": sorted(self.sandbox_modes),
+        }
+        if self.notes:
+            payload["notes"] = self.notes
+
+        limits: Dict[str, Any] = {}
+        if self.max_duration_seconds is not None:
+            limits["max_duration_seconds"] = int(self.max_duration_seconds)
+        if self.max_parallel_tasks is not None:
+            limits["max_parallel_tasks"] = int(self.max_parallel_tasks)
+        limits["network"] = self.network_mode
+        limits["network_blocklist"] = sorted(self.network_blocklist)
+        payload["limits"] = limits
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -2396,6 +2709,22 @@ class PolicyBundle:
 
     def get(self, operation: str) -> Optional[OperationPolicy]:
         return self.operations.get(operation.lower())
+
+    # ------------------------------------------------------------------
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialise the bundle back into a JSON-compatible payload."""
+
+        operations_payload: Dict[str, Any] = {}
+        for policy in self.operations.values():
+            operations_payload[policy.name] = policy.to_payload()
+
+        payload: Dict[str, Any] = {
+            "version": self.version,
+            "operations": operations_payload,
+        }
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
 
 
 class SettingsLoader:
@@ -2439,6 +2768,15 @@ class SettingsLoader:
 
     # ------------------------------------------------------------------
     def load_policies(self) -> PolicyBundle:
+        payload = self.read_policy_payload()
+        bundle = PolicyBundle.from_mapping(payload, source_path=self.policies_path)
+        self._policies = bundle
+        return bundle
+
+    # ------------------------------------------------------------------
+    def read_policy_payload(self) -> Mapping[str, Any]:
+        """Return the raw policy payload, generating defaults when missing."""
+
         template = self._load_policy_template()
         payload: Mapping[str, Any] = template
         if self.policies_path.exists():
@@ -2454,11 +2792,21 @@ class SettingsLoader:
                 payload = template
         else:
             self._persist_policies(template)
+            payload = template
+        return payload
 
-        bundle = PolicyBundle.from_mapping(payload, source_path=self.policies_path)
+    # ------------------------------------------------------------------
+    def write_policy_payload(self, payload: Mapping[str, Any]) -> PolicyBundle:
+        """Persist ``payload`` to ``policies.json`` with human-friendly formatting."""
+
+        try:
+            serialisable = json.loads(json.dumps(payload))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Policy payload must be JSON serialisable") from exc
+
+        self._persist_policies(serialisable)
+        bundle = PolicyBundle.from_mapping(serialisable, source_path=self.policies_path)
         self._policies = bundle
-        if not self.policies_path.exists():
-            self._persist_policies(template)
         return bundle
 
     # ------------------------------------------------------------------
@@ -2611,6 +2959,41 @@ POLICY_BUNDLE = SETTINGS_LOADER.load_policies()
 safety_manager.set_operation_policies(POLICY_BUNDLE.operations)
 _SENTINEL_LOGGER = logging.getLogger("sentinel")
 _SENTINEL_NOTIFIER_TOKEN: Optional[str] = None
+
+
+def read_policy_file(path: Optional[os.PathLike[str] | str] = None) -> PolicyBundle:
+    """Load policies from ``path`` (or default) ensuring defaults exist."""
+
+    if path is None:
+        bundle = SETTINGS_LOADER.load_policies()
+    else:
+        loader = SettingsLoader(policy_path=Path(path))
+        bundle = loader.load_policies()
+    safety_manager.set_operation_policies(bundle.operations)
+    return bundle
+
+
+def write_policy_file(
+    payload: Union[PolicyBundle, Mapping[str, Any]],
+    *,
+    path: Optional[os.PathLike[str] | str] = None,
+) -> PolicyBundle:
+    """Persist ``payload`` to ``policies.json`` with stable formatting."""
+
+    target_loader: SettingsLoader
+    if path is None:
+        target_loader = SETTINGS_LOADER
+    else:
+        target_loader = SettingsLoader(policy_path=Path(path))
+
+    bundle = (
+        payload
+        if isinstance(payload, PolicyBundle)
+        else PolicyBundle.from_mapping(payload, source_path=target_loader.policies_path)
+    )
+    persisted = target_loader.write_policy_payload(bundle.to_payload())
+    safety_manager.set_operation_policies(persisted.operations)
+    return persisted
 
 
 def configure_safety_sentinel(settings: RuntimeSettings) -> None:
@@ -13278,9 +13661,11 @@ def run_checked(
     """Execute ``cmd`` and update task bookkeeping when provided.
 
     ``operation`` designates high-level flows such as ``"coder"`` or ``"test"`` so
-    safety policies can enforce allowlists, denylists, and sandbox expectations.
+    safety policies can enforce allowlists, denylists, sandbox expectations,
+    runtime limits, and network bans while surfacing sentinel telemetry.
     """
 
+    canonical_cmd = [str(part) for part in cmd]
     stdout = ""
     stderr = ""
     return_code = 1
@@ -13288,9 +13673,9 @@ def run_checked(
     header_logged = False
     if task is not None:
         try:
-            command_display = shlex.join(cmd)
+            command_display = shlex.join(canonical_cmd)
         except Exception:
-            command_display = " ".join(cmd)
+            command_display = " ".join(canonical_cmd)
         suffix: List[str] = []
         if cwd:
             try:
@@ -13306,30 +13691,80 @@ def run_checked(
         except Exception as exc:
             log_exception("Task run-log header failed", exc)
 
+    blocked = False
+    policy: Optional[OperationPolicy] = None
+    enforced_limit: Optional[int] = None
     try:
-        blocked = False
-        try:
-            safety_manager.ensure_command_allowed(cmd, operation=operation)
-        except SafetyViolation as exc:
-            blocked = True
-            stderr = str(exc)
-
-        if not blocked:
+        with safety_manager.operation_guard(operation) as active_policy:
+            policy = active_policy
             try:
-                cp = subprocess.run(
-                    cmd,
-                    cwd=str(cwd) if cwd else None,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
+                safety_manager.ensure_command_allowed(
+                    canonical_cmd, operation=operation
                 )
-                return_code = cp.returncode
-                stdout = cp.stdout or ""
-                stderr = cp.stderr or ""
-            except Exception as exc:
+            except SafetyViolation as exc:
+                blocked = True
                 stderr = str(exc)
-                log_exception("run_checked execution failed", exc)
+
+            if not blocked:
+                effective_timeout = timeout
+                if policy and policy.max_duration_seconds is not None:
+                    enforced_limit = int(policy.max_duration_seconds)
+                    effective_timeout = (
+                        enforced_limit
+                        if effective_timeout is None
+                        else min(int(effective_timeout), enforced_limit)
+                    )
+
+                policy_env = env
+                if policy and policy.network_mode == "deny":
+                    merged_env: Dict[str, str]
+                    if env is None:
+                        merged_env = dict(os.environ)
+                    else:
+                        merged_env = dict(env)
+                    for proxy_key in (
+                        "http_proxy",
+                        "https_proxy",
+                        "HTTP_PROXY",
+                        "HTTPS_PROXY",
+                        "no_proxy",
+                        "NO_PROXY",
+                    ):
+                        merged_env.pop(proxy_key, None)
+                    merged_env["ACAGI_NETWORK_POLICY"] = "deny"
+                    if policy.network_blocklist:
+                        merged_env["ACAGI_NETWORK_BLOCKLIST"] = ",".join(
+                            sorted(policy.network_blocklist)
+                        )
+                    policy_env = merged_env
+
+                try:
+                    cp = subprocess.run(
+                        canonical_cmd,
+                        cwd=str(cwd) if cwd else None,
+                        env=policy_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=effective_timeout,
+                    )
+                    return_code = cp.returncode
+                    stdout = cp.stdout or ""
+                    stderr = cp.stderr or ""
+                except subprocess.TimeoutExpired as exc:
+                    return_code = -1
+                    stdout = exc.stdout or stdout
+                    stderr = exc.stderr or stderr or str(exc)
+                    limit_for_record = enforced_limit or effective_timeout
+                    if limit_for_record:
+                        safety_manager.record_timeout(
+                            operation, canonical_cmd, int(limit_for_record)
+                        )
+                except Exception as exc:
+                    stderr = str(exc)
+                    log_exception("run_checked execution failed", exc)
+    except SafetyViolation as exc:
+        blocked = True
+        stderr = str(exc)
     finally:
         if task is not None:
             try:

@@ -58,6 +58,11 @@
       "applies_to": "operation-safety"
     },
     {
+      "title": "Operation Policy Runtime Limits",
+      "summary": "Operation policies now define max_duration_seconds, max_parallel_tasks, and network bans that SafetyManager enforces with sentinel events while run_checked clamps timeouts and strips network proxies.",
+      "applies_to": "operation-safety"
+    },
+    {
       "title": "Terminal Health & Transcript Capture",
       "summary": "The terminal widget now drives the bridge LED through a TerminalHealthState machine and lets transcript taps store Hippocampus-backed anchors while logging session JSONL notices.",
       "applies_to": "terminal-ui"
