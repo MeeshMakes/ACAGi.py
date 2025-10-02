@@ -90,9 +90,11 @@ from PySide6.QtCore import (
     Slot,
     QSize,
     QEvent,
+    QObject,
     QMimeData,
     QPoint,
     QUrl,
+    QThread,
     QFileSystemWatcher,
 )
 from PySide6.QtGui import (
@@ -3800,6 +3802,255 @@ def log_exception(console: ErrorConsole, exc_type, exc, tb) -> None:
     console.log(text)
 
 
+class DatasetIngestWorker(QObject):
+    """Background worker that performs Hippocampus ingest operations."""
+
+    progress = Signal(str)
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        client: HippocampusClient,
+        paths: Sequence[Path],
+        tags: Sequence[str],
+        note: str,
+    ) -> None:
+        super().__init__()
+        self._client = client
+        self._paths = list(paths)
+        self._tags = list(tags)
+        self._note = note
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            results = self._client.ingest_assets(
+                self._paths,
+                self._tags,
+                self._note,
+                progress=lambda msg: self.progress.emit(str(msg)),
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(results)
+
+
+class DatasetManagerDock(QDockWidget):
+    """Qt dock widget exposing the Hippocampus dataset ingestion flow."""
+
+    def __init__(
+        self,
+        chat_card: Optional["ChatCard"],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Dataset Manager", parent)
+        self.setObjectName("DatasetManagerDock")
+        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.toggleViewAction().setText("Dataset Manager")
+
+        self._chat: Optional["ChatCard"] = None
+        self._selected: List[Path] = []
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[DatasetIngestWorker] = None
+
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Select files or folders to ingest into Hippocampus. "
+            "Entries trigger OCR, embedding, and graph registration.",
+            container,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        tag_row = QHBoxLayout()
+        tag_row.setSpacing(6)
+        self.tag_input = QLineEdit(container)
+        self.tag_input.setPlaceholderText("Comma-separated tags (e.g. design,log)")
+        tag_row.addWidget(self.tag_input, 1)
+        self.note_input = QLineEdit(container)
+        self.note_input.setPlaceholderText("Operator note / rationale (optional)")
+        tag_row.addWidget(self.note_input, 1)
+        layout.addLayout(tag_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.btn_add_files = QPushButton("Add Files…", container)
+        self.btn_add_files.clicked.connect(self._add_files)
+        btn_row.addWidget(self.btn_add_files)
+        self.btn_add_dir = QPushButton("Add Directory…", container)
+        self.btn_add_dir.clicked.connect(self._add_directory)
+        btn_row.addWidget(self.btn_add_dir)
+        self.btn_clear = QPushButton("Clear Selection", container)
+        self.btn_clear.clicked.connect(self._clear_selection)
+        btn_row.addWidget(self.btn_clear)
+        layout.addLayout(btn_row)
+
+        self.path_list = QListWidget(container)
+        self.path_list.setSelectionMode(QAbstractItemView.NoSelection)
+        layout.addWidget(self.path_list, 1)
+
+        self.ingest_button = QPushButton("Ingest Selection", container)
+        self.ingest_button.clicked.connect(self._start_ingest)
+        layout.addWidget(self.ingest_button)
+
+        self.log = QPlainTextEdit(container)
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(160)
+        layout.addWidget(self.log, 1)
+
+        self.setWidget(container)
+        self.set_chat_card(chat_card)
+
+    # ------------------------------------------------------------------
+    def set_chat_card(self, chat_card: Optional["ChatCard"]) -> None:
+        """Attach the active chat card so we can reach Hippocampus services."""
+
+        self._chat = chat_card
+        self._append_log(
+            "Hippocampus client ready." if chat_card else "No chat context bound."
+        )
+
+    def _hippocampus(self) -> Optional[HippocampusClient]:
+        if self._chat and hasattr(self._chat, "hippocampus_client"):
+            return self._chat.hippocampus_client()
+        return None
+
+    def _add_files(self) -> None:
+        base = self._default_directory()
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select files",
+            str(base),
+        )
+        self._add_paths(files)
+
+    def _add_directory(self) -> None:
+        base = self._default_directory()
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select directory",
+            str(base),
+        )
+        if directory:
+            self._add_paths([directory])
+
+    def _add_paths(self, raw_paths: Sequence[str]) -> None:
+        added = 0
+        for raw in raw_paths:
+            candidate = Path(raw).expanduser()
+            if candidate in self._selected:
+                continue
+            if candidate.exists():
+                self._selected.append(candidate)
+                added += 1
+        if added:
+            self._selected.sort(key=lambda p: p.as_posix())
+            self._refresh_list()
+            self._append_log(f"Added {added} path(s) to ingest queue.")
+
+    def _clear_selection(self) -> None:
+        if not self._selected:
+            return
+        self._selected.clear()
+        self._refresh_list()
+        self._append_log("Selection cleared.")
+
+    def _refresh_list(self) -> None:
+        self.path_list.clear()
+        for path in self._selected:
+            item = QListWidgetItem(path.as_posix(), self.path_list)
+            item.setToolTip(path.as_posix())
+
+    def _start_ingest(self) -> None:
+        client = self._hippocampus()
+        if client is None:
+            QMessageBox.warning(
+                self,
+                "Hippocampus unavailable",
+                "Chat context is not ready; reopen after chat initialises.",
+            )
+            return
+        if not self._selected:
+            QMessageBox.information(
+                self,
+                "No paths selected",
+                "Add at least one file or directory before ingesting.",
+            )
+            return
+        tags = [tag.strip() for tag in self.tag_input.text().split(",") if tag.strip()]
+        note = self.note_input.text().strip()
+        self._set_busy(True)
+        self._append_log(
+            f"Starting ingest for {len(self._selected)} path(s) with tags {tags}."
+        )
+        self._thread = QThread(self)
+        self._worker = DatasetIngestWorker(client, list(self._selected), tags, note)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._append_log)
+        self._worker.finished.connect(self._on_ingest_finished)
+        self._worker.failed.connect(self._on_ingest_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.failed.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
+    def _on_ingest_finished(self, records: List[HippocampusNodeRecord]) -> None:
+        self._set_busy(False)
+        if not records:
+            self._append_log("Ingest completed with no nodes registered.")
+            return
+        self._append_log(f"Ingest complete: {len(records)} node(s) registered.")
+        for record in records:
+            summary = record.summary
+            if len(summary) > 160:
+                summary = summary[:157] + "…"
+            self._append_log(
+                f"• {record.label} → {summary} [tags: {', '.join(record.tags)}]"
+            )
+
+    def _on_ingest_failed(self, error: str) -> None:
+        self._set_busy(False)
+        self._append_log(f"Ingest failed:\n{error}")
+        QMessageBox.critical(
+            self,
+            "Hippocampus ingest failed",
+            "Review the dataset log for full details.",
+        )
+
+    def _cleanup_thread(self) -> None:
+        if self._thread:
+            self._thread.deleteLater()
+            self._thread = None
+        self._worker = None
+
+    def _set_busy(self, busy: bool) -> None:
+        self.btn_add_files.setEnabled(not busy)
+        self.btn_add_dir.setEnabled(not busy)
+        self.btn_clear.setEnabled(not busy)
+        self.ingest_button.setEnabled(not busy)
+
+    def _append_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log.appendPlainText(f"[{timestamp}] {message}")
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def _default_directory(self) -> Path:
+        if self._chat and hasattr(self._chat, "data_root"):
+            try:
+                return Path(getattr(self._chat, "data_root")).expanduser()
+            except Exception:
+                return agent_data_dir()
+        return agent_data_dir()
+
 # ============================================================================
 # Virtual Desktop Backgrounds (Inlined from Dev_Logic/background)
 # ============================================================================
@@ -6321,6 +6572,421 @@ class DatasetManager:
             results.append(payload)
         return results
 
+
+@dataclass(slots=True)
+class HippocampusNodeRecord:
+    """In-memory representation of a node persisted by Hippocampus."""
+
+    anchor: str
+    label: str
+    source_path: str
+    tags: List[str]
+    summary: str
+    embedding: List[float]
+    metadata: Dict[str, Any]
+
+    def as_payload(self) -> Dict[str, Any]:
+        """Return a serialisable payload for UI loggers or telemetry."""
+
+        return {
+            "anchor": self.anchor,
+            "label": self.label,
+            "source_path": self.source_path,
+            "tags": list(self.tags),
+            "summary": self.summary,
+            "embedding": list(self.embedding),
+            "metadata": self.metadata,
+        }
+
+
+class BrainMapRegistry:
+    """Durable store backing the 3D brain map visualisation."""
+
+    def __init__(
+        self,
+        storage_path: Path,
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.storage_path = storage_path
+        self.logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        self._lock = threading.RLock()
+        self._state: Dict[str, Any] = {"nodes": {}, "edges": []}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.storage_path.exists():
+            return
+        try:
+            data = json.loads(self.storage_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to load brain map registry: %s", exc, exc_info=True
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        nodes = data.get("nodes")
+        edges = data.get("edges")
+        if isinstance(nodes, dict) and isinstance(edges, list):
+            with self._lock:
+                self._state["nodes"] = nodes
+                self._state["edges"] = edges
+
+    def _persist(self) -> None:
+        ensure_dir(self.storage_path.parent)
+        try:
+            self.storage_path.write_text(
+                json.dumps(self._state, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to persist brain map registry: %s", exc, exc_info=True
+            )
+
+    def register_node(self, node_id: str, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            self._state.setdefault("nodes", {})[node_id] = payload
+            self._persist()
+        self.logger.debug("Brain map node registered: %s", node_id)
+
+    def register_edge(self, source: str, target: str, relation: str) -> None:
+        edge = {"source": source, "target": target, "relation": relation}
+        with self._lock:
+            edges: List[Dict[str, str]] = self._state.setdefault("edges", [])
+            edges.append(edge)
+            self._persist()
+        self.logger.debug(
+            "Brain map edge registered: %s -> %s (%s)",
+            source,
+            target,
+            relation,
+        )
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._state))
+
+
+class HippocampusClient:
+    """Bridge datasets into Hippocampus nodes plus brain map edges."""
+
+    _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
+    _MAX_TEXT_BYTES = 131_072
+    _MAX_DIRECTORY_DEPTH = 4
+    _MAX_DIRECTORY_LISTING = 64
+
+    def __init__(
+        self,
+        dataset: DatasetManager,
+        brain_map: BrainMapRegistry,
+        ollama: OllamaClient,
+        settings: Mapping[str, Any],
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.dataset = dataset
+        self.brain_map = brain_map
+        self.ollama = ollama
+        self.settings = settings
+        self.logger = logger or logging.getLogger(VD_LOGGER_NAME)
+        self.enable_vision = bool(settings.get("enable_vision", True))
+        self.summary_model = str(
+            settings.get("chat_model", DEFAULT_CHAT_MODEL)
+        ).strip()
+        self.vision_model = str(
+            settings.get("vision_model", DEFAULT_VISION_MODEL)
+        ).strip()
+
+    def ingest_assets(
+        self,
+        paths: Sequence[Path],
+        tags: Sequence[str],
+        note: str,
+        *,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> List[HippocampusNodeRecord]:
+        records: List[HippocampusNodeRecord] = []
+        for path in paths:
+            if progress:
+                progress(f"Ingesting {path}")
+            try:
+                resolved = path.expanduser().resolve()
+            except Exception:
+                resolved = path
+            records.extend(
+                self._ingest_path(resolved, list(tags), note, 0, progress)
+            )
+        return records
+
+    def _ingest_path(
+        self,
+        path: Path,
+        tags: List[str],
+        note: str,
+        depth: int,
+        progress: Optional[Callable[[str], None]],
+    ) -> List[HippocampusNodeRecord]:
+        if depth > self._MAX_DIRECTORY_DEPTH:
+            summary = (
+                f"Depth limit reached while scanning {path}. Captured metadata "
+                "only."
+            )
+            payload = self.dataset.add_entry(
+                "system",
+                summary,
+                [],
+                tags=tags + ["hippocampus_depth_limit"],
+                extra={"source_path": str(path)},
+            )
+            record = self._register_node(path, summary, tags, payload)
+            return [record]
+
+        if path.is_dir():
+            return self._ingest_directory(path, tags, note, depth, progress)
+        return [self._ingest_file(path, tags, note, progress)]
+
+    def _ingest_directory(
+        self,
+        directory: Path,
+        tags: List[str],
+        note: str,
+        depth: int,
+        progress: Optional[Callable[[str], None]],
+    ) -> List[HippocampusNodeRecord]:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name.lower())
+        except Exception as exc:
+            summary = f"Unable to enumerate {directory}: {exc}"
+            payload = self.dataset.add_entry(
+                "system",
+                summary,
+                [],
+                tags=tags + ["hippocampus_error"],
+                extra={"source_path": str(directory)},
+            )
+            record = self._register_node(directory, summary, tags, payload)
+            return [record]
+
+        limited = entries[: self._MAX_DIRECTORY_LISTING]
+        overflow = len(entries) - len(limited)
+        child_records: List[HippocampusNodeRecord] = []
+        for child in limited:
+            if progress:
+                progress(f"Processing {child}")
+            child_records.extend(
+                self._ingest_path(child, tags, note, depth + 1, progress)
+            )
+        child_labels = ", ".join(rec.label for rec in child_records[:6])
+        if overflow > 0:
+            child_labels += f" … (+{overflow} more)"
+        summary_parts = [
+            f"Directory ingest for {directory.name}",
+            f"Tags: {', '.join(tags) or '(none)'}",
+        ]
+        if note.strip():
+            summary_parts.append(f"Operator note: {note.strip()}")
+        if child_labels:
+            summary_parts.append(f"Children: {child_labels}")
+        summary = "\n".join(summary_parts)
+        payload = self.dataset.add_entry(
+            "system",
+            summary,
+            [],
+            tags=tags + ["hippocampus_directory"],
+            extra={
+                "source_path": str(directory),
+                "children": [rec.anchor for rec in child_records],
+            },
+        )
+        record = self._register_node(directory, summary, tags, payload)
+        for child in child_records:
+            self.brain_map.register_edge(record.anchor, child.anchor, "contains")
+        return [record] + child_records
+
+    def _ingest_file(
+        self,
+        path: Path,
+        tags: List[str],
+        note: str,
+        progress: Optional[Callable[[str], None]],
+    ) -> HippocampusNodeRecord:
+        suffix = path.suffix.lower()
+        if suffix in self._IMAGE_SUFFIXES:
+            return self._ingest_image(path, tags, note)
+        snippet, is_text = self._extract_text_snippet(path)
+        if is_text and snippet.strip():
+            return self._ingest_text_file(path, tags, note, snippet)
+        return self._ingest_binary_file(path, tags)
+
+    def _ingest_image(
+        self,
+        path: Path,
+        tags: List[str],
+        note: str,
+    ) -> HippocampusNodeRecord:
+        ocr_res = perform_ocr(path)
+        vision_summary = ""
+        if self.enable_vision:
+            vision = analyze_image(
+                path,
+                ocr_res.markdown if ocr_res.ok else "",
+                client=self.ollama,
+                model=self.vision_model or DEFAULT_VISION_MODEL,
+                user_text=note,
+            )
+            if vision.ok:
+                vision_summary = vision.summary
+        combined_source = []
+        if ocr_res.ok:
+            combined_source.append(f"OCR Markdown:\n{ocr_res.markdown}")
+        elif ocr_res.error:
+            combined_source.append(f"OCR error: {ocr_res.error}")
+        if vision_summary:
+            combined_source.append(f"Vision summary:\n{vision_summary}")
+        source_text = "\n\n".join(combined_source)
+        summary = self._summarise_asset(path, tags, note, source_text)
+        payload = self.dataset.add_entry(
+            "assistant",
+            summary,
+            [path],
+            tags=tags + ["hippocampus_image"],
+            extra={
+                "source_path": str(path),
+                "ocr": ocr_res.markdown if ocr_res.ok else None,
+                "vision": vision_summary or None,
+            },
+        )
+        return self._register_node(path, summary, tags, payload)
+
+    def _ingest_text_file(
+        self,
+        path: Path,
+        tags: List[str],
+        note: str,
+        snippet: str,
+    ) -> HippocampusNodeRecord:
+        summary = self._summarise_asset(path, tags, note, snippet)
+        payload = self.dataset.add_entry(
+            "system",
+            summary,
+            [],
+            tags=tags + ["hippocampus_text"],
+            extra={
+                "source_path": str(path),
+                "preview": snippet[:1024],
+            },
+        )
+        return self._register_node(path, summary, tags, payload)
+
+    def _ingest_binary_file(
+        self,
+        path: Path,
+        tags: List[str],
+    ) -> HippocampusNodeRecord:
+        try:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        summary = (
+            f"Binary asset captured: {path.name} ({size} bytes). Tags: "
+            f"{', '.join(tags) or '(none)'}"
+        )
+        payload = self.dataset.add_entry(
+            "system",
+            summary,
+            [],
+            tags=tags + ["hippocampus_binary"],
+            extra={"source_path": str(path), "size": size},
+        )
+        return self._register_node(path, summary, tags, payload)
+
+    def _extract_text_snippet(self, path: Path) -> Tuple[str, bool]:
+        try:
+            data = path.read_bytes()
+        except Exception as exc:
+            self.logger.debug("Failed to read %s: %s", path, exc)
+            return "", False
+        sample = data[: self._MAX_TEXT_BYTES]
+        text = sample.decode("utf-8", errors="ignore")
+        if not text:
+            return "", False
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+        ratio = printable / max(1, len(text))
+        return text[: self._MAX_TEXT_BYTES], ratio > 0.75
+
+    def _summarise_asset(
+        self,
+        path: Path,
+        tags: Sequence[str],
+        note: str,
+        source_text: str,
+    ) -> str:
+        cleaned = source_text.strip()
+        if cleaned:
+            prompt = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Hippocampus, the semantic memory graft. "
+                        "Produce a concise summary highlighting entities, "
+                        "relationships, and potential follow-up questions."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Asset: {path.name}\nTags: {', '.join(tags) or '(none)'}\n"
+                        f"Operator note: {note or '(none)'}\n\n"
+                        f"Content snippet:\n{cleaned[:4000]}"
+                    ),
+                },
+            ]
+            ok, summary, err = self.ollama.chat(
+                self.summary_model or DEFAULT_CHAT_MODEL,
+                prompt,
+            )
+            if ok and summary.strip():
+                return summary.strip()
+            self.logger.debug(
+                "Summary fallback for %s due to Ollama error: %s",
+                path,
+                err,
+            )
+        fallback = cleaned[:512] if cleaned else ""
+        if fallback:
+            return fallback.strip()
+        return (
+            f"Asset {path.name} ingested with tags {', '.join(tags) or '(none)'}."
+        )
+
+    def _register_node(
+        self,
+        path: Path,
+        summary: str,
+        tags: Sequence[str],
+        payload: Dict[str, Any],
+    ) -> HippocampusNodeRecord:
+        anchor = str(payload.get("anchor") or payload.get("id") or uuid.uuid4().hex)
+        metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.setdefault("source_path", str(path))
+        record = HippocampusNodeRecord(
+            anchor=anchor,
+            label=path.name,
+            source_path=str(path),
+            tags=list(tags),
+            summary=summary,
+            embedding=payload.get("embedding") or [],
+            metadata=metadata,
+        )
+        brain_payload = record.as_payload()
+        brain_payload["core"] = payload
+        self.brain_map.register_node(anchor, brain_payload)
+        return record
+
 @dataclass(slots=True)
 class ConversationPaths:
     identifier: str
@@ -8698,6 +9364,18 @@ class ChatCard(QFrame):
             archive_root=agent_archives_dir(),
         )
         self.dataset = DatasetManager(self.session_dir, embed_model, self.ollama, data_root=self.data_root, enable_semantic=enable_embed)
+        hippocampus_root = ensure_dir(self.session_dir / "hippocampus")
+        self.brain_map = BrainMapRegistry(
+            hippocampus_root / "brain_map.json",
+            logger=logging.getLogger(f"{VD_LOGGER_NAME}.hippocampus"),
+        )
+        self.hippocampus = HippocampusClient(
+            self.dataset,
+            self.brain_map,
+            self.ollama,
+            self.settings,
+            logger=logging.getLogger(f"{VD_LOGGER_NAME}.hippocampus"),
+        )
         self.pending_images: List[Path] = []
         self.session_notes: List[Dict[str, str]] = self._load_session_notes()
         self._safety_notifier_id: str = ""
@@ -9636,6 +10314,11 @@ class ChatCard(QFrame):
     @Slot(str)
     def _handle_error_notice(self, message: str) -> None:
         self._emit_system_notice(message)
+
+    def hippocampus_client(self) -> HippocampusClient:
+        """Expose the active Hippocampus client for auxiliary widgets."""
+
+        return self.hippocampus
 
     def detach_safety_notifier(self) -> None:
         if self._safety_notifier_id:
@@ -11384,6 +12067,9 @@ class MainWindow(QMainWindow):
         else:
             self.desktop = TerminalDesktop(theme, self.chat, self)
             self.setCentralWidget(self.desktop)
+        self.dataset_dock = DatasetManagerDock(self.chat, self)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dataset_dock)
+        self.dataset_dock.hide()
         safety_manager.set_confirmer(self._confirm_risky_command)
         self.status_indicator: QStatusBar = self.statusBar()
         self._refresh_status_bar()
@@ -11415,6 +12101,7 @@ class MainWindow(QMainWindow):
         self.fullscreen_act.setShortcut("Alt+Return")
         self.fullscreen_act.triggered.connect(self._toggle_fullscreen)
         view_menu.addAction(self.fullscreen_act)
+        view_menu.addAction(self.dataset_dock.toggleViewAction())
 
     def _init_shortcuts(self):
         focus_input = QAction(self); focus_input.setShortcut(QKeySequence("Ctrl+`"))
@@ -11501,6 +12188,8 @@ class MainWindow(QMainWindow):
         else:
             self.desktop = TerminalDesktop(self.theme, self.chat, self)
             self.setCentralWidget(self.desktop)
+        if hasattr(self, "dataset_dock"):
+            self.dataset_dock.set_chat_card(self.chat)
 
     @Slot()
     def _open_settings(self):
@@ -11619,6 +12308,8 @@ class MainWindow(QMainWindow):
             else:
                 self.desktop = TerminalDesktop(self.theme, self.chat, self)
                 self.setCentralWidget(self.desktop)
+            if hasattr(self, "dataset_dock"):
+                self.dataset_dock.set_chat_card(self.chat)
             configure_safety_sentinel(self.feature_flags)
             self._refresh_status_bar()
 

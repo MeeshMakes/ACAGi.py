@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.9] - 2025-10-02
+### Added
+- Added a Hippocampus-backed dataset manager dock that lets operators ingest
+  tagged files or directories from the UI while kicking off OCR, embedding, and
+  summarisation workflows.
+
+### Changed
+- Registered ingestion outputs with a persistent brain map registry so new
+  nodes and edges surface in the 3D visualisation after Hippocampus processes
+  them.
+
 ## [0.1.8] - 2025-10-02
 ### Added
 - Embedded a `MemoryServices` stack that loads durable lessons, instruction inbox items, and session JSONL tails during boot and exposes CRUD helpers for each store.
