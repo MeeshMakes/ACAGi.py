@@ -96,6 +96,11 @@
       "title": "Task Bucket Failure Rationalization Loop",
       "summary": "When a task bucket stage fails ACAGi queues a Rationalizer job with the failure context and updates the durable memory snapshot with the latest telemetry so follow-up runs start with concrete remediation clues.",
       "applies_to": "task-orchestration"
+    },
+    {
+      "title": "ScriptSpeak Command Dispatch",
+      "summary": "ScriptSpeak commands are parsed into structured events on the script.command topic, mirrored into session logs, and reused by macros and Rationalizer outputs for auditable automation.",
+      "applies_to": "scriptspeak"
     }
   ],
   "procedures": [

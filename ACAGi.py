@@ -2693,6 +2693,44 @@ class MacroStep:
             "arguments": dict(self.arguments),
         }
 
+    # ------------------------------------------------------------------
+    def to_scriptspeak(self) -> str:
+        """Serialise the step into a ScriptSpeak command string."""
+
+        verb = (self.action or "").strip().upper()
+        if not verb:
+            raise ScriptSpeakParseError("Macro step is missing an action verb")
+
+        parts: List[str] = [verb]
+        for key, value in sorted(self.arguments.items()):
+            if value is None:
+                continue
+            formatted = _format_scriptspeak_value(value)
+            parts.append(f"{key}={formatted}")
+        return " ".join(parts)
+
+    # ------------------------------------------------------------------
+    def dispatch_scriptspeak(
+        self,
+        *,
+        source: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        session_id: Optional[str] = None,
+        parser: Optional["ScriptSpeakParser"] = None,
+    ) -> "ScriptSpeakDispatch":
+        """Parse and dispatch this step via the ScriptSpeak pipeline."""
+
+        runner = parser or scriptspeak_parser()
+        enriched_meta: Dict[str, Any] = {"macro_step_order": int(self.order)}
+        if metadata:
+            enriched_meta.update(dict(metadata))
+        return runner.dispatch(
+            self.to_scriptspeak(),
+            source=source,
+            metadata=enriched_meta,
+            session_id=session_id,
+        )
+
 
 @dataclass(slots=True)
 class MacroPlaybook:
@@ -2717,6 +2755,47 @@ class MacroPlaybook:
             "description": self.description,
             "steps": [step.to_payload() for step in sorted(self.steps, key=lambda s: s.order)],
         }
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "MacroPlaybook":
+        """Hydrate a playbook model from a payload emitted on the event bus."""
+
+        identifier = str(payload.get("id") or payload.get("identifier") or "").strip()
+        if not identifier:
+            identifier = uuid.uuid4().hex
+        title = str(payload.get("title") or identifier)
+        description = str(payload.get("description") or "")
+        steps_payload = payload.get("steps")
+        steps: List[MacroStep] = []
+        if isinstance(steps_payload, Sequence):
+            for idx, raw_step in enumerate(steps_payload):
+                if not isinstance(raw_step, Mapping):
+                    continue
+                action = str(raw_step.get("action") or raw_step.get("command") or "").strip()
+                if not action:
+                    continue
+                arguments_payload = raw_step.get("arguments") or raw_step.get("params") or {}
+                if not isinstance(arguments_payload, Mapping):
+                    arguments_payload = {"value": arguments_payload}
+                try:
+                    order_value = int(raw_step.get("order", idx))
+                except Exception:
+                    order_value = idx
+                steps.append(
+                    MacroStep(
+                        order=order_value,
+                        action=action,
+                        arguments=dict(arguments_payload),
+                    )
+                )
+        ordered = sorted(steps, key=lambda step: step.order)
+        normalised: List[MacroStep] = []
+        for idx, step in enumerate(ordered):
+            normalised.append(
+                MacroStep(order=idx, action=step.action, arguments=dict(step.arguments))
+            )
+        return cls(identifier=identifier, title=title, description=description, steps=normalised)
 
 
 @dataclass(slots=True)
@@ -2949,6 +3028,321 @@ def _utc_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+class ScriptSpeakParseError(ValueError):
+    """Raised when a ScriptSpeak command cannot be parsed."""
+
+
+@dataclass(slots=True)
+class ScriptSpeakCommand:
+    """Structured representation of a parsed ScriptSpeak instruction."""
+
+    verb: str
+    arguments: Dict[str, Any]
+    flags: Tuple[str, ...]
+    raw: str
+
+
+@dataclass(slots=True)
+class ScriptSpeakDispatch:
+    """Container describing a dispatched ScriptSpeak event."""
+
+    command: ScriptSpeakCommand
+    topic: str
+    payload: Dict[str, Any]
+
+
+_SCRIPTSPEAK_VERB_CATEGORIES: Dict[str, str] = {
+    "APPLY_PATCH": "bucket",
+    "RUN_TESTS": "bucket",
+    "LINT": "bucket",
+    "OPEN_DEVSPACE": "ui",
+    "OPEN_VD": "ui",
+    "CAPTURE_SCREEN": "vision",
+    "OCR_STRICT": "vision",
+    "OCR_CREATIVE": "vision",
+    "INDEX_REPO": "repo",
+    "CREATE_BUCKET": "bucket",
+    "UPDATE_BUCKET": "bucket",
+    "PROMOTE_BUCKET": "bucket",
+    "IMMUNE_RESPONSE": "immune",
+    "APPROVE": "policy",
+    "DENY": "policy",
+    "TOGGLE_REMOTE": "remote",
+    "SET_THEME": "ui",
+    "MACRO_RUN": "macro",
+    "MACRO_SAVE": "macro",
+    "JUMP_NODE": "ui",
+    "SEARCH_LOGS": "observability",
+    "SUMMARIZE": "summary",
+}
+
+_SCRIPTSPEAK_ALLOWED_VERBS: Set[str] = set(_SCRIPTSPEAK_VERB_CATEGORIES.keys())
+
+
+def _format_scriptspeak_value(value: Any) -> str:
+    """Format *value* for ScriptSpeak string emission with quoting as needed."""
+
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        text = str(value)
+    elif value is None:
+        return "null"
+    elif isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+
+    needs_quotes = False
+    for ch in (" ", "\t", "\n", ",", "=", "\""):
+        if ch in text:
+            needs_quotes = True
+            break
+    if not text:
+        needs_quotes = True
+
+    if not needs_quotes:
+        return text
+    escaped = text.replace("\"", "\\\"")
+    return f'"{escaped}"'
+
+
+class ScriptSpeakParser:
+    """Parse ScriptSpeak commands and publish them onto the event bus."""
+
+    def __init__(
+        self,
+        dispatcher: EventDispatcher,
+        *,
+        logger: Optional[logging.Logger] = None,
+        allowed_verbs: Optional[Iterable[str]] = None,
+    ) -> None:
+        self._dispatcher = dispatcher
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.scriptspeak")
+        self._allowed_verbs: Set[str] = (
+            set(verb.strip().upper() for verb in allowed_verbs)
+            if allowed_verbs
+            else set(_SCRIPTSPEAK_ALLOWED_VERBS)
+        )
+
+    # ------------------------------------------------------------------
+    def parse(self, command: str) -> ScriptSpeakCommand:
+        """Parse a ScriptSpeak command string into a structured object."""
+
+        text = (command or "").strip()
+        if not text:
+            raise ScriptSpeakParseError("ScriptSpeak command cannot be empty")
+
+        lexer = shlex.shlex(text, posix=True)
+        lexer.whitespace_split = True
+        lexer.whitespace += ","
+        tokens = [token.strip() for token in lexer if token.strip()]
+        if not tokens:
+            raise ScriptSpeakParseError("ScriptSpeak command has no tokens")
+
+        verb = tokens[0].upper()
+        if verb not in self._allowed_verbs:
+            raise ScriptSpeakParseError(f"Unsupported ScriptSpeak verb: {verb}")
+
+        arguments: Dict[str, Any] = {}
+        flags: List[str] = []
+        for token in tokens[1:]:
+            if token.startswith("--"):
+                flag = token[2:].strip()
+                if not flag:
+                    raise ScriptSpeakParseError("Encountered empty flag token")
+                flags.append(flag.replace("-", "_"))
+                continue
+            if "=" not in token:
+                raise ScriptSpeakParseError(f"Malformed token without '=': {token}")
+            key, raw_value = token.split("=", 1)
+            key = key.strip()
+            if not key:
+                raise ScriptSpeakParseError("Argument keys must be non-empty")
+            value = self._coerce_value(raw_value.strip())
+            arguments[key] = value
+
+        unique_flags = tuple(sorted(dict.fromkeys(flags)))
+        return ScriptSpeakCommand(verb=verb, arguments=arguments, flags=unique_flags, raw=text)
+
+    # ------------------------------------------------------------------
+    def dispatch(
+        self,
+        command: str,
+        *,
+        source: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> ScriptSpeakDispatch:
+        """Parse *command* and publish the resulting payload on the bus."""
+
+        parsed = self.parse(command)
+        topic, payload = self._build_payload(parsed, source=source, metadata=metadata)
+        self._dispatcher.publish(topic, payload)
+        self._logger.info(
+            "Dispatched ScriptSpeak command",
+            extra={"verb": parsed.verb, "topic": topic, "source": source},
+        )
+        resolved_session = self._resolve_session_id(session_id, metadata)
+        if resolved_session:
+            self._record_session_entry(resolved_session, parsed, payload)
+        return ScriptSpeakDispatch(command=parsed, topic=topic, payload=payload)
+
+    # ------------------------------------------------------------------
+    def _build_payload(
+        self,
+        command: ScriptSpeakCommand,
+        *,
+        source: str,
+        metadata: Optional[Mapping[str, Any]],
+    ) -> Tuple[str, Dict[str, Any]]:
+        category = _SCRIPTSPEAK_VERB_CATEGORIES.get(command.verb, "general")
+        payload: Dict[str, Any] = {
+            "verb": command.verb,
+            "category": category,
+            "arguments": {
+                key: self._serialise_value(value) for key, value in command.arguments.items()
+            },
+            "flags": list(command.flags),
+            "raw": command.raw,
+            "source": source,
+            "issued_at": _utc_iso(),
+        }
+        if metadata:
+            payload["meta"] = self._serialise_value(dict(metadata))
+        return "script.command", payload
+
+    # ------------------------------------------------------------------
+    def _coerce_value(self, raw: str) -> Any:
+        lowered = raw.lower()
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        if lowered == "null":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+        return raw
+
+    # ------------------------------------------------------------------
+    def _serialise_value(self, value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, Mapping):
+            return {str(k): self._serialise_value(v) for k, v in value.items()}
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return [self._serialise_value(item) for item in value]
+        return repr(value)
+
+    # ------------------------------------------------------------------
+    def _resolve_session_id(
+        self,
+        session_id: Optional[str],
+        metadata: Optional[Mapping[str, Any]],
+    ) -> Optional[str]:
+        if session_id:
+            cleaned = session_id.strip()
+            if cleaned:
+                return cleaned
+        if not metadata:
+            return None
+        for key in ("session_id", "conversation_id", "codex_conversation_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    # ------------------------------------------------------------------
+    def _record_session_entry(
+        self,
+        session_id: str,
+        command: ScriptSpeakCommand,
+        payload: Mapping[str, Any],
+    ) -> None:
+        entry = {
+            "timestamp": _utc_iso(),
+            "kind": "scriptspeak",
+            "verb": command.verb,
+            "arguments": self._serialise_value(command.arguments),
+            "flags": list(command.flags),
+            "source": payload.get("source"),
+            "payload": self._serialise_value(payload),
+        }
+        try:
+            memory_services().sessions.append_entry(session_id, entry)
+        except Exception:
+            self._logger.debug(
+                "Failed to record ScriptSpeak session entry",
+                extra={"session_id": session_id, "verb": command.verb},
+                exc_info=True,
+            )
+
+
+_SCRIPTSPEAK_PARSER: Optional[ScriptSpeakParser] = None
+
+
+def scriptspeak_parser() -> ScriptSpeakParser:
+    """Return the process-wide ScriptSpeak parser singleton."""
+
+    global _SCRIPTSPEAK_PARSER
+    if _SCRIPTSPEAK_PARSER is None:
+        _SCRIPTSPEAK_PARSER = ScriptSpeakParser(EVENT_DISPATCHER)
+    return _SCRIPTSPEAK_PARSER
+
+
+def dispatch_scriptspeak(
+    command: str,
+    *,
+    source: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+    session_id: Optional[str] = None,
+    parser: Optional[ScriptSpeakParser] = None,
+) -> ScriptSpeakDispatch:
+    """Convenience wrapper for publishing ScriptSpeak commands."""
+
+    runner = parser or scriptspeak_parser()
+    return runner.dispatch(
+        command,
+        source=source,
+        metadata=metadata,
+        session_id=session_id,
+    )
+
+
+def dispatch_macro_playbook(
+    playbook: MacroPlaybook,
+    *,
+    source: str = "macro",
+    metadata: Optional[Mapping[str, Any]] = None,
+    session_id: Optional[str] = None,
+    parser: Optional[ScriptSpeakParser] = None,
+) -> List[ScriptSpeakDispatch]:
+    """Dispatch every step within *playbook* via the ScriptSpeak parser."""
+
+    runner = parser or scriptspeak_parser()
+    base_meta = dict(metadata or {})
+    base_meta.setdefault("playbook_id", playbook.identifier)
+    base_meta.setdefault("playbook_title", playbook.title)
+    dispatches: List[ScriptSpeakDispatch] = []
+    for step in sorted(playbook.steps, key=lambda item: item.order):
+        step_meta = dict(base_meta)
+        step_meta["playbook_step_action"] = step.action
+        dispatches.append(
+            runner.dispatch(
+                step.to_scriptspeak(),
+                source=source,
+                metadata=step_meta,
+                session_id=session_id,
+            )
+        )
+    return dispatches
+
+
 def _dataset_root(candidate: Optional[Path]) -> Path:
     return Path(candidate) if candidate else TASKS_DATA_ROOT
 
@@ -3137,6 +3531,8 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     # Cortex rationalization outputs.
     "cortex.intent",
     "cortex.reference",
+    # ScriptSpeak command stream.
+    "script.command",
 }
 _WILDCARD_TOPIC = "task.*"
 
@@ -4842,6 +5238,43 @@ class RationalizerManager:
         if error is not None:
             payload["error"] = error
         self._publisher(topic, payload)
+        scripts = self._extract_scriptspeak_commands(result)
+        if scripts:
+            session_hint: Optional[str] = None
+            if isinstance(job.metadata, Mapping):
+                candidate = job.metadata.get("session_id") or job.metadata.get("conversation_id")
+                if isinstance(candidate, str) and candidate.strip():
+                    session_hint = candidate.strip()
+            session_hint = session_hint or job.conversation_id
+            meta_base: Dict[str, Any] = {
+                "job_id": job.job_id,
+                "task_type": job.task_type.value,
+            }
+            if isinstance(job.metadata, Mapping):
+                for key, value in job.metadata.items():
+                    if key not in meta_base:
+                        meta_base[key] = value
+            for index, script in enumerate(scripts):
+                sequence_meta = dict(meta_base)
+                sequence_meta["sequence"] = index
+                try:
+                    dispatch_scriptspeak(
+                        script,
+                        source="rationalizer",
+                        metadata=sequence_meta,
+                        session_id=session_hint,
+                    )
+                except ScriptSpeakParseError:
+                    self._logger.warning(
+                        "Failed to parse ScriptSpeak command from rationalizer",
+                        extra={"job_id": job.job_id, "command": script},
+                        exc_info=True,
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "Failed to dispatch ScriptSpeak command from rationalizer",
+                        extra={"job_id": job.job_id, "command": script},
+                    )
 
     # ------------------------------------------------------------------
     def _segment_intents(self, utterance: str) -> Dict[str, Any]:
@@ -4876,6 +5309,21 @@ class RationalizerManager:
                 }
             )
         return {"segments": segments}
+
+    # ------------------------------------------------------------------
+    def _extract_scriptspeak_commands(self, result: Mapping[str, Any]) -> List[str]:
+        commands: List[str] = []
+        if not isinstance(result, Mapping):
+            return commands
+        for key in ("scriptspeak", "script_speak", "script_instructions"):
+            payload = result.get(key)
+            if isinstance(payload, str) and payload.strip():
+                commands.append(payload.strip())
+            elif isinstance(payload, Sequence):
+                for item in payload:
+                    if isinstance(item, str) and item.strip():
+                        commands.append(item.strip())
+        return commands
 
     # ------------------------------------------------------------------
     def _classify_intent(self, snippet: str) -> str:
@@ -18885,6 +19333,61 @@ class MainWindow(QMainWindow):
         self._manual_macro_notes = self._manual_macro_notes[-50:]
         self._palette_logger.info("Macro execution scheduled", extra={"title": title})
         self.status_indicator.showMessage(f"Macro '{title}' queued for manual review", 8000)
+
+        session_hint = None
+        if isinstance(payload.get("session_id"), str):
+            session_hint = payload.get("session_id")
+        elif isinstance(payload.get("conversation_id"), str):
+            session_hint = payload.get("conversation_id")
+
+        scriptspeak_metadata: Dict[str, Any] = {
+            "macro_event_title": title,
+            "macro_event_invoked_at": payload.get("invoked_at"),
+        }
+
+        if isinstance(playbook, Mapping):
+            try:
+                model = MacroPlaybook.from_payload(playbook)
+                dispatch_macro_playbook(
+                    model,
+                    source="macro",
+                    metadata=scriptspeak_metadata,
+                    session_id=session_hint,
+                )
+            except ScriptSpeakParseError:
+                self._palette_logger.warning(
+                    "Macro playbook contains unparseable ScriptSpeak step",
+                    extra={"title": title},
+                    exc_info=True,
+                )
+            except Exception:
+                self._palette_logger.exception(
+                    "Failed to dispatch ScriptSpeak commands for macro", extra={"title": title}
+                )
+        else:
+            commands = payload.get("commands")
+            if isinstance(commands, Sequence):
+                for idx, command in enumerate(commands):
+                    if not isinstance(command, str):
+                        continue
+                    try:
+                        dispatch_scriptspeak(
+                            command,
+                            source="macro",
+                            metadata={**scriptspeak_metadata, "macro_sequence": idx},
+                            session_id=session_hint,
+                        )
+                    except ScriptSpeakParseError:
+                        self._palette_logger.warning(
+                            "Macro command failed ScriptSpeak parsing",
+                            extra={"title": title, "sequence": idx},
+                            exc_info=True,
+                        )
+                    except Exception:
+                        self._palette_logger.exception(
+                            "Failed to dispatch ad-hoc ScriptSpeak command",
+                            extra={"title": title, "sequence": idx},
+                        )
 
         target = getattr(self, "virtual_desktop_dock", None)
         if target and hasattr(target, "record_manual_macro_note"):
