@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7] - 2025-10-05
+### Added
+- Introduced a topic-aware event dispatcher with bounded subscriber queues so observation, note, task, and system streams share a consistent pub/sub surface.
+
+### Changed
+- Routed dispatcher telemetry into the shared `vd_system.log` sink and added informational logs to trace publish/drop flows.
+
 ## [0.1.6] - 2025-10-05
 ### Changed
 - Consolidated safety guardrails, prompt loader, image pipeline, and repository indexing code directly into `ACAGi.py`, replacing sibling module imports with scoped sections referencing the Dev_Logic assets.

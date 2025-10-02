@@ -31,6 +31,11 @@
       "title": "Dev Logic Path Constant",
       "summary": "Use the DEV_LOGIC_ROOT constant within ACAGi.py when referencing prompts, datasets, or other assets migrated from Dev_Logic modules so paths remain stable after inlining.",
       "applies_to": "acagi-architecture"
+    },
+    {
+      "title": "Event Dispatcher Telemetry",
+      "summary": "Route new pub/sub topics through the unified EventDispatcher so queue backpressure, logging, and remote fan-out remain consistent across observation, note, and task streams.",
+      "applies_to": "acagi-events"
     }
   ],
   "procedures": [

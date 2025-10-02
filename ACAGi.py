@@ -2508,38 +2508,98 @@ def append_event(event: TaskEvent) -> None:
     _append_jsonl(EVENTS_FILE, event.to_dict())
 
 
-# -- Task event bus ---------------------------------------------------------
+# -- Event dispatcher -------------------------------------------------------
 
 Subscriber = Callable[[dict], None]
 
-TASK_TOPICS = {
+DEFAULT_EVENT_TOPICS: Set[str] = {
+    # Human-facing streams sourced from observations, annotations, and tasks.
+    "observation",
+    "observation.delta",
+    "note",
+    "note.appended",
+    "task",
     "task.created",
     "task.updated",
     "task.status",
     "task.diff",
     "task.deleted",
     "task.conversation",
+    # System coordination and metrics feeds.
     "system.metrics",
+    "system.process",
 }
 _WILDCARD_TOPIC = "task.*"
-_BUS_LOGGER = logging.getLogger("tasks.bus")
-_SUBSCRIBERS: MutableMapping[str, List[Subscriber]] = defaultdict(list)
-_BUS_LOCK = RLock()
-_EVENT_RATE_WINDOW = 60.0
-_EVENT_RATE_LIMIT = max(1, RUNTIME_SETTINGS.event_rate_per_minute)
-_EVENT_RATE_HISTORY: Deque[float] = deque()
-_EVENT_REMOTE_URL = RUNTIME_SETTINGS.remote_event_bus
-_EVENT_REMOTE_ENABLED = bool(_EVENT_REMOTE_URL and not RUNTIME_SETTINGS.offline)
+
+
+class _SubscriptionState:
+    """Runtime state for a single subscriber including queue backpressure."""
+
+    __slots__ = (
+        "callback",
+        "max_pending",
+        "queue",
+        "lock",
+        "delivering",
+        "dropped",
+    )
+
+    def __init__(self, callback: Subscriber, *, max_pending: int) -> None:
+        self.callback = callback
+        self.max_pending = max_pending
+        self.queue: Deque[dict] = deque()
+        self.lock = RLock()
+        self.delivering = False
+        self.dropped = 0
+
+    def enqueue(self, topic: str, payload: dict, *, logger: logging.Logger) -> bool:
+        """Add ``payload`` and return ``True`` when the queue should be drained."""
+
+        with self.lock:
+            if len(self.queue) >= self.max_pending:
+                self.dropped += 1
+                logger.warning(
+                    "Backpressure drop topic=%s callback=%r dropped=%s",
+                    topic,
+                    self.callback,
+                    self.dropped,
+                )
+                return False
+            self.queue.append(payload)
+            should_start = not self.delivering
+            # Mark as delivering so concurrent publishers avoid double drains.
+            if should_start:
+                self.delivering = True
+            return should_start
+
+    def start_delivery(self) -> Optional[dict]:
+        """Pop the next payload or release the delivery flag when empty."""
+
+        with self.lock:
+            if not self.queue:
+                self.delivering = False
+                return None
+            return self.queue.popleft()
+
+    def finish_delivery(self) -> bool:
+        """Return ``True`` when more payloads remain queued."""
+
+        with self.lock:
+            if self.queue:
+                return True
+            self.delivering = False
+            return False
 
 
 class Subscription:
     """Handle returned from :func:`subscribe` that can detach a listener."""
 
-    __slots__ = ("_topic", "_callback", "_active")
+    __slots__ = ("_dispatcher", "_topic", "_state", "_active")
 
-    def __init__(self, topic: str, callback: Subscriber) -> None:
+    def __init__(self, dispatcher: "EventDispatcher", topic: str, state: _SubscriptionState) -> None:
+        self._dispatcher = dispatcher
         self._topic = topic
-        self._callback = callback
+        self._state = state
         self._active = True
 
     @property
@@ -2549,86 +2609,187 @@ class Subscription:
     def unsubscribe(self) -> None:
         if not self._active:
             return
-        with _BUS_LOCK:
-            listeners = _SUBSCRIBERS.get(self._topic)
-            if listeners is None:
-                self._active = False
-                return
-            try:
-                listeners.remove(self._callback)
-            except ValueError:
-                pass
-            else:
-                if not listeners:
-                    _SUBSCRIBERS.pop(self._topic, None)
-            self._active = False
+        self._dispatcher._detach(self._topic, self._state)
+        self._active = False
 
     def __call__(self) -> None:  # pragma: no cover - sugar
         self.unsubscribe()
 
 
-def _validate_topic(topic: str, allow_wildcard: bool = False) -> None:
-    if topic in TASK_TOPICS:
-        return
-    if allow_wildcard and topic == _WILDCARD_TOPIC:
-        return
-    raise ValueError(f"Unsupported topic: {topic!r}")
+class EventDispatcher:
+    """Centralized pub/sub dispatcher with bounded subscriber queues."""
+
+    def __init__(
+        self,
+        *,
+        topics: Iterable[str],
+        wildcard_topic: str,
+        logger: Optional[logging.Logger] = None,
+        rate_window: float = 60.0,
+    ) -> None:
+        self._topics: Set[str] = set(topics)
+        self._wildcard = wildcard_topic
+        self._subscribers: MutableMapping[str, List[_SubscriptionState]] = defaultdict(list)
+        self._lock = RLock()
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.events")
+        self._rate_window = rate_window
+        self._remote_history: Deque[float] = deque()
+        self._remote_url = RUNTIME_SETTINGS.remote_event_bus
+        self._rate_limit = max(1, RUNTIME_SETTINGS.event_rate_per_minute)
+
+    # ------------------------------------------------------------------
+    def register_topic(self, topic: str) -> None:
+        """Register ``topic`` to allow future subscriptions."""
+
+        if not topic:
+            raise ValueError("topic must be a non-empty string")
+        with self._lock:
+            self._topics.add(topic)
+
+    # ------------------------------------------------------------------
+    def subscribe(
+        self,
+        topic: str,
+        callback: Subscriber,
+        *,
+        max_pending: int = 32,
+    ) -> Subscription:
+        """Register ``callback`` for ``topic`` with bounded queue backpressure."""
+
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+
+        if topic != self._wildcard and topic not in self._topics:
+            raise ValueError(f"Unsupported topic: {topic!r}")
+
+        if max_pending < 1:
+            raise ValueError("max_pending must be >= 1")
+
+        state = _SubscriptionState(callback, max_pending=max_pending)
+        with self._lock:
+            self._subscribers[topic].append(state)
+
+        self._logger.debug(
+            "Subscribed callback=%r topic=%s max_pending=%s", callback, topic, max_pending
+        )
+        return Subscription(self, topic, state)
+
+    # ------------------------------------------------------------------
+    def publish(self, topic: str, payload: dict) -> None:
+        """Broadcast ``payload`` to subscribers registered for ``topic``."""
+
+        if not isinstance(payload, dict):
+            raise TypeError("payload must be a dictionary")
+
+        if topic not in self._topics:
+            raise ValueError(f"Unsupported topic: {topic!r}")
+
+        enriched_payload = dict(payload)
+        meta = dict(enriched_payload.get("meta", {}))
+        meta.setdefault("offline", RUNTIME_SETTINGS.offline)
+        meta.setdefault("sandbox", RUNTIME_SETTINGS.sandbox)
+        meta.setdefault("share_limit", RUNTIME_SETTINGS.share_limit)
+        meta.setdefault("sentinel_policy", RUNTIME_SETTINGS.sentinel_policy)
+        enriched_payload["meta"] = meta
+
+        deliveries: List[_SubscriptionState] = []
+        with self._lock:
+            listeners = list(self._subscribers.get(topic, ()))
+            wildcard_listeners = list(self._subscribers.get(self._wildcard, ()))
+
+        for state in (*listeners, *wildcard_listeners):
+            should_start = state.enqueue(topic, enriched_payload, logger=self._logger)
+            if should_start:
+                deliveries.append(state)
+
+        subscriber_count = len(listeners) + len(wildcard_listeners)
+        self._logger.info(
+            "Event published topic=%s subscribers=%s keys=%s",
+            topic,
+            subscriber_count,
+            list(enriched_payload.keys()),
+        )
+
+        for state in deliveries:
+            self._drain(state, topic)
+
+        self._fan_out_remote(topic, enriched_payload)
+
+    # ------------------------------------------------------------------
+    def _detach(self, topic: str, state: _SubscriptionState) -> None:
+        with self._lock:
+            listeners = self._subscribers.get(topic)
+            if not listeners:
+                return
+            try:
+                listeners.remove(state)
+            except ValueError:
+                return
+            if not listeners:
+                self._subscribers.pop(topic, None)
+        self._logger.debug("Unsubscribed callback=%r topic=%s", state.callback, topic)
+
+    # ------------------------------------------------------------------
+    def _drain(self, state: _SubscriptionState, topic: str) -> None:
+        while True:
+            payload = state.start_delivery()
+            if payload is None:
+                return
+            try:
+                state.callback(payload)
+            except Exception:  # pragma: no cover - defensive logging
+                self._logger.exception("Error dispatching %s to %r", topic, state.callback)
+            finally:
+                if not state.finish_delivery():
+                    return
+
+    # ------------------------------------------------------------------
+    def _fan_out_remote(self, topic: str, payload: dict) -> None:
+        if not self._remote_url or RUNTIME_SETTINGS.offline:
+            return
+
+        now = time.monotonic()
+        with self._lock:
+            while self._remote_history and now - self._remote_history[0] > self._rate_window:
+                self._remote_history.popleft()
+            if len(self._remote_history) >= self._rate_limit:
+                self._logger.warning(
+                    "Remote event bus limit reached (%s/min) – dropping %s", self._rate_limit, topic
+                )
+                return
+            self._remote_history.append(now)
+
+        self._logger.debug(
+            "Remote fan-out to %s topic=%s payload_keys=%s",
+            self._remote_url,
+            topic,
+            list(payload.keys()),
+        )
 
 
-def subscribe(topic: str, callback: Subscriber) -> Subscription:
+EVENT_DISPATCHER = EventDispatcher(
+    topics=DEFAULT_EVENT_TOPICS,
+    wildcard_topic=_WILDCARD_TOPIC,
+    logger=logging.getLogger(f"{VD_LOGGER_NAME}.events"),
+)
+
+
+def register_topic(topic: str) -> None:
+    """Expose ``topic`` for future subscriptions."""
+
+    EVENT_DISPATCHER.register_topic(topic)
+
+
+def subscribe(topic: str, callback: Subscriber, *, max_pending: int = 32) -> Subscription:
     """Register ``callback`` for ``topic`` and return an unsubscribe handle."""
 
-    if not callable(callback):
-        raise TypeError("callback must be callable")
-    _validate_topic(topic, allow_wildcard=True)
-
-    with _BUS_LOCK:
-        _SUBSCRIBERS[topic].append(callback)
-    return Subscription(topic, callback)
+    return EVENT_DISPATCHER.subscribe(topic, callback, max_pending=max_pending)
 
 
 def publish(topic: str, payload: dict) -> None:
     """Broadcast ``payload`` to subscribers registered for ``topic``."""
 
-    if not isinstance(payload, dict):
-        raise TypeError("payload must be a dictionary")
-    _validate_topic(topic)
-
-    enriched_payload = dict(payload)
-    meta = dict(enriched_payload.get("meta", {}))
-    meta.setdefault("offline", RUNTIME_SETTINGS.offline)
-    meta.setdefault("sandbox", RUNTIME_SETTINGS.sandbox)
-    meta.setdefault("share_limit", RUNTIME_SETTINGS.share_limit)
-    meta.setdefault("sentinel_policy", RUNTIME_SETTINGS.sentinel_policy)
-    enriched_payload["meta"] = meta
-
-    with _BUS_LOCK:
-        listeners = list(_SUBSCRIBERS.get(topic, ()))
-        wildcard_listeners = list(_SUBSCRIBERS.get(_WILDCARD_TOPIC, ()))
-
-    for callback in (*listeners, *wildcard_listeners):
-        try:
-            callback(enriched_payload)
-        except Exception:  # pragma: no cover - defensive logging
-            _BUS_LOGGER.exception("Error dispatching %s to %r", topic, callback)
-
-    if _EVENT_REMOTE_ENABLED:
-        now = time.monotonic()
-        with _BUS_LOCK:
-            while _EVENT_RATE_HISTORY and now - _EVENT_RATE_HISTORY[0] > _EVENT_RATE_WINDOW:
-                _EVENT_RATE_HISTORY.popleft()
-            if len(_EVENT_RATE_HISTORY) >= _EVENT_RATE_LIMIT:
-                _BUS_LOGGER.warning(
-                    "Remote event bus limit reached (%s/min) – dropping %s", _EVENT_RATE_LIMIT, topic
-                )
-                return
-            _EVENT_RATE_HISTORY.append(now)
-        _BUS_LOGGER.debug(
-            "Remote fan-out to %s suppressed=%s payload_keys=%s",
-            _EVENT_REMOTE_URL,
-            RUNTIME_SETTINGS.offline,
-            list(enriched_payload.keys()),
-        )
+    EVENT_DISPATCHER.publish(topic, payload)
 
 
 configure_safety_sentinel(RUNTIME_SETTINGS)
