@@ -1742,6 +1742,7 @@ class BrainShellCrashDialog(QDialog):
         details: str,
         *,
         log_path: Optional[Path] = None,
+        report_path: Optional[Path] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -1790,9 +1791,14 @@ class BrainShellCrashDialog(QDialog):
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        subtitle_text = "A fatal exception was captured. Review the log and details below."
+        subtitle_lines = [
+            "A fatal exception was captured. Review the log and details below.",
+        ]
         if log_path:
-            subtitle_text = f"A fatal exception was captured. System log: {log_path}"
+            subtitle_lines.append(f"System log: {log_path}")
+        if report_path:
+            subtitle_lines.append(f"Crash report: {report_path}")
+        subtitle_text = " \u2022 ".join(subtitle_lines)
         subtitle = QLabel(subtitle_text, self)
         subtitle.setObjectName("CrashSubtitle")
         subtitle.setWordWrap(True)
@@ -1824,6 +1830,78 @@ class BrainShellCrashDialog(QDialog):
         clipboard.setText(self.details.toPlainText())
 
 
+def _flush_logger_handlers(logger: logging.Logger) -> Dict[str, int]:
+    """Flush all handlers on ``logger`` and return success/failure counters."""
+
+    flushed = 0
+    failed = 0
+    for handler in list(logger.handlers):
+        try:
+            handler.flush()
+        except Exception:
+            failed += 1
+            logger.debug("Failed to flush log handler %r", handler, exc_info=True)
+        else:
+            flushed += 1
+    return {"flushed": flushed, "failed": failed}
+
+
+def _write_crash_report(details: str) -> Optional[Path]:
+    """Persist ``details`` to the agent crash-report directory."""
+
+    try:
+        crash_dir = BOOT_ENV.agent_subdir("crashes")
+    except Exception:
+        logging.getLogger(f"{VD_LOGGER_NAME}.crash").debug(
+            "Failed to resolve crash directory",
+            exc_info=True,
+        )
+        return None
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = crash_dir / f"crash-{timestamp}.log"
+    try:
+        path.write_text(details, encoding="utf-8")
+    except Exception:
+        logging.getLogger(f"{VD_LOGGER_NAME}.crash").debug(
+            "Failed to persist crash report",
+            exc_info=True,
+        )
+        return None
+    return path
+
+
+def _emit_cli_crash_banner(
+    details: str,
+    *,
+    report_path: Optional[Path],
+    timestamp: str,
+) -> None:
+    """Print a high-contrast textual crash banner when Qt UI is unavailable."""
+
+    stream = sys.stderr
+    banner = "=" * 72
+    highlight = (
+        "\033[97;41m"
+        if hasattr(stream, "isatty") and stream.isatty()
+        else ""
+    )
+    reset = "\033[0m" if highlight else ""
+    header = f"ACAGi crash captured at {timestamp}"
+    if report_path:
+        header += f" | crash report: {report_path}"
+    try:
+        stream.write(f"{highlight}{banner}{reset}\n")
+        stream.write(f"{highlight}{header}{reset}\n")
+        stream.write(f"{highlight}{banner}{reset}\n")
+        stream.write(details)
+        if not details.endswith("\n"):
+            stream.write("\n")
+        stream.flush()
+    except Exception:
+        pass
+
+
 def install_global_exception_handler(logger: logging.Logger, *, log_path: Optional[Path] = None) -> None:
     """Install a BrainShell-aligned crash handler capturing unhandled exceptions."""
 
@@ -1833,25 +1911,41 @@ def install_global_exception_handler(logger: logging.Logger, *, log_path: Option
 
     def _hook(exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None) -> None:
         logger.error("Unhandled exception in ACAGi", exc_info=(exc_type, exc, tb))
-        for handler in logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                continue
 
         details = "".join(traceback.format_exception(exc_type, exc, tb))
+        report_path = _write_crash_report(details)
+        timestamp = datetime.now(UTC).isoformat()
+
+        coordinator = globals().get("SHUTDOWN_COORDINATOR")
+        if coordinator is not None:
+            try:
+                coordinator.run(
+                    reason="crash",
+                    extra_context={
+                        "exception": exc_type.__name__,
+                        "crash_report": str(report_path) if report_path else None,
+                    },
+                    force=True,
+                )
+            except Exception:
+                logger.error("Crash-time shutdown coordination failed", exc_info=True)
+
+        _flush_logger_handlers(logger)
+
         app = QApplication.instance()
         if app is None:
-            try:
-                stderr = sys.stderr
-                stderr.write("Unhandled exception in ACAGi.\n")
-                stderr.write(details)
-                stderr.flush()
-            except Exception:
-                pass
+            _emit_cli_crash_banner(
+                details,
+                report_path=report_path,
+                timestamp=timestamp,
+            )
         else:
             try:
-                dialog = BrainShellCrashDialog(details, log_path=log_path)
+                dialog = BrainShellCrashDialog(
+                    details,
+                    log_path=log_path,
+                    report_path=report_path,
+                )
                 dialog.exec()
             except Exception:
                 logger.error("Failed to display BrainShell crash dialog", exc_info=True)
@@ -3894,6 +3988,14 @@ class _SubscriptionState:
             self.delivering = False
             return False
 
+    def snapshot(self) -> Dict[str, int]:
+        """Return queued item and drop counters for telemetry."""
+
+        with self.lock:
+            queued = len(self.queue)
+            dropped = self.dropped
+        return {"queued": queued, "dropped": dropped}
+
 
 class Subscription:
     """Handle returned from :func:`subscribe` that can detach a listener."""
@@ -4096,6 +4198,76 @@ class EventDispatcher:
             topic,
             list(payload.keys()),
         )
+
+    # ------------------------------------------------------------------
+    def pending_snapshot(self) -> Dict[str, Any]:
+        """Return aggregate queue/dropped metrics for all subscribers."""
+
+        with self._lock:
+            items = list(self._subscribers.items())
+
+        topics: Dict[str, Dict[str, int]] = {}
+        total_queued = 0
+        total_drops = 0
+        for topic, states in items:
+            queued_sum = 0
+            drop_sum = 0
+            hot = 0
+            for state in states:
+                metrics = state.snapshot()
+                queued_sum += metrics["queued"]
+                drop_sum += metrics["dropped"]
+                if metrics["queued"]:
+                    hot += 1
+            if queued_sum or drop_sum:
+                topics[topic] = {
+                    "queued": queued_sum,
+                    "drops": drop_sum,
+                    "active_subscribers": hot,
+                    "total_subscribers": len(states),
+                }
+            total_queued += queued_sum
+            total_drops += drop_sum
+
+        return {
+            "total_queued": total_queued,
+            "total_drops": total_drops,
+            "topics": topics,
+        }
+
+    # ------------------------------------------------------------------
+    def flush(self, *, wait: float = 1.0, poll_interval: float = 0.05) -> Dict[str, Any]:
+        """Drain queued events for all subscribers before shutdown."""
+
+        before = self.pending_snapshot()
+        deadline = time.monotonic() + max(0.0, wait)
+        iterations = 0
+
+        while True:
+            drained_any = False
+            with self._lock:
+                snapshot = [
+                    (topic, state)
+                    for topic, states in self._subscribers.items()
+                    for state in states
+                ]
+
+            for topic, state in snapshot:
+                with state.lock:
+                    if not state.queue:
+                        continue
+                    state.delivering = True
+                drained_any = True
+                self._drain(state, topic)
+
+            if not drained_any or time.monotonic() >= deadline:
+                break
+
+            iterations += 1
+            time.sleep(max(0.0, poll_interval))
+
+        after = self.pending_snapshot()
+        return {"before": before, "after": after, "iterations": iterations}
 
 
 EVENT_DISPATCHER = EventDispatcher(
@@ -11676,6 +11848,17 @@ class DurableMemoryStore:
 
         return self.lessons.get(anchor)
 
+    def persist(self) -> Dict[str, Any]:
+        """Persist the in-memory payload to disk for safe shutdown."""
+
+        with self._lock:
+            self._persist()
+        return {
+            "path": str(self.path),
+            "count": len(self.lessons),
+            "session_entries": len(self.session_entries),
+        }
+
     def upsert_lesson(
         self,
         *,
@@ -11880,6 +12063,12 @@ class InstructionInboxStore:
         self._order = [existing for existing in self._order if existing != item_id]
         self._flush()
         return True
+
+    def flush(self) -> Dict[str, Any]:
+        """Rewrite the inbox JSONL file and report persisted counts."""
+
+        self._flush()
+        return {"path": str(self.path), "items": len(self._order)}
 
     def _coerce(self, payload: Mapping[str, Any]) -> InstructionItem:
         item_id = str(payload.get("id") or uuid.uuid4().hex)
@@ -12086,6 +12275,29 @@ class MemoryServices:
     def append_session_note(self, note: str) -> Dict[str, str]:
         return self.lessons.append_session_note(note)
 
+    def persist_all(self) -> Dict[str, Any]:
+        """Persist lessons and inbox data while refreshing session metadata."""
+
+        summary: Dict[str, Any] = {}
+
+        try:
+            summary["lessons"] = self.lessons.persist()
+        except Exception:
+            self.logger.exception("Failed to persist durable lessons")
+
+        try:
+            summary["inbox"] = self.inbox.flush()
+        except Exception:
+            self.logger.exception("Failed to flush instruction inbox")
+
+        try:
+            self.sessions.refresh()
+            summary["sessions"] = {"tails": len(self.sessions.list_tails())}
+        except Exception:
+            self.logger.exception("Failed to refresh session tails during persist")
+
+        return summary
+
 
 def memory_services() -> MemoryServices:
     """Return the shared memory services singleton, creating it if needed."""
@@ -12118,6 +12330,147 @@ MEMORY_SERVICES = memory_services()
 
 def is_windows() -> bool:
     return os.name == "nt" or platform.system().lower().startswith("win")
+
+
+class ShutdownCoordinator:
+    """Coordinate final flush, persist, and session summary generation."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._executions: Dict[str, Dict[str, Any]] = {}
+        self._note_written = False
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.shutdown")
+
+    def run(
+        self,
+        *,
+        reason: str = "shutdown",
+        extra_context: Optional[Mapping[str, Any]] = None,
+        force: bool = False,
+        record_note: bool = True,
+    ) -> Dict[str, Any]:
+        """Flush event/log buffers, persist memory, and capture a summary note."""
+
+        context: Dict[str, Any] = {
+            "reason": reason,
+            "timestamp": _utc_iso(),
+        }
+        if extra_context:
+            context.update(dict(extra_context))
+
+        with self._lock:
+            if not force and reason in self._executions:
+                return dict(self._executions[reason])
+
+        dispatcher_summary: Optional[Dict[str, Any]] = None
+        try:
+            dispatcher_summary = EVENT_DISPATCHER.flush(wait=1.5)
+        except Exception:
+            self._logger.exception("Failed to flush event dispatcher during shutdown")
+        if dispatcher_summary is not None:
+            context["event_dispatcher"] = dispatcher_summary
+
+        log_summary: Optional[Dict[str, int]] = None
+        try:
+            log_summary = _flush_logger_handlers(shared_logger())
+        except Exception:
+            self._logger.exception("Failed to flush shared logger during shutdown")
+        if log_summary is not None:
+            context["log_handlers"] = log_summary
+
+        memory_summary: Optional[Dict[str, Any]] = None
+        try:
+            memory_summary = memory_services().persist_all()
+        except Exception:
+            self._logger.exception("Failed to persist memory services during shutdown")
+        if memory_summary is not None:
+            context["memory"] = memory_summary
+
+        if record_note and not self._note_written:
+            try:
+                note = _format_shutdown_note(context)
+                append_session_note(note)
+            except Exception:
+                self._logger.exception("Failed to append shutdown session note")
+            else:
+                context["session_note"] = note
+                self._note_written = True
+
+        self._logger.info(
+            "Shutdown coordination completed reason=%s queued_before=%s "
+            "queued_after=%s",
+            reason,
+            dispatcher_summary["before"] if dispatcher_summary else {},
+            dispatcher_summary["after"] if dispatcher_summary else {},
+        )
+
+        with self._lock:
+            self._executions[reason] = dict(context)
+        return context
+
+
+def _format_shutdown_note(summary: Mapping[str, Any]) -> str:
+    """Render a compact shutdown summary string for durable session notes."""
+
+    timestamp = str(summary.get("timestamp") or _utc_iso())
+    reason = str(summary.get("reason") or "shutdown")
+
+    dispatcher = summary.get("event_dispatcher") or {}
+    before = dispatcher.get("before") or {}
+    after = dispatcher.get("after") or {}
+    before_total = int(before.get("total_queued", 0))
+    after_total = int(after.get("total_queued", 0))
+    before_drops = int(before.get("total_drops", 0))
+    after_drops = int(after.get("total_drops", 0))
+
+    log_info = summary.get("log_handlers") or {}
+    flushed = int(log_info.get("flushed", 0))
+    failed = int(log_info.get("failed", 0))
+
+    memory_info = summary.get("memory") or {}
+    lessons = memory_info.get("lessons") or {}
+    lessons_count = int(lessons.get("count", lessons.get("lessons", 0) or 0))
+    inbox = memory_info.get("inbox") or {}
+    inbox_count = int(inbox.get("items", 0))
+    sessions = memory_info.get("sessions") or {}
+    tails = int(sessions.get("tails", 0))
+
+    crash_report = summary.get("crash_report") or summary.get("crash_report_path")
+
+    parts = [
+        f"{timestamp} shutdown={reason}",
+        f"events {before_total}->{after_total}",
+        f"drops {before_drops}->{after_drops}",
+        f"log_handlers flushed={flushed} failed={failed}",
+        f"lessons={lessons_count}",
+        f"inbox_items={inbox_count}",
+        f"session_tails={tails}",
+    ]
+    if crash_report:
+        parts.append(f"crash_report={crash_report}")
+    return " | ".join(parts)
+
+
+SHUTDOWN_COORDINATOR = ShutdownCoordinator()
+
+
+def _shutdown_atexit() -> None:
+    """Best-effort final flush when Python triggers process shutdown."""
+
+    try:
+        SHUTDOWN_COORDINATOR.run(
+            reason="atexit",
+            force=True,
+            record_note=False,
+        )
+    except Exception:
+        logging.getLogger(f"{VD_LOGGER_NAME}.shutdown").exception(
+            "Shutdown coordinator failed during atexit",
+        )
+
+
+atexit.register(_shutdown_atexit)
+
 
 # Ollama
 DEFAULT_CHAT_MODEL = "qwen3:8b"
@@ -20240,7 +20593,17 @@ def main():
 
     widget, _ = build_widget()
     widget.show()
-    sys.exit(app.exec())
+
+    exit_code = 0
+    try:
+        exit_code = app.exec()
+    finally:
+        try:
+            SHUTDOWN_COORDINATOR.run(reason="app-exit")
+        except Exception:
+            logger.exception("Shutdown coordinator failed during app exit")
+
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
