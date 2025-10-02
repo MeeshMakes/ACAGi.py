@@ -23,6 +23,7 @@ import builtins
 import copy
 import ctypes
 import configparser
+import contextlib
 import difflib
 import hashlib
 import importlib
@@ -3118,6 +3119,9 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     "task.diff",
     "task.deleted",
     "task.conversation",
+    "task.bucket",
+    "task.bucket.stage",
+    "task.bucket.error",
     # System coordination and metrics feeds.
     "system.metrics",
     "system.process",
@@ -3427,6 +3431,481 @@ def is_remote_fanout_enabled() -> bool:
     """Return the dispatcher remote fan-out flag for UI consumers."""
 
     return EVENT_DISPATCHER.remote_enabled()
+
+
+class TaskBucketStageStatus(str, Enum):
+    """Enumeration describing lifecycle state for a bucket stage."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class TaskBucketStage(str, Enum):
+    """Ordered lifecycle stages executed by the task bucket pipeline."""
+
+    CAPTURE = "capture"
+    NOTE = "note"
+    BUCKETIZE = "bucketize"
+    ASSEMBLE = "assemble"
+    APPLY = "apply"
+    TEST = "test"
+    VERIFY = "verify"
+    PROMOTE = "promote"
+
+    @property
+    def requires_serialization(self) -> bool:
+        """Return ``True`` when this stage must serialize on file leases."""
+
+        return self in SERIALIZED_BUCKET_STAGES
+
+
+TASK_BUCKET_STAGE_SEQUENCE: Tuple[TaskBucketStage, ...] = (
+    TaskBucketStage.CAPTURE,
+    TaskBucketStage.NOTE,
+    TaskBucketStage.BUCKETIZE,
+    TaskBucketStage.ASSEMBLE,
+    TaskBucketStage.APPLY,
+    TaskBucketStage.TEST,
+    TaskBucketStage.VERIFY,
+    TaskBucketStage.PROMOTE,
+)
+
+
+SERIALIZED_BUCKET_STAGES: Tuple[TaskBucketStage, ...] = (
+    TaskBucketStage.APPLY,
+    TaskBucketStage.TEST,
+    TaskBucketStage.VERIFY,
+)
+
+
+@dataclass(slots=True)
+class TaskBucketStageState:
+    """State container tracking timestamps and errors for each stage."""
+
+    stage: TaskBucketStage
+    status: TaskBucketStageStatus = TaskBucketStageStatus.PENDING
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
+    note: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a serialisable payload for UI/event consumers."""
+
+        payload: Dict[str, Any] = {
+            "stage": self.stage.value,
+            "status": self.status.value,
+        }
+        if self.started_at is not None:
+            payload["started_at"] = float(self.started_at)
+        if self.completed_at is not None:
+            payload["completed_at"] = float(self.completed_at)
+        if self.error is not None:
+            payload["error"] = self.error
+        if self.note is not None:
+            payload["note"] = self.note
+        return payload
+
+
+@dataclass(slots=True)
+class TaskBucket:
+    """Aggregates related tasks flowing through the lifecycle pipeline."""
+
+    identifier: str
+    tasks: List[Task] = field(default_factory=list)
+    created_at: float = field(default_factory=lambda: time.time())
+    touched_files: Set[str] = field(default_factory=set)
+    notes: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    stages: Dict[TaskBucketStage, TaskBucketStageState] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.identifier:
+            raise ValueError("identifier must be provided for TaskBucket")
+        for stage in TASK_BUCKET_STAGE_SEQUENCE:
+            self.stages.setdefault(stage, TaskBucketStageState(stage=stage))
+
+    def add_task(self, task: Task) -> None:
+        """Append ``task`` to this bucket's tracked work items."""
+
+        self.tasks.append(task)
+
+    def add_touched_files(self, files: Iterable[str]) -> None:
+        """Merge ``files`` into the touch set with normalised paths."""
+
+        for path in files:
+            if not path:
+                continue
+            normalised = os.path.normpath(str(path))
+            self.touched_files.add(normalised)
+
+    def update_metadata(self, updates: Mapping[str, Any]) -> None:
+        """Merge ``updates`` into the metadata dictionary."""
+
+        for key, value in updates.items():
+            self.metadata[key] = value
+
+    def stage_state(self, stage: TaskBucketStage) -> TaskBucketStageState:
+        """Return the mutable state object for ``stage``."""
+
+        return self.stages[stage]
+
+    def mark_stage_running(self, stage: TaskBucketStage) -> None:
+        """Mark ``stage`` as running and stamp a start time."""
+
+        state = self.stage_state(stage)
+        state.status = TaskBucketStageStatus.RUNNING
+        if state.started_at is None:
+            state.started_at = float(time.time())
+        state.completed_at = None
+        state.error = None
+
+    def mark_stage_completed(self, stage: TaskBucketStage) -> None:
+        """Mark ``stage`` as completed and record completion time."""
+
+        state = self.stage_state(stage)
+        state.status = TaskBucketStageStatus.COMPLETED
+        state.completed_at = float(time.time())
+
+    def mark_stage_failed(self, stage: TaskBucketStage, exc: BaseException) -> None:
+        """Mark ``stage`` as failed and capture the exception message."""
+
+        state = self.stage_state(stage)
+        state.status = TaskBucketStageStatus.FAILED
+        state.completed_at = float(time.time())
+        state.error = f"{type(exc).__name__}: {exc}"
+
+    def apply_stage_result(
+        self,
+        stage: TaskBucketStage,
+        result: Optional["TaskBucketStageResult"],
+    ) -> None:
+        """Apply result side-effects (files, metadata, notes) to the bucket."""
+
+        if result is None:
+            return
+        if result.touched_files:
+            self.add_touched_files(result.touched_files)
+        if result.metadata:
+            self.update_metadata(result.metadata)
+        if result.note:
+            self.notes.append(result.note)
+            self.stage_state(stage).note = result.note
+
+    @property
+    def current_stage(self) -> TaskBucketStage:
+        """Return the most recently advanced stage for this bucket."""
+
+        for stage in reversed(TASK_BUCKET_STAGE_SEQUENCE):
+            state = self.stage_state(stage)
+            if state.status in {
+                TaskBucketStageStatus.RUNNING,
+                TaskBucketStageStatus.COMPLETED,
+                TaskBucketStageStatus.FAILED,
+            }:
+                return stage
+        return TaskBucketStage.CAPTURE
+
+    @property
+    def failed(self) -> bool:
+        """Return ``True`` when any stage is marked as failed."""
+
+        return any(
+            state.status is TaskBucketStageStatus.FAILED for state in self.stages.values()
+        )
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Return a dictionary suitable for task bucket event publishing."""
+
+        return {
+            "bucket_id": self.identifier,
+            "tasks": [task.to_dict() for task in self.tasks],
+            "touched_files": sorted(self.touched_files),
+            "notes": list(self.notes),
+            "metadata": dict(self.metadata),
+            "stages": {
+                stage.value: state.to_dict() for stage, state in self.stages.items()
+            },
+        }
+
+
+@dataclass(slots=True)
+class TaskBucketStageResult:
+    """Outcome data returned by a lifecycle stage handler."""
+
+    touched_files: Optional[Iterable[str]] = None
+    note: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass(slots=True)
+class TaskBucketStageContext:
+    """Execution context handed to each stage handler."""
+
+    bucket: TaskBucket
+    stage: TaskBucketStage
+    dispatcher: EventDispatcher
+    shared: MutableMapping[str, Any]
+    logger: logging.Logger
+
+    def publish(self, topic: str, payload: Mapping[str, Any]) -> None:
+        """Publish ``payload`` to ``topic`` with bucket metadata attached."""
+
+        enriched = dict(payload)
+        enriched.setdefault("bucket_id", self.bucket.identifier)
+        self.dispatcher.publish(topic, enriched)
+
+
+TaskBucketStageHandler = Callable[
+    [TaskBucketStageContext], Optional[TaskBucketStageResult]
+]
+
+
+@dataclass(slots=True)
+class TaskBucketLifecycleHandlers:
+    """Container bundling callables for each lifecycle stage."""
+
+    capture: TaskBucketStageHandler
+    note: TaskBucketStageHandler
+    bucketize: TaskBucketStageHandler
+    assemble: TaskBucketStageHandler
+    apply: TaskBucketStageHandler
+    test: TaskBucketStageHandler
+    verify: TaskBucketStageHandler
+    promote: TaskBucketStageHandler
+
+    def for_stage(self, stage: TaskBucketStage) -> TaskBucketStageHandler:
+        """Return the handler associated with ``stage``."""
+
+        return getattr(self, stage.name.lower())
+
+
+class TaskBucketLease:
+    """Context manager representing a serialization lease for a bucket."""
+
+    def __init__(
+        self,
+        manager: "TaskBucketSerializationManager",
+        bucket: TaskBucket,
+        stage: TaskBucketStage,
+        files: Tuple[str, ...],
+    ) -> None:
+        self._manager = manager
+        self._bucket = bucket
+        self._stage = stage
+        self._files = files
+
+    def __enter__(self) -> "TaskBucketLease":
+        self._manager._acquire(self._bucket, self._stage, self._files)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        self._manager._release(self._bucket, self._stage, self._files)
+
+
+class TaskBucketSerializationManager:
+    """Coordinate serialization for stages that touch overlapping files."""
+
+    def __init__(self, *, logger: Optional[logging.Logger] = None) -> None:
+        self._lock = RLock()
+        self._condition = threading.Condition(self._lock)
+        self._file_holders: Dict[str, str] = {}
+        self._logger = logger or logging.getLogger(
+            f"{VD_LOGGER_NAME}.tasks.bucket.serialization"
+        )
+
+    def lease(self, bucket: TaskBucket, stage: TaskBucketStage) -> TaskBucketLease:
+        """Return a lease guarding ``stage`` for ``bucket``."""
+
+        if not stage.requires_serialization:
+            raise ValueError(f"Stage {stage.value} does not require serialization")
+        files = tuple(sorted(bucket.touched_files))
+        return TaskBucketLease(self, bucket, stage, files)
+
+    def _acquire(
+        self, bucket: TaskBucket, stage: TaskBucketStage, files: Tuple[str, ...]
+    ) -> None:
+        if not files:
+            self._logger.debug(
+                "Serialization lease skipped stage=%s bucket=%s no files",
+                stage.value,
+                bucket.identifier,
+            )
+            return
+
+        normalised = tuple(os.path.normcase(os.path.normpath(path)) for path in files)
+        with self._condition:
+            while True:
+                conflicts = [
+                    path
+                    for path in normalised
+                    if (holder := self._file_holders.get(path))
+                    and holder != bucket.identifier
+                ]
+                if not conflicts:
+                    for path in normalised:
+                        self._file_holders[path] = bucket.identifier
+                    self._logger.info(
+                        "Lease granted stage=%s bucket=%s files=%s",
+                        stage.value,
+                        bucket.identifier,
+                        list(files),
+                    )
+                    return
+
+                conflict_buckets = sorted(
+                    {
+                        self._file_holders[path]
+                        for path in conflicts
+                        if path in self._file_holders
+                    }
+                )
+                self._logger.info(
+                    "Lease waiting stage=%s bucket=%s conflicts=%s files=%s",
+                    stage.value,
+                    bucket.identifier,
+                    conflict_buckets,
+                    list(files),
+                )
+                self._condition.wait()
+
+    def _release(
+        self, bucket: TaskBucket, stage: TaskBucketStage, files: Tuple[str, ...]
+    ) -> None:
+        if not files:
+            return
+        normalised = tuple(os.path.normcase(os.path.normpath(path)) for path in files)
+        with self._condition:
+            released = False
+            for path in normalised:
+                if self._file_holders.get(path) == bucket.identifier:
+                    released = True
+                    self._file_holders.pop(path, None)
+            if released:
+                self._logger.info(
+                    "Lease released stage=%s bucket=%s files=%s",
+                    stage.value,
+                    bucket.identifier,
+                    list(files),
+                )
+                self._condition.notify_all()
+
+
+class TaskBucketLifecycleRunner:
+    """Execute buckets through the capture→promote lifecycle with logging."""
+
+    def __init__(
+        self,
+        handlers: TaskBucketLifecycleHandlers,
+        *,
+        dispatcher: EventDispatcher = EVENT_DISPATCHER,
+        logger: Optional[logging.Logger] = None,
+        serialization: Optional[TaskBucketSerializationManager] = None,
+    ) -> None:
+        self._handlers = handlers
+        self._dispatcher = dispatcher
+        self._logger = logger or logging.getLogger(f"{VD_LOGGER_NAME}.tasks.bucket")
+        self._serialization = (
+            serialization
+            if serialization is not None
+            else TASK_BUCKET_SERIALIZATION_MANAGER
+        )
+
+    def run(
+        self,
+        bucket: TaskBucket,
+        *,
+        shared: Optional[MutableMapping[str, Any]] = None,
+    ) -> TaskBucket:
+        """Execute the full lifecycle for ``bucket``."""
+
+        shared_context: MutableMapping[str, Any]
+        shared_context = shared if shared is not None else {}
+        for stage in TASK_BUCKET_STAGE_SEQUENCE:
+            handler = self._handlers.for_stage(stage)
+            self._execute_stage(bucket, stage, handler, shared_context)
+
+        self._dispatcher.publish("task.bucket", bucket.to_payload())
+        return bucket
+
+    def _execute_stage(
+        self,
+        bucket: TaskBucket,
+        stage: TaskBucketStage,
+        handler: TaskBucketStageHandler,
+        shared: MutableMapping[str, Any],
+    ) -> None:
+        bucket.mark_stage_running(stage)
+        self._emit_stage_event(bucket, stage)
+
+        lease_cm: contextlib.AbstractContextManager[Any]
+        if stage.requires_serialization:
+            lease_cm = self._serialization.lease(bucket, stage)
+        else:
+            lease_cm = contextlib.nullcontext()
+
+        try:
+            with lease_cm:
+                context = TaskBucketStageContext(
+                    bucket=bucket,
+                    stage=stage,
+                    dispatcher=self._dispatcher,
+                    shared=shared,
+                    logger=self._logger,
+                )
+                result = handler(context)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            bucket.mark_stage_failed(stage, exc)
+            self._emit_stage_event(bucket, stage)
+            self._emit_error_event(bucket, stage, exc)
+            self._logger.exception(
+                "Task bucket stage failed stage=%s bucket=%s",
+                stage.value,
+                bucket.identifier,
+            )
+            raise
+
+        bucket.apply_stage_result(stage, result)
+        bucket.mark_stage_completed(stage)
+        self._emit_stage_event(bucket, stage)
+
+    def _emit_stage_event(self, bucket: TaskBucket, stage: TaskBucketStage) -> None:
+        state = bucket.stage_state(stage)
+        payload = {
+            "bucket_id": bucket.identifier,
+            "stage": stage.value,
+            "status": state.status.value,
+            "started_at": state.started_at,
+            "completed_at": state.completed_at,
+            "note": state.note,
+            "error": state.error,
+            "touched_files": sorted(bucket.touched_files),
+        }
+        self._dispatcher.publish("task.bucket.stage", payload)
+
+    def _emit_error_event(
+        self,
+        bucket: TaskBucket,
+        stage: TaskBucketStage,
+        exc: BaseException,
+    ) -> None:
+        payload = {
+            "bucket_id": bucket.identifier,
+            "stage": stage.value,
+            "error": f"{type(exc).__name__}: {exc}",
+            "touched_files": sorted(bucket.touched_files),
+        }
+        self._dispatcher.publish("task.bucket.error", payload)
+
+
+TASK_BUCKET_SERIALIZATION_MANAGER = TaskBucketSerializationManager()
 
 
 class GateQuotaController:

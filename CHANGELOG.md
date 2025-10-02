@@ -1,4 +1,20 @@
 # Changelog
+## [0.1.19] - 2025-10-08
+### Added
+- Added task bucket lifecycle data classes and orchestration helpers that drive
+  capture→note→bucketize→assemble→apply→test→verify→promote transitions while
+  emitting stage telemetry on new event topics.
+- Exposed a bucket stage context/result API so handlers can enrich metadata,
+  touched files, and notes for downstream observers.
+
+### Changed
+- Introduced a serialization manager that leases Apply/Test/Verify stages when
+  buckets touch overlapping files, maintaining parallelism for upstream
+  assembly work while preventing conflicting writes.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+
 ## [0.1.18] - 2025-10-07
 ### Added
 - Introduced a Cerebellum scheduler and Rationalizer manager that spin up
