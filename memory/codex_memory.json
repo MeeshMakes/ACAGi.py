@@ -51,6 +51,11 @@
       "title": "Operation Policy Enforcement",
       "summary": "SafetyManager consumes policies.json to enforce coder/test allowlists, denylists, approval prompts, and sandbox requirements via run_checked helpers.",
       "applies_to": "operation-safety"
+    },
+    {
+      "title": "Terminal Health & Transcript Capture",
+      "summary": "The terminal widget now drives the bridge LED through a TerminalHealthState machine and lets transcript taps store Hippocampus-backed anchors while logging session JSONL notices.",
+      "applies_to": "terminal-ui"
     }
   ],
   "procedures": [
