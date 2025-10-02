@@ -1,4 +1,18 @@
 # Changelog
+## [0.1.21] - 2025-10-09
+### Added
+- Introduced a ScriptSpeak parser that normalises verbs, arguments, and flags
+  into structured payloads and publishes them on a dedicated `script.command`
+  event stream with session log journaling.
+- Wired macro playbooks and ad-hoc macro events through the parser so queued
+  automation steps emit auditable ScriptSpeak instructions.
+- Extended the Rationalizer manager to forward ScriptSpeak guidance emitted in
+  job results onto the event bus with per-job metadata, enabling automated
+  follow-ups to appear in session transcripts.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+
 ## [0.1.20] - 2025-10-08
 ### Added
 - Implemented coder/test/verifier lifecycle handlers that capture anchored patches
