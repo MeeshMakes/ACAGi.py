@@ -61,6 +61,11 @@
       "title": "Virtual Desktop Dock Integration",
       "summary": "Virtual Desktop features now live in a dockable widget that lazily instantiates consoles, Dev Space tabs, and OCR overlays while consuming event bus updates for tasks, logs, and datasets.",
       "applies_to": "ui-virtual-desktop"
+    },
+    {
+      "title": "Brain Map Dock",
+      "summary": "ACAGi includes a BrainMapDock that lazily renders Hippocampus nodes and typed edges with energy/salience overlays and Dev Space focus callbacks when nodes are selected.",
+      "applies_to": "ui-brain-map"
     }
   ],
   "procedures": [

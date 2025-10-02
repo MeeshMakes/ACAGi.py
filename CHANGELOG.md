@@ -1,4 +1,18 @@
 # Changelog
+## [0.1.14] - 2025-10-05
+### Added
+- Introduced a Brain Map dock that lazily initialises a graphics scene to render
+  Hippocampus nodes and typed edges with energy/salience overlays and Dev Space
+  activation callbacks.
+- Added energy heatmap, queue depth, and error ray toggles so operators can
+  spotlight different operational metrics while reviewing the graph.
+
+### Changed
+- Linked the Brain Map dock with the Virtual Desktop focus helper to jump into
+  Dev Space diagnostics whenever a node is selected.
+- Ensured theme/settings reloads refresh the Brain Map registry reference and
+  exposed a View menu toggle alongside other investigative docks.
+
 ## [0.1.13] - 2025-10-05
 ### Added
 - Introduced a Log Observatory dock that tails the shared system log, scans

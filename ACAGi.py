@@ -119,6 +119,7 @@ from PySide6.QtGui import (
     QTextCursor,
     QTextDocument,
     QMovie,
+    QPen,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -156,6 +157,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QStatusBar,
     QSplitter,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsLineItem,
+    QGraphicsTextItem,
 )
 
 
@@ -4886,6 +4893,34 @@ class VirtualDesktopDock(QDockWidget):
         layout.addWidget(self._ocr_history_list, 1)
 
     # ------------------------------------------------------------------
+    def focus_devspace(
+        self,
+        node_id: Optional[str] = None,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Surface the Dev Space tab in response to external activation."""
+
+        self.show()
+        self.raise_()
+        self._ensure_devspace_panel()
+        self._main_tabs.setCurrentWidget(self._devspace_tab)
+
+        if payload and self._dev_logs_view is not None:
+            label = str(payload.get("label") or payload.get("core", {}).get("label") or "")
+            timestamp = datetime.now(UTC).strftime("%H:%M:%S")
+            summary = label or payload.get("anchor") or node_id or "brain-node"
+            message = f"[{timestamp}] Brain map focus → {summary}"
+            self._dev_logs_view.appendPlainText(message)
+
+        self._logger.info(
+            "Dev Space focused from brain map",
+            extra={
+                "event": "brain_map.devspace_focus",
+                "node": node_id,
+            },
+        )
+
+    # ------------------------------------------------------------------
     def _make_callback(self, topic: str) -> Callable[[dict], None]:
         def _callback(payload: dict) -> None:
             snapshot = dict(payload)
@@ -5224,6 +5259,450 @@ class VirtualDesktopDock(QDockWidget):
                     "Failed to unsubscribe %s", topic, exc_info=True
                 )
         self._subscriptions.clear()
+
+
+# ============================================================================
+# Brain map dock
+# ============================================================================
+
+
+class BrainNodeItem(QGraphicsEllipseItem):
+    """Interactive graphics item representing a brain map node."""
+
+    def __init__(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+        radius: float,
+        *,
+        color: QColor,
+        border_color: QColor,
+        border_width: float,
+        click_handler: Optional[Callable[[str, Mapping[str, Any]], None]] = None,
+    ) -> None:
+        super().__init__(-radius, -radius, 2.0 * radius, 2.0 * radius)
+        self.node_id = node_id
+        self.payload = dict(payload)
+        self._click_handler = click_handler
+
+        pen = QPen(border_color)
+        pen.setWidthF(max(1.0, border_width))
+        self.setPen(pen)
+        self.setBrush(color)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+
+        tooltip_lines = [f"Node: {node_id}"]
+        label = str(payload.get("label") or payload.get("core", {}).get("label") or "")
+        if label:
+            tooltip_lines.append(f"Label: {label}")
+        energy = BrainMapDock.extract_metric(payload, "energy", "activation")
+        salience = BrainMapDock.extract_metric(payload, "salience", "priority")
+        if energy is not None:
+            tooltip_lines.append(f"Energy: {energy:.3f}")
+        if salience is not None:
+            tooltip_lines.append(f"Salience: {salience:.3f}")
+        queue_depth = BrainMapDock.extract_metric(payload, "queue_depth", "queue_size")
+        if queue_depth is not None:
+            tooltip_lines.append(f"Queue depth: {int(queue_depth)}")
+        meta = payload.get("metadata")
+        if isinstance(meta, Mapping) and meta.get("source_path"):
+            tooltip_lines.append(f"Source: {meta['source_path']}")
+        self.setToolTip("\n".join(tooltip_lines))
+
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton and self._click_handler:
+            try:
+                self._click_handler(self.node_id, self.payload)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Brain map node activation failed: %s", self.node_id
+                )
+
+
+class BrainMapDock(QDockWidget):
+    """Dockable brain map visualiser with lazy scene initialisation."""
+
+    _REFRESH_INTERVAL_MS = 4_000
+    _NODE_RADIUS = 26.0
+
+    def __init__(
+        self,
+        brain_registry: Optional[BrainMapRegistry],
+        devspace_callback: Optional[Callable[[str, Mapping[str, Any]], None]],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Brain Map", parent)
+        self.setObjectName("BrainMapDock")
+        self.setAllowedAreas(
+            Qt.LeftDockWidgetArea
+            | Qt.RightDockWidgetArea
+            | Qt.BottomDockWidgetArea
+        )
+        self.toggleViewAction().setText("Brain Map")
+
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.brain_map")
+        self._brain_registry = brain_registry
+        self._devspace_callback = devspace_callback
+        self._scene: Optional[QGraphicsScene] = None
+        self._view: Optional[QGraphicsView] = None
+        self._canvas_host: Optional[QWidget] = None
+        self._canvas_layout: Optional[QVBoxLayout] = None
+        self._placeholder: Optional[QLabel] = None
+        self._initialized = False
+        self._current_snapshot: Dict[str, Any] = {"nodes": {}, "edges": []}
+        self._last_render_key: str = ""
+
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        intro = QLabel(
+            "Brain map rendering is deferred until the dock becomes visible so "
+            "the workspace launches quickly.",
+            container,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(8)
+        self._energy_toggle = QCheckBox("Energy heatmap", container)
+        self._energy_toggle.setChecked(True)
+        self._energy_toggle.toggled.connect(self._on_overlay_changed)
+        toggle_row.addWidget(self._energy_toggle)
+        self._queue_toggle = QCheckBox("Queue depth", container)
+        self._queue_toggle.toggled.connect(self._on_overlay_changed)
+        toggle_row.addWidget(self._queue_toggle)
+        self._error_toggle = QCheckBox("Error rays", container)
+        self._error_toggle.toggled.connect(self._on_overlay_changed)
+        toggle_row.addWidget(self._error_toggle)
+        toggle_row.addStretch(1)
+        layout.addLayout(toggle_row)
+
+        self._status_label = QLabel("Brain map idle.", container)
+        layout.addWidget(self._status_label)
+
+        self._placeholder = QLabel(
+            "Brain map will initialise when shown.",
+            container,
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._placeholder, 1)
+
+        self._canvas_host = QWidget(container)
+        self._canvas_host.setVisible(False)
+        self._canvas_layout = QVBoxLayout(self._canvas_host)
+        self._canvas_layout.setContentsMargins(0, 0, 0, 0)
+        self._canvas_layout.setSpacing(0)
+        layout.addWidget(self._canvas_host, 1)
+
+        self.setWidget(container)
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(self._REFRESH_INTERVAL_MS)
+        self._refresh_timer.timeout.connect(self._refresh_brain_snapshot)
+        self.visibilityChanged.connect(self._on_visibility_changed)
+
+    # ------------------------------------------------------------------
+    def set_brain_registry(self, registry: Optional[BrainMapRegistry]) -> None:
+        """Update the backing registry reference used for snapshots."""
+
+        self._brain_registry = registry
+        if self.isVisible():
+            self._refresh_brain_snapshot(force=True)
+
+    # ------------------------------------------------------------------
+    def _on_visibility_changed(self, visible: bool) -> None:
+        if visible:
+            self._ensure_initialized()
+            self._refresh_brain_snapshot(force=True)
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
+        else:
+            self._refresh_timer.stop()
+
+    # ------------------------------------------------------------------
+    def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        if not self._canvas_host or not self._canvas_layout:
+            return
+        self._scene = QGraphicsScene(self)
+        self._view = QGraphicsView(self._scene, self._canvas_host)
+        self._view.setRenderHint(QPainter.Antialiasing, True)
+        self._view.setRenderHint(QPainter.TextAntialiasing, True)
+        self._view.setDragMode(QGraphicsView.ScrollHandDrag)
+        self._view.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self._canvas_layout.addWidget(self._view, 1)
+        if self._placeholder:
+            self._placeholder.hide()
+        self._canvas_host.show()
+        self._initialized = True
+
+    # ------------------------------------------------------------------
+    def _on_overlay_changed(self) -> None:
+        if not self._initialized:
+            return
+        self._render_snapshot(self._current_snapshot, force=True)
+
+    # ------------------------------------------------------------------
+    def _refresh_brain_snapshot(self, force: bool = False) -> None:
+        if not self._initialized:
+            self._ensure_initialized()
+        if not self._brain_registry:
+            self._status_label.setText("Brain map registry unavailable.")
+            return
+        snapshot = self._brain_registry.snapshot()
+        if not isinstance(snapshot, dict):
+            snapshot = {"nodes": {}, "edges": []}
+        nodes = snapshot.get("nodes")
+        edges = snapshot.get("edges")
+        if not isinstance(nodes, Mapping):
+            nodes = {}
+        if not isinstance(edges, list):
+            edges = []
+        sanitized = {"nodes": dict(nodes), "edges": list(edges)}
+        digest = hashlib.sha1(
+            json.dumps(sanitized, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if not force and digest == self._last_render_key:
+            return
+        self._current_snapshot = sanitized
+        self._last_render_key = digest
+        self._render_snapshot(sanitized, force=True)
+
+    # ------------------------------------------------------------------
+    def _render_snapshot(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
+        if not self._scene or not self._view:
+            return
+        nodes = snapshot.get("nodes")
+        edges = snapshot.get("edges")
+        if not isinstance(nodes, Mapping):
+            nodes = {}
+        if not isinstance(edges, Sequence):
+            edges = []
+        self._scene.clear()
+        if not nodes:
+            self._status_label.setText("No brain nodes recorded yet.")
+            return
+        positions = self._layout_nodes(nodes)
+        self._render_edges(edges, positions)
+        self._render_nodes(nodes, positions)
+        self._update_scene_bounds(positions)
+        self._status_label.setText(
+            f"Nodes: {len(nodes)} • Edges: {len(list(edges))}"
+        )
+
+    # ------------------------------------------------------------------
+    def _render_edges(
+        self,
+        edges: Sequence[Mapping[str, Any]],
+        positions: Mapping[str, Tuple[float, float]],
+    ) -> None:
+        if not self._scene:
+            return
+        base_pen = QPen(QColor("#5f6b7c"))
+        base_pen.setWidthF(1.2)
+        for entry in edges:
+            if not isinstance(entry, Mapping):
+                continue
+            source = entry.get("source")
+            target = entry.get("target")
+            if source not in positions or target not in positions:
+                continue
+            sx, sy = positions[source]
+            tx, ty = positions[target]
+            line = QGraphicsLineItem(sx, sy, tx, ty)
+            line.setPen(base_pen)
+            self._scene.addItem(line)
+            relation = str(entry.get("relation") or "").strip()
+            if relation:
+                label = QGraphicsTextItem(relation)
+                label.setDefaultTextColor(QColor("#d0d6e2"))
+                mid_x = (sx + tx) / 2.0
+                mid_y = (sy + ty) / 2.0
+                label.setPos(mid_x + 6, mid_y + 6)
+                self._scene.addItem(label)
+
+    # ------------------------------------------------------------------
+    def _render_nodes(
+        self,
+        nodes: Mapping[str, Mapping[str, Any]],
+        positions: Mapping[str, Tuple[float, float]],
+    ) -> None:
+        if not self._scene:
+            return
+        queue_enabled = self._queue_toggle.isChecked()
+        error_enabled = self._error_toggle.isChecked()
+        for node_id, payload in nodes.items():
+            if node_id not in positions or not isinstance(payload, Mapping):
+                continue
+            x, y = positions[node_id]
+            energy = self.extract_metric(payload, "energy", "activation")
+            salience = self.extract_metric(payload, "salience", "priority")
+            color = self._node_color(energy)
+            if not self._energy_toggle.isChecked():
+                color = QColor("#3d7eff")
+            border_color = QColor("#1b2030")
+            border_width = 1.6 + (salience or 0.0)
+            item = BrainNodeItem(
+                node_id,
+                payload,
+                self._NODE_RADIUS,
+                color=color,
+                border_color=border_color,
+                border_width=border_width,
+                click_handler=self._handle_node_activation,
+            )
+            item.setPos(x, y)
+            self._scene.addItem(item)
+            if queue_enabled:
+                queue_depth = self.extract_metric(
+                    payload,
+                    "queue_depth",
+                    "queue_size",
+                )
+                if queue_depth is not None:
+                    queue_label = QGraphicsTextItem(f"Q:{int(queue_depth)}")
+                    queue_label.setDefaultTextColor(QColor("#f0f3ff"))
+                    queue_label.setPos(x + self._NODE_RADIUS + 4.0, y - 6.0)
+                    self._scene.addItem(queue_label)
+            if error_enabled and self._has_error(payload):
+                ray = QGraphicsLineItem(
+                    x,
+                    y - self._NODE_RADIUS,
+                    x,
+                    y - (self._NODE_RADIUS + 22.0),
+                )
+                pen = QPen(QColor("#ff4d67"))
+                pen.setWidthF(2.4)
+                ray.setPen(pen)
+                self._scene.addItem(ray)
+
+    # ------------------------------------------------------------------
+    def _update_scene_bounds(
+        self, positions: Mapping[str, Tuple[float, float]]
+    ) -> None:
+        if not self._scene or not self._view or not positions:
+            return
+        xs = [pos[0] for pos in positions.values()]
+        ys = [pos[1] for pos in positions.values()]
+        margin = self._NODE_RADIUS * 3.0
+        rect = QRectF(
+            min(xs) - margin,
+            min(ys) - margin,
+            (max(xs) - min(xs)) + margin * 2.0,
+            (max(ys) - min(ys)) + margin * 2.0,
+        )
+        self._scene.setSceneRect(rect)
+        self._view.fitInView(rect, Qt.KeepAspectRatio)
+
+    # ------------------------------------------------------------------
+    def _layout_nodes(
+        self, nodes: Mapping[str, Mapping[str, Any]]
+    ) -> Dict[str, Tuple[float, float]]:
+        count = len(nodes)
+        if count == 0:
+            return {}
+        radius = max(140.0, self._NODE_RADIUS * max(3.0, math.sqrt(count)))
+        positions: Dict[str, Tuple[float, float]] = {}
+        for index, node_id in enumerate(sorted(nodes.keys())):
+            angle = (2.0 * math.pi * index) / max(1, count)
+            x = radius * math.cos(angle)
+            y = radius * math.sin(angle)
+            positions[node_id] = (x, y)
+        return positions
+
+    # ------------------------------------------------------------------
+    def _node_color(self, energy: Optional[float]) -> QColor:
+        cold = QColor("#2a4d8f")
+        hot = QColor("#ff6f3c")
+        if energy is None or not math.isfinite(energy):
+            return cold
+        normalized = max(0.0, min(1.0, float(energy)))
+        return QColor(
+            int(cold.red() + (hot.red() - cold.red()) * normalized),
+            int(cold.green() + (hot.green() - cold.green()) * normalized),
+            int(cold.blue() + (hot.blue() - cold.blue()) * normalized),
+        )
+
+    # ------------------------------------------------------------------
+    def _handle_node_activation(
+        self, node_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        self._logger.info(
+            "Brain map node activated",
+            extra={
+                "event": "brain_map.node_activated",
+                "node": node_id,
+                "metadata": self._safe_metadata(payload),
+            },
+        )
+        if self._devspace_callback:
+            self._devspace_callback(node_id, payload)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def extract_metric(
+        payload: Mapping[str, Any],
+        *keys: str,
+    ) -> Optional[float]:
+        for key in keys:
+            for container in (payload, payload.get("metadata")):
+                if not isinstance(container, Mapping):
+                    continue
+                value = container.get(key)
+                if value is None:
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(number):
+                    return number
+        return None
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _has_error(payload: Mapping[str, Any]) -> bool:
+        metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
+        for container in (payload, metadata):
+            if not isinstance(container, Mapping):
+                continue
+            if container.get("last_error"):
+                return True
+            errors = container.get("errors")
+            if isinstance(errors, Sequence) and errors:
+                return True
+            count = container.get("error_count")
+            try:
+                if count is not None and float(count) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_metadata(payload: Mapping[str, Any]) -> Dict[str, Any]:
+        metadata = payload.get("metadata") if isinstance(payload, Mapping) else {}
+        if not isinstance(metadata, Mapping):
+            return {}
+        safe: Dict[str, Any] = {}
+        for key in ("source_path", "energy", "salience", "queue_depth"):
+            if key in metadata:
+                safe[key] = metadata[key]
+        return safe
 
 
 # ============================================================================
@@ -14342,6 +14821,14 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self.virtual_desktop_dock)
         self.virtual_desktop_dock.hide()
         self.tabifyDockWidget(self.dataset_dock, self.virtual_desktop_dock)
+        self.brain_map_dock = BrainMapDock(
+            getattr(self.chat, "brain_map", None),
+            self._activate_devspace_from_brain,
+            self,
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, self.brain_map_dock)
+        self.brain_map_dock.hide()
+        self.tabifyDockWidget(self.virtual_desktop_dock, self.brain_map_dock)
         safety_manager.set_confirmer(self._confirm_risky_command)
         self.status_indicator: QStatusBar = self.statusBar()
         self._refresh_status_bar()
@@ -14375,7 +14862,28 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.fullscreen_act)
         view_menu.addAction(self.dataset_dock.toggleViewAction())
         view_menu.addAction(self.virtual_desktop_dock.toggleViewAction())
+        view_menu.addAction(self.brain_map_dock.toggleViewAction())
         view_menu.addAction(self.log_dock.toggleViewAction())
+
+    def _activate_devspace_from_brain(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Focus the Virtual Desktop Dev Space for a selected brain node."""
+
+        if hasattr(self, "virtual_desktop_dock"):
+            try:
+                self.virtual_desktop_dock.focus_devspace(node_id, payload)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to focus Dev Space for node %s", node_id
+                )
+        if hasattr(self, "brain_map_dock"):
+            try:
+                self.brain_map_dock.raise_()
+            except Exception:
+                pass
 
     def _init_shortcuts(self):
         focus_input = QAction(self); focus_input.setShortcut(QKeySequence("Ctrl+`"))
@@ -14464,6 +14972,12 @@ class MainWindow(QMainWindow):
             self.setCentralWidget(self.desktop)
         if hasattr(self, "dataset_dock"):
             self.dataset_dock.set_chat_card(self.chat)
+        if hasattr(self, "virtual_desktop_dock"):
+            self.virtual_desktop_dock.set_chat_card(self.chat)
+        if hasattr(self, "brain_map_dock"):
+            self.brain_map_dock.set_brain_registry(
+                getattr(self.chat, "brain_map", None)
+            )
 
     @Slot()
     def _open_settings(self):
@@ -14582,6 +15096,10 @@ class MainWindow(QMainWindow):
                 self.dataset_dock.set_chat_card(self.chat)
             if hasattr(self, "virtual_desktop_dock"):
                 self.virtual_desktop_dock.set_chat_card(self.chat)
+            if hasattr(self, "brain_map_dock"):
+                self.brain_map_dock.set_brain_registry(
+                    getattr(self.chat, "brain_map", None)
+                )
             configure_safety_sentinel(self.feature_flags)
             self._refresh_status_bar()
 
