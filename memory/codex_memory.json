@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-01",
+  "last_updated": "2025-10-05",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -56,6 +56,11 @@
       "title": "Terminal Health & Transcript Capture",
       "summary": "The terminal widget now drives the bridge LED through a TerminalHealthState machine and lets transcript taps store Hippocampus-backed anchors while logging session JSONL notices.",
       "applies_to": "terminal-ui"
+    },
+    {
+      "title": "Virtual Desktop Dock Integration",
+      "summary": "Virtual Desktop features now live in a dockable widget that lazily instantiates consoles, Dev Space tabs, and OCR overlays while consuming event bus updates for tasks, logs, and datasets.",
+      "applies_to": "ui-virtual-desktop"
     }
   ],
   "procedures": [

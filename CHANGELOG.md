@@ -1,4 +1,12 @@
 # Changelog
+## [0.1.12] - 2025-10-05
+### Added
+- Introduced a Virtual Desktop dock that lazily initializes consoles, Dev Space
+  tabs, and OCR overlays while streaming event bus updates into the UI.
+
+### Changed
+- Replaced the standalone TerminalDesktop central widget with the new dock,
+  wiring live task/log/dataset refreshes and view menu toggles for operators.
 
 ## [0.1.11] - 2025-10-05
 ### Added
