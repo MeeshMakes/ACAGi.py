@@ -1,0 +1,75 @@
+{
+  "version": "0.1.0",
+  "operations": {
+    "coder": {
+      "allow": [
+        "python",
+        "pip",
+        "pip3",
+        "pytest",
+        "ruff",
+        "black",
+        "mypy",
+        "npm",
+        "yarn",
+        "pnpm",
+        "node",
+        "cargo",
+        "go",
+        "mvn",
+        "gradle",
+        "make",
+        "git"
+      ],
+      "deny": [
+        "rm",
+        "sudo",
+        "chmod",
+        "chown",
+        "mkfs"
+      ],
+      "approval": [
+        "git"
+      ],
+      "sandbox_modes": [
+        "isolated",
+        "restricted"
+      ],
+      "notes": "Coder operations must run in restricted sandboxes and request approval before mutating repositories."
+    },
+    "test": {
+      "allow": [
+        "python",
+        "pytest",
+        "tox",
+        "npm",
+        "yarn",
+        "pnpm",
+        "bun",
+        "go",
+        "cargo",
+        "mvn",
+        "gradle",
+        "node",
+        "make"
+      ],
+      "deny": [
+        "rm",
+        "sudo",
+        "mkfs"
+      ],
+      "approval": [],
+      "sandbox_modes": [
+        "isolated",
+        "restricted",
+        "trusted"
+      ],
+      "notes": "Test operations focus on non-destructive tooling; destructive commands remain blocked."
+    }
+  },
+  "metadata": {
+    "generated": "repository default",
+    "updated": "2025-10-04",
+    "description": "Policies used by the safety manager to gate coder and tester operations."
+  }
+}

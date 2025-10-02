@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt
 
 import argparse
 import ast
+import atexit
 import base64
 import builtins
 import copy
@@ -279,6 +280,8 @@ class SafetyManager:
             re.compile(r"\bformat\s+[A-Za-z]:"),
             re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*;\s*\}\s*;\s*:"),
         )
+        self._operation_policies: Dict[str, "OperationPolicy"] = {}
+        self._runtime_settings: Optional["RuntimeSettings"] = None
 
     def install_file_guard(self) -> None:
         """Monkey patch :func:`open` so destructive writes are intercepted."""
@@ -341,13 +344,30 @@ class SafetyManager:
         with self._lock:
             self._confirmer = callback
 
-    def ensure_command_allowed(self, cmd: Sequence[str]) -> None:
+    def set_operation_policies(
+        self, policies: Mapping[str, "OperationPolicy"]
+    ) -> None:
+        with self._lock:
+            self._operation_policies = {
+                key.lower(): value for key, value in policies.items()
+            }
+
+    def set_runtime_settings(self, settings: "RuntimeSettings") -> None:
+        with self._lock:
+            self._runtime_settings = settings
+
+    def ensure_command_allowed(
+        self, cmd: Sequence[str], *, operation: Optional[str] = None
+    ) -> None:
         if not cmd:
             return
 
         canonical = [str(part) for part in cmd]
         joined = shlex.join(canonical)
         lowered = joined.lower()
+
+        if operation:
+            self._enforce_operation_policy(operation, canonical)
 
         reason = self._match_risky(lowered, canonical)
         if not reason:
@@ -374,6 +394,67 @@ class SafetyManager:
             return
 
         message = f"[SAFETY] Blocked command: {joined}"
+        self._dispatch(message)
+        raise SafetyViolation(message)
+
+    def _enforce_operation_policy(
+        self, operation: str, canonical: Sequence[str]
+    ) -> None:
+        with self._lock:
+            policy = self._operation_policies.get(operation.lower())
+            runtime = self._runtime_settings
+
+        if policy is None:
+            return
+
+        command_name = Path(canonical[0]).name.lower()
+        if command_name in policy.deny_commands:
+            message = (
+                f"[POLICY] {operation} denylist violation: {shlex.join(canonical)}"
+            )
+            self._dispatch(message)
+            raise SafetyViolation(message)
+
+        reasons: List[str] = []
+        if policy.allow_commands and command_name not in policy.allow_commands:
+            reasons.append("command not allowlisted")
+
+        if command_name in policy.approval_commands:
+            reasons.append("command requires manual approval")
+
+        if policy.sandbox_modes:
+            current_mode = (runtime.sandbox if runtime else "trusted").lower()
+            if current_mode not in policy.sandbox_modes:
+                allowed = ", ".join(sorted(policy.sandbox_modes))
+                reasons.append(
+                    f"sandbox must be one of [{allowed}] (current={current_mode})"
+                )
+
+        if reasons:
+            reason_text = "; ".join(reasons)
+            self._request_policy_approval(operation, canonical, reason_text)
+
+    def _request_policy_approval(
+        self, operation: str, canonical: Sequence[str], reason: str
+    ) -> None:
+        joined = shlex.join(canonical)
+        prompt = f"[POLICY] {operation}: {reason}: {joined}"
+        self._dispatch(prompt)
+
+        allow = False
+        callback = self._confirmer
+        if callback is not None:
+            try:
+                allow = bool(callback(prompt, tuple(canonical)))
+            except Exception as exc:  # pragma: no cover - defensive
+                self._dispatch(f"[POLICY] Approval handler failed: {exc}")
+                allow = False
+
+        if allow:
+            self._dispatch(f"[POLICY] Approved: {joined}")
+            return
+
+        message = f"[POLICY] Blocked command: {joined}"
         self._dispatch(message)
         raise SafetyViolation(message)
 
@@ -1856,6 +1937,139 @@ class RuntimeSettings:
     remote_sentinel: str = ""
 
 
+POLICIES_FILENAME = "policies.json"
+
+DEFAULT_POLICY_BUNDLE: Mapping[str, Any] = {
+    "version": "0.1.0",
+    "operations": {
+        "coder": {
+            "allow": [
+                "python",
+                "pip",
+                "pip3",
+                "pytest",
+                "ruff",
+                "black",
+                "mypy",
+                "npm",
+                "yarn",
+                "pnpm",
+                "node",
+                "cargo",
+                "go",
+                "mvn",
+                "gradle",
+                "make",
+                "git",
+            ],
+            "deny": ["rm", "sudo", "chmod", "chown", "mkfs"],
+            "approval": ["git"],
+            "sandbox_modes": ["isolated", "restricted"],
+            "notes": (
+                "Coder operations must run in restricted sandboxes and prompt before "
+                "mutating repositories."
+            ),
+        },
+        "test": {
+            "allow": [
+                "python",
+                "pytest",
+                "tox",
+                "npm",
+                "yarn",
+                "pnpm",
+                "bun",
+                "go",
+                "cargo",
+                "mvn",
+                "gradle",
+                "node",
+                "make",
+            ],
+            "deny": ["rm", "sudo", "mkfs"],
+            "approval": [],
+            "sandbox_modes": ["isolated", "restricted", "trusted"],
+            "notes": "Tests should stay non-destructive; blocked commands remain explicit.",
+        },
+    },
+    "metadata": {"generated": "default"},
+}
+
+
+@dataclass(frozen=True, slots=True)
+class OperationPolicy:
+    """Allowlist, denylist, and sandbox requirements for an operation."""
+
+    name: str
+    allow_commands: frozenset[str] = field(default_factory=frozenset)
+    deny_commands: frozenset[str] = field(default_factory=frozenset)
+    approval_commands: frozenset[str] = field(default_factory=frozenset)
+    sandbox_modes: frozenset[str] = field(default_factory=frozenset)
+    notes: str = ""
+
+    @classmethod
+    def from_mapping(cls, name: str, payload: Mapping[str, Any]) -> "OperationPolicy":
+        def _normalize(values: Any) -> frozenset[str]:
+            if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
+                return frozenset()
+            cleaned = {
+                str(value).strip().lower() for value in values if str(value).strip()
+            }
+            return frozenset(cleaned)
+
+        allow = _normalize(payload.get("allow"))
+        deny = _normalize(payload.get("deny"))
+        approval = _normalize(payload.get("approval"))
+        sandbox = _normalize(payload.get("sandbox_modes"))
+        notes = str(payload.get("notes") or "").strip()
+        return cls(
+            name=name,
+            allow_commands=allow,
+            deny_commands=deny,
+            approval_commands=approval,
+            sandbox_modes=sandbox,
+            notes=notes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyBundle:
+    """Structured policies derived from ``policies.json``."""
+
+    version: str
+    operations: Dict[str, OperationPolicy]
+    source_path: Optional[Path] = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(
+        cls, payload: Mapping[str, Any], *, source_path: Optional[Path] = None
+    ) -> "PolicyBundle":
+        version = str(payload.get("version") or "0.0.0").strip()
+        operations_payload = payload.get("operations")
+        operations: Dict[str, OperationPolicy] = {}
+        if isinstance(operations_payload, Mapping):
+            for name, op_payload in operations_payload.items():
+                if not isinstance(op_payload, Mapping):
+                    continue
+                operations[name.lower()] = OperationPolicy.from_mapping(name, op_payload)
+
+        metadata: Dict[str, Any] = {}
+        extra_meta = payload.get("metadata")
+        if isinstance(extra_meta, Mapping):
+            metadata = dict(extra_meta)
+
+        return cls(
+            version=version,
+            operations=operations,
+            source_path=source_path,
+            metadata=metadata,
+        )
+
+    def get(self, operation: str) -> Optional[OperationPolicy]:
+        return self.operations.get(operation.lower())
+
+
 class SettingsLoader:
     """Persist ACAGi runtime defaults while tolerating absent or corrupt files."""
 
@@ -1863,12 +2077,15 @@ class SettingsLoader:
         self,
         path: Optional[Path] = None,
         defaults: Optional[Mapping[str, Mapping[str, str]]] = None,
+        policy_path: Optional[Path] = None,
     ) -> None:
         self.path = path or CONFIG_PATH
+        self.policies_path = policy_path or (self.path.parent / POLICIES_FILENAME)
         self.defaults: Mapping[str, Mapping[str, str]] = (
             defaults if defaults is not None else copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
         )
         self._parser = configparser.ConfigParser()
+        self._policies: Optional[PolicyBundle] = None
 
     # ------------------------------------------------------------------
     def load(self) -> RuntimeSettings:
@@ -1888,6 +2105,30 @@ class SettingsLoader:
         if not self.path.exists():
             self.save(settings)
         return settings
+
+    # ------------------------------------------------------------------
+    def load_policies(self) -> PolicyBundle:
+        template = self._load_policy_template()
+        payload: Mapping[str, Any] = template
+        if self.policies_path.exists():
+            try:
+                raw = self.policies_path.read_text(encoding="utf-8")
+                payload = json.loads(raw)
+            except (OSError, json.JSONDecodeError) as exc:
+                logging.getLogger(__name__).warning(
+                    "Failed to parse %s: %s – using defaults",
+                    self.policies_path,
+                    exc,
+                )
+                payload = template
+        else:
+            self._persist_policies(template)
+
+        bundle = PolicyBundle.from_mapping(payload, source_path=self.policies_path)
+        self._policies = bundle
+        if not self.policies_path.exists():
+            self._persist_policies(template)
+        return bundle
 
     # ------------------------------------------------------------------
     def save(self, settings: RuntimeSettings) -> None:
@@ -1964,6 +2205,27 @@ class SettingsLoader:
         )
 
     # ------------------------------------------------------------------
+    def _load_policy_template(self) -> Mapping[str, Any]:
+        template_path = here() / POLICIES_FILENAME
+        if template_path.exists():
+            try:
+                return json.loads(template_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logging.getLogger(__name__).warning(
+                    "Failed to parse policy template %s: %s – falling back to built-in",
+                    template_path,
+                    exc,
+                )
+        return copy.deepcopy(DEFAULT_POLICY_BUNDLE)
+
+    # ------------------------------------------------------------------
+    def _persist_policies(self, payload: Mapping[str, Any]) -> None:
+        self.policies_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.policies_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    # ------------------------------------------------------------------
     def _persist_defaults(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         parser = configparser.ConfigParser()
@@ -1980,6 +2242,9 @@ class SettingsLoader:
 
 SETTINGS_LOADER = SettingsLoader()
 RUNTIME_SETTINGS = SETTINGS_LOADER.load()
+safety_manager.set_runtime_settings(RUNTIME_SETTINGS)
+POLICY_BUNDLE = SETTINGS_LOADER.load_policies()
+safety_manager.set_operation_policies(POLICY_BUNDLE.operations)
 _SENTINEL_LOGGER = logging.getLogger("sentinel")
 _SENTINEL_NOTIFIER_TOKEN: Optional[str] = None
 
@@ -1988,6 +2253,13 @@ def configure_safety_sentinel(settings: RuntimeSettings) -> None:
     """Align the safety manager with sandbox and policy runtime toggles."""
 
     global _SENTINEL_NOTIFIER_TOKEN
+
+    try:
+        safety_manager.set_runtime_settings(settings)
+    except Exception:
+        _SENTINEL_LOGGER.debug(
+            "Failed to refresh runtime settings on safety manager", exc_info=True
+        )
 
     try:
         safety_manager.install_file_guard()
@@ -2041,6 +2313,13 @@ def configure_safety_sentinel(settings: RuntimeSettings) -> None:
             _SENTINEL_NOTIFIER_TOKEN = safety_manager.add_notifier(_dispatch)
         except Exception:
             _SENTINEL_LOGGER.debug("Failed to attach sentinel notifier", exc_info=True)
+
+    try:
+        _ensure_sentinel_monitors(settings)
+    except Exception:
+        _SENTINEL_LOGGER.debug(
+            "Unable to refresh sentinel monitors", exc_info=True
+        )
 
 
 def agent_sessions_dir() -> Path:
@@ -2543,6 +2822,7 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     # System coordination and metrics feeds.
     "system.metrics",
     "system.process",
+    "system.immune",
 }
 _WILDCARD_TOPIC = "task.*"
 
@@ -2805,6 +3085,298 @@ def publish(topic: str, payload: dict) -> None:
     """Broadcast ``payload`` to subscribers registered for ``topic``."""
 
     EVENT_DISPATCHER.publish(topic, payload)
+
+
+class ImmuneResponse(Enum):
+    """Enumerate sentinel immune response strategies."""
+
+    COOLDOWN = "cooldown"
+    QUARANTINE = "quarantine"
+    ROLLBACK = "rollback"
+
+
+@dataclass(slots=True)
+class SentinelIncident:
+    """Container describing a sentinel-triggered immune response."""
+
+    task_id: str
+    response: ImmuneResponse
+    reason: str
+    notes: str
+    timestamp: float
+
+    def to_payload(self, *, sandbox: str, policy: str) -> Dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "response": self.response.value,
+            "reason": self.reason,
+            "notes": self.notes,
+            "timestamp": datetime.fromtimestamp(self.timestamp, UTC).isoformat(),
+            "sandbox": sandbox,
+            "policy": policy,
+        }
+
+
+class SentinelMonitorHub:
+    """Subscribe to event bus topics and emit immune responses."""
+
+    _SUCCESS_STATES = {
+        "done",
+        "complete",
+        "completed",
+        "merged",
+        "passed",
+        "resolved",
+        "success",
+    }
+
+    def __init__(self, dispatcher: EventDispatcher, settings: RuntimeSettings) -> None:
+        self._dispatcher = dispatcher
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.sentinel.monitor")
+        self._lock = RLock()
+        self._settings = settings
+        self._status_history: Dict[str, Deque[Tuple[str, float]]] = defaultdict(
+            lambda: deque(maxlen=8)
+        )
+        self._last_progress: Dict[str, float] = {}
+        self._response_backoff: Dict[Tuple[str, ImmuneResponse], float] = {}
+        self._loop_window = 240.0
+        self._stall_threshold = 600.0
+        self._stall_interval = 60.0
+        self._backoff_seconds = 300.0
+        self._stop = threading.Event()
+        self._subscriptions: List[Subscription] = []
+        self._thread: Optional[threading.Thread] = None
+        self.configure(settings)
+        self._install_subscriptions()
+        self._start_watcher()
+        atexit.register(self.shutdown)
+
+    # ------------------------------------------------------------------
+    def configure(self, settings: RuntimeSettings) -> None:
+        with self._lock:
+            self._settings = settings
+            if settings.sentinel_policy == "monitor":
+                self._backoff_seconds = 180.0
+                self._stall_threshold = 900.0
+            else:
+                self._backoff_seconds = 300.0
+                self._stall_threshold = 600.0
+
+    # ------------------------------------------------------------------
+    def trigger_manual(
+        self,
+        task_id: str,
+        response: ImmuneResponse,
+        reason: str,
+        notes: str,
+    ) -> None:
+        self._emit_response(task_id, response, reason, notes, force=True)
+
+    # ------------------------------------------------------------------
+    def shutdown(self) -> None:
+        self._stop.set()
+        for sub in list(self._subscriptions):
+            try:
+                sub.unsubscribe()
+            except Exception:
+                self._logger.debug("Unable to detach sentinel subscription", exc_info=True)
+        self._subscriptions.clear()
+        thread = self._thread
+        if thread and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=1.0)
+
+    # ------------------------------------------------------------------
+    def _start_watcher(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._watch_stalls,
+            name="SentinelStallWatcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    # ------------------------------------------------------------------
+    def _install_subscriptions(self) -> None:
+        self._subscriptions.append(subscribe("task.status", self._on_task_status))
+        self._subscriptions.append(subscribe("task.diff", self._on_task_diff))
+        self._subscriptions.append(subscribe("task.updated", self._on_task_updated))
+
+    # ------------------------------------------------------------------
+    def _on_task_status(self, payload: Mapping[str, Any]) -> None:
+        task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
+        status = payload.get("status") or payload.get("to")
+        if not task_id or not status:
+            return
+        normalized = str(status).strip().lower()
+        if not normalized:
+            return
+
+        now = time.time()
+        with self._lock:
+            history = self._status_history[task_id]
+            if history and history[-1][0] == normalized:
+                self._last_progress[task_id] = now
+                return
+            history.append((normalized, now))
+            self._last_progress[task_id] = now
+
+        self._detect_loop(task_id)
+        self._detect_regression(task_id)
+
+    # ------------------------------------------------------------------
+    def _on_task_diff(self, payload: Mapping[str, Any]) -> None:
+        task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
+        if not task_id:
+            return
+        with self._lock:
+            self._last_progress[task_id] = time.time()
+
+    # ------------------------------------------------------------------
+    def _on_task_updated(self, payload: Mapping[str, Any]) -> None:
+        task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
+        if not task_id:
+            return
+        with self._lock:
+            self._last_progress[task_id] = time.time()
+
+    # ------------------------------------------------------------------
+    def _detect_loop(self, task_id: str) -> None:
+        with self._lock:
+            history = list(self._status_history.get(task_id, ()))
+
+        if len(history) < 4:
+            return
+
+        recent = history[-4:]
+        statuses = [status for status, _ in recent]
+        unique = {status for status in statuses}
+        if len(unique) > 2:
+            return
+
+        first, second, third, fourth = statuses
+        if first == second:
+            return
+        if first == third and second == fourth:
+            window = recent[-1][1] - recent[0][1]
+            if window <= self._loop_window:
+                notes = (
+                    f"Status loop {first}->{second} repeated within {int(window)}s"
+                )
+                self._emit_response(
+                    task_id,
+                    ImmuneResponse.COOLDOWN,
+                    "loop",
+                    notes,
+                )
+
+    # ------------------------------------------------------------------
+    def _detect_regression(self, task_id: str) -> None:
+        with self._lock:
+            history = list(self._status_history.get(task_id, ()))
+
+        if len(history) < 2:
+            return
+
+        prev_status, prev_ts = history[-2]
+        current_status, current_ts = history[-1]
+        if prev_status in self._SUCCESS_STATES and current_status not in self._SUCCESS_STATES:
+            delta = max(0, int(current_ts - prev_ts))
+            notes = (
+                f"Regressed from {prev_status} to {current_status} after {delta}s"
+            )
+            self._emit_response(
+                task_id,
+                ImmuneResponse.ROLLBACK,
+                "regression",
+                notes,
+            )
+
+    # ------------------------------------------------------------------
+    def _watch_stalls(self) -> None:
+        while not self._stop.wait(self._stall_interval):
+            now = time.time()
+            with self._lock:
+                items = list(self._last_progress.items())
+            for task_id, last_ts in items:
+                if now - last_ts >= self._stall_threshold:
+                    notes = f"No progress for {int(now - last_ts)}s"
+                    self._emit_response(
+                        task_id,
+                        ImmuneResponse.QUARANTINE,
+                        "stall",
+                        notes,
+                    )
+
+    # ------------------------------------------------------------------
+    def _emit_response(
+        self,
+        task_id: str,
+        response: ImmuneResponse,
+        reason: str,
+        notes: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            sandbox = getattr(self._settings, "sandbox", "unknown")
+            policy = getattr(self._settings, "sentinel_policy", "unknown")
+            if not force and not self._update_backoff_locked(task_id, response, now):
+                return
+            if force:
+                self._response_backoff[(task_id, response)] = now
+
+        incident = SentinelIncident(
+            task_id=task_id,
+            response=response,
+            reason=reason,
+            notes=notes,
+            timestamp=now,
+        )
+        payload = incident.to_payload(sandbox=sandbox, policy=policy)
+        try:
+            publish("system.immune", payload)
+        except Exception:
+            self._logger.debug("Unable to publish immune response", exc_info=True)
+        self._logger.warning(
+            "Sentinel immune response=%s task=%s reason=%s notes=%s",
+            response.value,
+            task_id,
+            reason,
+            notes,
+        )
+
+    # ------------------------------------------------------------------
+    def _update_backoff_locked(
+        self, task_id: str, response: ImmuneResponse, now: float
+    ) -> bool:
+        key = (task_id, response)
+        last = self._response_backoff.get(key)
+        if last is not None and now - last < self._backoff_seconds:
+            return False
+        self._response_backoff[key] = now
+        return True
+
+
+_SENTINEL_MONITOR_HUB: Optional[SentinelMonitorHub] = None
+
+
+def _ensure_sentinel_monitors(settings: RuntimeSettings) -> SentinelMonitorHub:
+    global _SENTINEL_MONITOR_HUB
+    if _SENTINEL_MONITOR_HUB is None:
+        _SENTINEL_MONITOR_HUB = SentinelMonitorHub(EVENT_DISPATCHER, settings)
+    else:
+        _SENTINEL_MONITOR_HUB.configure(settings)
+    return _SENTINEL_MONITOR_HUB
+
+
+def trigger_manual_immune_response(
+    task_id: str, response: ImmuneResponse, reason: str, notes: str
+) -> None:
+    hub = _ensure_sentinel_monitors(RUNTIME_SETTINGS)
+    hub.trigger_manual(task_id, response, reason, notes)
 
 
 configure_safety_sentinel(RUNTIME_SETTINGS)
@@ -5791,8 +6363,13 @@ def run_checked(
     dataset_root: Optional[Path] = None,
     workspace: Optional[Path] = None,
     cancelled: bool = False,
+    operation: Optional[str] = None,
 ) -> Tuple[int, str, str]:
-    """Execute ``cmd`` and update task bookkeeping when provided."""
+    """Execute ``cmd`` and update task bookkeeping when provided.
+
+    ``operation`` designates high-level flows such as ``"coder"`` or ``"test"`` so
+    safety policies can enforce allowlists, denylists, and sandbox expectations.
+    """
 
     stdout = ""
     stderr = ""
@@ -5822,7 +6399,7 @@ def run_checked(
     try:
         blocked = False
         try:
-            safety_manager.ensure_command_allowed(cmd)
+            safety_manager.ensure_command_allowed(cmd, operation=operation)
         except SafetyViolation as exc:
             blocked = True
             stderr = str(exc)
@@ -5917,6 +6494,58 @@ def run_checked(
                     publish("task.updated", updated_task.to_dict())
 
     return return_code, stdout, stderr
+
+
+def run_coder_command(
+    cmd: List[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = None,
+    task: Optional[Task] = None,
+    dataset_root: Optional[Path] = None,
+    workspace: Optional[Path] = None,
+    cancelled: bool = False,
+) -> Tuple[int, str, str]:
+    """Execute a command under the coder operation policy."""
+
+    return run_checked(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        task=task,
+        dataset_root=dataset_root,
+        workspace=workspace,
+        cancelled=cancelled,
+        operation="coder",
+    )
+
+
+def run_test_command(
+    cmd: List[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = None,
+    task: Optional[Task] = None,
+    dataset_root: Optional[Path] = None,
+    workspace: Optional[Path] = None,
+    cancelled: bool = False,
+) -> Tuple[int, str, str]:
+    """Execute a command under the tester operation policy."""
+
+    return run_checked(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        task=task,
+        dataset_root=dataset_root,
+        workspace=workspace,
+        cancelled=cancelled,
+        operation="test",
+    )
 
 def slug(s: str) -> str:
     t = re.sub(r"[^A-Za-z0-9_.-]+", "-", s.strip())

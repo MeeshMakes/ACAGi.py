@@ -41,6 +41,16 @@
       "title": "Hippocampus Dataset Dock",
       "summary": "Use the DatasetManagerDock to ingest tagged files or directories so Hippocampus can run OCR/embeddings, persist dataset nodes, and update the brain map registry.",
       "applies_to": "dataset-ingestion"
+    },
+    {
+      "title": "Sentinel Event Monitoring",
+      "summary": "SentinelMonitorHub listens to task.status/task.diff/task.updated topics, detects loops, regressions, and stalls, and publishes immune responses on system.immune.",
+      "applies_to": "safety-monitoring"
+    },
+    {
+      "title": "Operation Policy Enforcement",
+      "summary": "SafetyManager consumes policies.json to enforce coder/test allowlists, denylists, approval prompts, and sandbox requirements via run_checked helpers.",
+      "applies_to": "operation-safety"
     }
   ],
   "procedures": [

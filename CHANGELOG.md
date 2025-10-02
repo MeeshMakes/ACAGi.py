@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.10] - 2025-10-04
+### Added
+- Introduced a sentinel monitor hub that subscribes to task/status topics, detects loops/regressions/stalls, and publishes immune responses with rationale on the `system.immune` stream.
+- Added a versioned `policies.json` template and settings loader support that materializes coder/test allowlists, denylists, sandbox requirements, and approval rules for SafetyManager.
+
+### Changed
+- Extended SafetyManager and command helpers to enforce operation policies, surface sandbox mismatches, and expose manual immune response triggering utilities.
+
 ## [0.1.9] - 2025-10-02
 ### Added
 - Added a Hippocampus-backed dataset manager dock that lets operators ingest
