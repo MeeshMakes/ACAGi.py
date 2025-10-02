@@ -117,6 +117,7 @@ from PySide6.QtGui import (
     QPixmap,
     QTextCharFormat,
     QTextCursor,
+    QTextDocument,
     QMovie,
 )
 from PySide6.QtWidgets import (
@@ -154,6 +155,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QAbstractItemView,
     QStatusBar,
+    QSplitter,
 )
 
 
@@ -5220,6 +5222,832 @@ class VirtualDesktopDock(QDockWidget):
             except Exception:
                 self._logger.debug(
                     "Failed to unsubscribe %s", topic, exc_info=True
+                )
+        self._subscriptions.clear()
+
+
+# ============================================================================
+# Log observability dock
+# ============================================================================
+
+
+class LogObservabilityDock(QDockWidget):
+    """Dock tailing system, process, and session streams with filtering."""
+
+    _BUS_TOPICS: Tuple[str, ...] = (
+        "observation",
+        "observation.delta",
+        "note",
+        "note.appended",
+        "task",
+        "task.created",
+        "task.updated",
+        "task.status",
+        "task.diff",
+        "task.deleted",
+        "task.conversation",
+        "system.metrics",
+        "system.process",
+        "system.immune",
+    )
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Log Observatory", parent)
+        self.setObjectName("LogObservabilityDock")
+        self.setAllowedAreas(
+            Qt.LeftDockWidgetArea
+            | Qt.RightDockWidgetArea
+            | Qt.BottomDockWidgetArea
+        )
+        self.toggleViewAction().setText("Log Observatory")
+
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.logs.observatory")
+        self._system_log_path = self._resolve_system_log_path()
+        self._system_offset = 0
+        self._system_lines: Deque[str] = deque(maxlen=1200)
+        self._system_filter = ""
+        self._process_filter = ""
+        self._session_filter = ""
+        self._process_offsets: Dict[str, int] = {}
+        self._process_lines: Dict[str, Deque[str]] = {}
+        self._session_lines: Dict[str, List[str]] = {}
+        self._session_selected: Optional[str] = None
+        self._active_process: Optional[str] = None
+        self._subscriptions: List[Subscription] = []
+        self._primed = False
+
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Monitor the shared system log, inspect process streams, and browse "
+            "session conversation tails with accessible filtering controls.",
+            container,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self._tabs = QTabWidget(container)
+        layout.addWidget(self._tabs, 1)
+
+        self._build_system_tab()
+        self._build_process_tab()
+        self._build_session_tab()
+
+        self.setWidget(container)
+
+        self._system_timer = QTimer(self)
+        self._system_timer.setInterval(1500)
+        self._system_timer.timeout.connect(self._poll_system_log)
+
+        self._process_timer = QTimer(self)
+        self._process_timer.setInterval(2000)
+        self._process_timer.timeout.connect(self._poll_active_process)
+
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(2500)
+        self._session_timer.timeout.connect(self._refresh_sessions)
+
+        self.visibilityChanged.connect(self._handle_visibility)
+        self.destroyed.connect(lambda *_: self._teardown())
+
+        self._install_bus_subscriptions()
+
+    # ------------------------------------------------------------------
+    def _build_system_tab(self) -> None:
+        widget = QWidget(self._tabs)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+
+        filter_label = QLabel("Filter:", widget)
+        controls.addWidget(filter_label)
+
+        self._system_filter_input = QLineEdit(widget)
+        self._system_filter_input.setPlaceholderText(
+            "Space-separated terms must all match."
+        )
+        self._system_filter_input.textChanged.connect(
+            self._on_system_filter_changed
+        )
+        controls.addWidget(self._system_filter_input, 1)
+
+        search_label = QLabel("Search:", widget)
+        controls.addWidget(search_label)
+
+        self._system_search_input = QLineEdit(widget)
+        self._system_search_input.setPlaceholderText("Find term…")
+        self._system_search_input.returnPressed.connect(
+            lambda: self._perform_system_search(False)
+        )
+        controls.addWidget(self._system_search_input, 1)
+
+        prev_btn = QPushButton("Prev", widget)
+        prev_btn.clicked.connect(
+            lambda _checked=False: self._perform_system_search(True)
+        )
+        controls.addWidget(prev_btn)
+
+        next_btn = QPushButton("Next", widget)
+        next_btn.clicked.connect(
+            lambda _checked=False: self._perform_system_search(False)
+        )
+        controls.addWidget(next_btn)
+
+        layout.addLayout(controls)
+
+        self._system_view = QPlainTextEdit(widget)
+        self._system_view.setReadOnly(True)
+        self._system_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._apply_view_palette(self._system_view)
+        layout.addWidget(self._system_view, 1)
+
+        self._system_status = QLabel("Awaiting system log activity.", widget)
+        self._system_status.setStyleSheet("color:#8ea4c9;")
+        layout.addWidget(self._system_status)
+
+        self._tabs.addTab(widget, "System Log")
+
+    # ------------------------------------------------------------------
+    def _build_process_tab(self) -> None:
+        widget = QWidget(self._tabs)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        refresh_btn = QPushButton("Rescan Logs", widget)
+        refresh_btn.clicked.connect(self._refresh_process_list)
+        header.addWidget(refresh_btn)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+
+        filter_label = QLabel("Filter:", widget)
+        controls.addWidget(filter_label)
+
+        self._process_filter_input = QLineEdit(widget)
+        self._process_filter_input.setPlaceholderText(
+            "Filter the active process stream."
+        )
+        self._process_filter_input.textChanged.connect(
+            self._on_process_filter_changed
+        )
+        controls.addWidget(self._process_filter_input, 1)
+
+        search_label = QLabel("Search:", widget)
+        controls.addWidget(search_label)
+
+        self._process_search_input = QLineEdit(widget)
+        self._process_search_input.setPlaceholderText("Find term…")
+        self._process_search_input.returnPressed.connect(
+            lambda: self._perform_process_search(False)
+        )
+        controls.addWidget(self._process_search_input, 1)
+
+        prev_btn = QPushButton("Prev", widget)
+        prev_btn.clicked.connect(
+            lambda _checked=False: self._perform_process_search(True)
+        )
+        controls.addWidget(prev_btn)
+
+        next_btn = QPushButton("Next", widget)
+        next_btn.clicked.connect(
+            lambda _checked=False: self._perform_process_search(False)
+        )
+        controls.addWidget(next_btn)
+
+        layout.addLayout(controls)
+
+        splitter = QSplitter(Qt.Horizontal, widget)
+        self._process_list = QListWidget(splitter)
+        self._process_list.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self._process_list.itemSelectionChanged.connect(
+            self._on_process_selected
+        )
+
+        self._process_view = QPlainTextEdit(splitter)
+        self._process_view.setReadOnly(True)
+        self._process_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._apply_view_palette(self._process_view)
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+        self._process_status = QLabel("No process logs discovered yet.", widget)
+        self._process_status.setStyleSheet("color:#8ea4c9;")
+        layout.addWidget(self._process_status)
+
+        self._tabs.addTab(widget, "Process Streams")
+
+    # ------------------------------------------------------------------
+    def _build_session_tab(self) -> None:
+        widget = QWidget(self._tabs)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        refresh_btn = QPushButton("Refresh Sessions", widget)
+        refresh_btn.clicked.connect(lambda: self._refresh_sessions(force=True))
+        header.addWidget(refresh_btn)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+
+        filter_label = QLabel("Filter:", widget)
+        controls.addWidget(filter_label)
+
+        self._session_filter_input = QLineEdit(widget)
+        self._session_filter_input.setPlaceholderText(
+            "Filter the selected session tail."
+        )
+        self._session_filter_input.textChanged.connect(
+            self._on_session_filter_changed
+        )
+        controls.addWidget(self._session_filter_input, 1)
+
+        search_label = QLabel("Search:", widget)
+        controls.addWidget(search_label)
+
+        self._session_search_input = QLineEdit(widget)
+        self._session_search_input.setPlaceholderText("Find term…")
+        self._session_search_input.returnPressed.connect(
+            lambda: self._perform_session_search(False)
+        )
+        controls.addWidget(self._session_search_input, 1)
+
+        prev_btn = QPushButton("Prev", widget)
+        prev_btn.clicked.connect(
+            lambda _checked=False: self._perform_session_search(True)
+        )
+        controls.addWidget(prev_btn)
+
+        next_btn = QPushButton("Next", widget)
+        next_btn.clicked.connect(
+            lambda _checked=False: self._perform_session_search(False)
+        )
+        controls.addWidget(next_btn)
+
+        layout.addLayout(controls)
+
+        splitter = QSplitter(Qt.Horizontal, widget)
+        self._session_list = QListWidget(splitter)
+        self._session_list.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self._session_list.itemSelectionChanged.connect(
+            self._on_session_selected
+        )
+
+        self._session_view = QPlainTextEdit(splitter)
+        self._session_view.setReadOnly(True)
+        self._session_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._apply_view_palette(self._session_view)
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+        self._session_status = QLabel("Session tails not loaded yet.", widget)
+        self._session_status.setStyleSheet("color:#8ea4c9;")
+        layout.addWidget(self._session_status)
+
+        self._tabs.addTab(widget, "Session Streams")
+
+    # ------------------------------------------------------------------
+    def _resolve_system_log_path(self) -> Path:
+        path = BOOT_ENV.log_path
+        if isinstance(path, Path) and path:
+            return path
+        fallback = agent_logs_dir() / VD_LOG_FILENAME
+        return fallback
+
+    # ------------------------------------------------------------------
+    def _handle_visibility(self, visible: bool) -> None:
+        if visible:
+            self._system_timer.start()
+            self._process_timer.start()
+            self._session_timer.start()
+            if not self._primed:
+                self._poll_system_log(initial=True)
+                self._refresh_process_list()
+                self._refresh_sessions(force=True)
+                self._primed = True
+        else:
+            self._system_timer.stop()
+            self._process_timer.stop()
+            self._session_timer.stop()
+
+    # ------------------------------------------------------------------
+    def _install_bus_subscriptions(self) -> None:
+        for topic in self._BUS_TOPICS:
+            try:
+                handle = subscribe(topic, self._wrap_bus_callback(topic))
+            except Exception:
+                self._logger.exception("Failed to subscribe to %s", topic)
+                continue
+            self._subscriptions.append(handle)
+
+    # ------------------------------------------------------------------
+    def _wrap_bus_callback(self, topic: str) -> Callable[[dict], None]:
+        def _callback(payload: dict) -> None:
+            snapshot = dict(payload)
+            QTimer.singleShot(
+                0,
+                lambda: self._handle_bus_event(topic, snapshot),
+            )
+
+        return _callback
+
+    # ------------------------------------------------------------------
+    def _handle_bus_event(self, topic: str, payload: Mapping[str, Any]) -> None:
+        line = self._format_event_line(topic, payload)
+        self._system_lines.append(line)
+        self._render_system_lines()
+        self._update_system_status(1)
+
+        if topic == "task.conversation":
+            session_id = str(payload.get("session_id") or "").strip()
+            if session_id:
+                self._refresh_sessions(force=True)
+        elif topic.startswith("system."):
+            self._refresh_process_list()
+
+    # ------------------------------------------------------------------
+    def _format_event_line(self, topic: str, payload: Mapping[str, Any]) -> str:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        summary = self._summarise_event(topic, payload)
+        return f"[{timestamp}] {topic}: {summary}"
+
+    # ------------------------------------------------------------------
+    def _summarise_event(self, topic: str, payload: Mapping[str, Any]) -> str:
+        if topic.startswith("task"):
+            title = str(payload.get("title") or payload.get("id") or "").strip()
+            status = payload.get("status") or payload.get("to")
+            if status:
+                return f"{title or '(task)'} → {status}"
+            return title or "(task event)"
+        if topic.startswith("system.process"):
+            name = str(payload.get("name") or payload.get("process") or "")
+            pid = payload.get("pid")
+            detail = str(payload.get("detail") or payload.get("status") or "")
+            if pid:
+                return f"{name or 'process'}[{pid}]: {detail or 'update'}"
+            return detail or name or "(process update)"
+        if topic == "system.metrics":
+            keys = [key for key in payload.keys() if key != "meta"]
+            return f"metrics fields={', '.join(keys) or 'none'}"
+        if topic == "system.immune":
+            response = payload.get("response")
+            reason = payload.get("reason")
+            return f"immune {response or '?'} ({reason or 'unspecified'})"
+        if topic.startswith("observation") or topic.startswith("note"):
+            text = payload.get("text") or payload.get("message")
+            if isinstance(text, str) and text.strip():
+                snippet = text.strip()
+                return snippet[:160]
+        safe = {k: v for k, v in payload.items() if k != "meta"}
+        snippet = json.dumps(safe, ensure_ascii=False)
+        return snippet[:160]
+
+    # ------------------------------------------------------------------
+    def _poll_system_log(self, initial: bool = False) -> None:
+        path = self._system_log_path
+        if not path.exists():
+            self._system_status.setText("System log not found yet.")
+            return
+
+        if initial and self._system_offset == 0:
+            lines = self._read_tail_lines(path, 600)
+            for line in lines:
+                self._system_lines.append(line)
+            try:
+                self._system_offset = path.stat().st_size
+            except OSError:
+                self._system_offset = 0
+            self._render_system_lines()
+            self._update_system_status(len(lines))
+            return
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+
+        if self._system_offset > size:
+            self._system_offset = 0
+
+        chunk = ""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                if self._system_offset:
+                    fh.seek(self._system_offset)
+                chunk = fh.read()
+                self._system_offset = fh.tell()
+        except Exception:
+            self._logger.exception("Failed to follow system log", exc_info=True)
+            return
+
+        if not chunk:
+            return
+
+        new_lines = 0
+        for line in chunk.splitlines():
+            self._system_lines.append(line)
+            new_lines += 1
+        self._render_system_lines()
+        self._update_system_status(new_lines)
+
+    # ------------------------------------------------------------------
+    def _read_tail_lines(self, path: Path, max_lines: int) -> List[str]:
+        rows: Deque[str] = deque(maxlen=max_lines)
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    rows.append(line.rstrip("\n"))
+        except Exception:
+            self._logger.debug("Unable to read log tail %s", path, exc_info=True)
+            return []
+        return list(rows)
+
+    # ------------------------------------------------------------------
+    def _update_system_status(self, new_lines: int) -> None:
+        total = len(self._system_lines)
+        parts = [f"{total} line(s) buffered"]
+        if new_lines:
+            parts.append(f"+{new_lines} new")
+        self._system_status.setText(" • ".join(parts))
+
+    # ------------------------------------------------------------------
+    def _render_system_lines(self) -> None:
+        pattern = self._system_filter
+        filtered = [
+            line for line in self._system_lines if self._line_matches(line, pattern)
+        ]
+        text = "\n".join(filtered)
+        if text == self._system_view.toPlainText():
+            return
+        self._system_view.setPlainText(text)
+        cursor = self._system_view.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self._system_view.setTextCursor(cursor)
+
+    # ------------------------------------------------------------------
+    def _on_system_filter_changed(self, text: str) -> None:
+        self._system_filter = text
+        self._render_system_lines()
+        self._update_system_status(0)
+
+    # ------------------------------------------------------------------
+    def _refresh_process_list(self) -> None:
+        base = agent_logs_dir()
+        candidates: List[Path] = []
+        processes_dir = base / "processes"
+        if processes_dir.exists():
+            candidates.extend(sorted(processes_dir.glob("*.log")))
+        if not candidates:
+            for path in sorted(base.glob("*.log")):
+                if path == self._system_log_path:
+                    continue
+                candidates.append(path)
+
+        mapping = {str(path): path for path in candidates}
+
+        previous = self._active_process
+        self._process_list.blockSignals(True)
+        self._process_list.clear()
+        for key, path in sorted(
+            mapping.items(), key=lambda item: item[1].name.lower()
+        ):
+            name = path.stem
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, key)
+            item.setToolTip(path.as_posix())
+            self._process_list.addItem(item)
+        self._process_list.blockSignals(False)
+
+        count = self._process_list.count()
+        if count and not self._process_list.selectedItems():
+            row = 0
+            if previous and previous in mapping:
+                for idx in range(count):
+                    data = self._process_list.item(idx).data(Qt.UserRole)
+                    if data == previous:
+                        row = idx
+                        break
+            self._process_list.setCurrentRow(row)
+        elif not count:
+            self._process_view.clear()
+            self._active_process = None
+
+        message = (
+            f"{count} process log(s) discovered"
+            if count
+            else "No process logs detected yet."
+        )
+        self._process_status.setText(message)
+
+    # ------------------------------------------------------------------
+    def _on_process_selected(self) -> None:
+        items = self._process_list.selectedItems()
+        if not items:
+            self._active_process = None
+            self._process_view.clear()
+            return
+        item = items[0]
+        key = item.data(Qt.UserRole)
+        if not key:
+            return
+        path = Path(str(key))
+        self._active_process = str(path)
+        if self._active_process not in self._process_lines:
+            lines = self._read_tail_lines(path, 600)
+            self._process_lines[self._active_process] = deque(lines, maxlen=800)
+            try:
+                self._process_offsets[self._active_process] = path.stat().st_size
+            except OSError:
+                self._process_offsets[self._active_process] = 0
+        self._render_process_lines(self._active_process)
+
+    # ------------------------------------------------------------------
+    def _on_process_filter_changed(self, text: str) -> None:
+        self._process_filter = text
+        if self._active_process:
+            self._render_process_lines(self._active_process)
+
+    # ------------------------------------------------------------------
+    def _render_process_lines(self, key: str) -> None:
+        lines = list(self._process_lines.get(key, ()))
+        filtered = [
+            line for line in lines if self._line_matches(line, self._process_filter)
+        ]
+        text = "\n".join(filtered)
+        if text == self._process_view.toPlainText():
+            return
+        self._process_view.setPlainText(text)
+        cursor = self._process_view.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self._process_view.setTextCursor(cursor)
+        name = Path(key).name
+        self._process_status.setText(
+            f"{len(lines)} buffered line(s) for {name}"
+        )
+
+    # ------------------------------------------------------------------
+    def _poll_active_process(self) -> None:
+        key = self._active_process
+        if not key:
+            return
+        path = Path(key)
+        if not path.exists():
+            return
+        offset = self._process_offsets.get(key, 0)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if offset > size:
+            offset = 0
+        chunk = ""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                if offset:
+                    fh.seek(offset)
+                chunk = fh.read()
+                offset = fh.tell()
+        except Exception:
+            self._logger.debug(
+                "Failed to follow process log %s", path, exc_info=True
+            )
+            return
+        self._process_offsets[key] = offset
+        if not chunk:
+            return
+        lines = self._process_lines.setdefault(key, deque(maxlen=800))
+        for line in chunk.splitlines():
+            lines.append(line)
+        self._render_process_lines(key)
+
+    # ------------------------------------------------------------------
+    def _refresh_sessions(self, force: bool = False) -> None:
+        try:
+            services = memory_services()
+        except Exception:
+            self._logger.debug("Memory services unavailable", exc_info=True)
+            return
+        store = services.sessions
+        try:
+            if force:
+                store.refresh(sessions_root=agent_sessions_dir())
+            else:
+                store.refresh()
+        except Exception:
+            self._logger.debug("Failed to refresh session tails", exc_info=True)
+            return
+
+        tails = store.list_tails()
+        lines: Dict[str, List[str]] = {}
+        for tail in tails:
+            rendered = [self._format_session_entry(entry) for entry in tail.entries]
+            lines[tail.session_id] = rendered
+        self._session_lines = lines
+
+        previous = self._session_selected
+        self._session_list.blockSignals(True)
+        self._session_list.clear()
+        for tail in tails:
+            stamp = "--"
+            try:
+                stamp = datetime.fromtimestamp(tail.updated_at).strftime("%H:%M:%S")
+            except Exception:
+                stamp = "--"
+            label = f"{tail.session_id} • {stamp}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, tail.session_id)
+            item.setToolTip(tail.path.as_posix())
+            self._session_list.addItem(item)
+        self._session_list.blockSignals(False)
+
+        count = self._session_list.count()
+        if count:
+            row = 0
+            if previous:
+                for idx in range(count):
+                    item = self._session_list.item(idx)
+                    if item.data(Qt.UserRole) == previous:
+                        row = idx
+                        break
+            self._session_list.setCurrentRow(row)
+        else:
+            self._session_view.clear()
+            self._session_selected = None
+
+        message = (
+            f"{count} session tail(s) discovered"
+            if count
+            else "Session tails not found."
+        )
+        self._session_status.setText(message)
+
+    # ------------------------------------------------------------------
+    def _on_session_selected(self) -> None:
+        items = self._session_list.selectedItems()
+        if not items:
+            self._session_selected = None
+            self._session_view.clear()
+            return
+        session_id = items[0].data(Qt.UserRole)
+        if not session_id:
+            return
+        self._session_selected = str(session_id)
+        self._render_session_lines(self._session_selected)
+
+    # ------------------------------------------------------------------
+    def _on_session_filter_changed(self, text: str) -> None:
+        self._session_filter = text
+        if self._session_selected:
+            self._render_session_lines(self._session_selected)
+
+    # ------------------------------------------------------------------
+    def _render_session_lines(self, session_id: str) -> None:
+        lines = self._session_lines.get(session_id, [])
+        filtered = [
+            line
+            for line in lines
+            if self._line_matches(line, self._session_filter)
+        ]
+        text = "\n".join(filtered)
+        if text == self._session_view.toPlainText():
+            return
+        self._session_view.setPlainText(text)
+        cursor = self._session_view.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self._session_view.setTextCursor(cursor)
+        self._session_status.setText(
+            f"{len(lines)} entry(ies) buffered for {session_id}"
+        )
+
+    # ------------------------------------------------------------------
+    def _format_session_entry(self, entry: Mapping[str, Any]) -> str:
+        timestamp = entry.get("timestamp") or entry.get("ts")
+        if isinstance(timestamp, (int, float)):
+            try:
+                stamp = datetime.fromtimestamp(float(timestamp)).strftime(
+                    "%H:%M:%S"
+                )
+            except Exception:
+                stamp = "--"
+        elif isinstance(timestamp, str) and timestamp.strip():
+            stamp = timestamp.strip()
+        else:
+            stamp = "--"
+
+        speaker = str(
+            entry.get("role")
+            or entry.get("speaker")
+            or entry.get("source")
+            or ""
+        ).strip()
+        speaker = speaker or "unknown"
+
+        for key in ("message", "text", "content", "value"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                body = value.strip()
+                break
+        else:
+            safe = {k: v for k, v in entry.items() if k not in {"timestamp", "ts"}}
+            body = json.dumps(safe, ensure_ascii=False)
+
+        return f"[{stamp}] {speaker}: {body[:200]}"
+
+    # ------------------------------------------------------------------
+    def _line_matches(self, line: str, pattern: str) -> bool:
+        tokens = [token.lower() for token in pattern.split() if token.strip()]
+        if not tokens:
+            return True
+        subject = line.lower()
+        return all(token in subject for token in tokens)
+
+    # ------------------------------------------------------------------
+    def _apply_view_palette(self, view: QPlainTextEdit) -> None:
+        view.setStyleSheet(
+            "QPlainTextEdit {"
+            "background-color: #050b18;"
+            "color: #f0f6ff;"
+            "selection-background-color: #1d4ed8;"
+            "selection-color: #ffffff;"
+            "}"
+        )
+        font = QFont(view.font())
+        font.setStyleHint(QFont.Monospace)
+        font.setFamily("Fira Code")
+        font.setPointSize(9)
+        view.setFont(font)
+
+    # ------------------------------------------------------------------
+    def _perform_search(
+        self,
+        view: QPlainTextEdit,
+        term: str,
+        *,
+        backwards: bool = False,
+    ) -> None:
+        if not term:
+            return
+        flags = QTextDocument.FindFlags()
+        if backwards:
+            flags |= QTextDocument.FindBackward
+        if not view.find(term, flags):
+            cursor = view.textCursor()
+            if backwards:
+                cursor.movePosition(QTextCursor.End)
+            else:
+                cursor.movePosition(QTextCursor.Start)
+            view.setTextCursor(cursor)
+            view.find(term, flags)
+
+    # ------------------------------------------------------------------
+    def _perform_system_search(self, backwards: bool = False) -> None:
+        term = self._system_search_input.text().strip()
+        self._perform_search(self._system_view, term, backwards=backwards)
+
+    # ------------------------------------------------------------------
+    def _perform_process_search(self, backwards: bool = False) -> None:
+        term = self._process_search_input.text().strip()
+        self._perform_search(self._process_view, term, backwards=backwards)
+
+    # ------------------------------------------------------------------
+    def _perform_session_search(self, backwards: bool = False) -> None:
+        term = self._session_search_input.text().strip()
+        self._perform_search(self._session_view, term, backwards=backwards)
+
+    # ------------------------------------------------------------------
+    def _teardown(self) -> None:
+        self._system_timer.stop()
+        self._process_timer.stop()
+        self._session_timer.stop()
+        for handle in self._subscriptions:
+            try:
+                handle.unsubscribe()
+            except Exception:
+                self._logger.debug(
+                    "Failed to detach log subscription", exc_info=True
                 )
         self._subscriptions.clear()
 
@@ -13495,6 +14323,11 @@ class MainWindow(QMainWindow):
             self._orig_excepthook = sys.excepthook
             sys.excepthook = self._handle_exception
 
+        self.log_dock = LogObservabilityDock(self)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+        self.tabifyDockWidget(self.error_console, self.log_dock)
+
         self.desktop: Optional[TerminalDesktop] = None
         self.chat = ChatCard(self.theme, self.ollama, self.settings, self.lex_mgr, self)
         self.setCentralWidget(self.chat)
@@ -13542,6 +14375,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.fullscreen_act)
         view_menu.addAction(self.dataset_dock.toggleViewAction())
         view_menu.addAction(self.virtual_desktop_dock.toggleViewAction())
+        view_menu.addAction(self.log_dock.toggleViewAction())
 
     def _init_shortcuts(self):
         focus_input = QAction(self); focus_input.setShortcut(QKeySequence("Ctrl+`"))

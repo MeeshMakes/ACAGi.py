@@ -1,4 +1,14 @@
 # Changelog
+## [0.1.13] - 2025-10-05
+### Added
+- Introduced a Log Observatory dock that tails the shared system log, scans
+  process/session streams, and surfaces filter/search controls while live
+  streaming Thalamus bus events.
+
+### Changed
+- Tabified the Log Observatory with the error console and exposed a view menu
+  toggle so operators can quickly switch between diagnostics surfaces.
+
 ## [0.1.12] - 2025-10-05
 ### Added
 - Introduced a Virtual Desktop dock that lazily initializes consoles, Dev Space
