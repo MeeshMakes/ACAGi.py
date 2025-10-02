@@ -1,4 +1,24 @@
 # Changelog
+## [0.1.22] - 2025-10-09
+### Added
+- Added local GitHub Desktop and GitHub CLI detection with status badges in the
+  status bar telemetry panel and Settings dialog, avoiding any outbound network
+  probes.
+- Introduced a `RemoteAccessController` that gates remote fan-out behind an
+  explicit toggle, syncs safety policy notices, and emits ScriptSpeak
+  `TOGGLE_REMOTE` events with rich metadata.
+
+### Changed
+- Extended the status bar summary with remote tooling availability indicators
+  alongside remote link posture.
+- Updated the Settings dialog to surface remote toggle state and detection
+  tooltips inside a dedicated "Remote Access" section.
+
+### Validation
+- Ran `python -m compileall ACAGi.py` to confirm syntax integrity.
+- Documented manual remote toggle verification in
+  `logs/session_2025-10-02.md`.
+
 ## [0.1.21] - 2025-10-09
 ### Added
 - Introduced a ScriptSpeak parser that normalises verbs, arguments, and flags

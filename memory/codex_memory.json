@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-08",
+  "last_updated": "2025-10-09",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -101,6 +101,11 @@
       "title": "ScriptSpeak Command Dispatch",
       "summary": "ScriptSpeak commands are parsed into structured events on the script.command topic, mirrored into session logs, and reused by macros and Rationalizer outputs for auditable automation.",
       "applies_to": "scriptspeak"
+    },
+    {
+      "title": "Remote Access Controller Toggle",
+      "summary": "Remote fan-out must route through the RemoteAccessController so UI state, safety policies, and ScriptSpeak notifications stay synchronised whenever remote actions are enabled or paused.",
+      "applies_to": "remote-control"
     }
   ],
   "procedures": [
