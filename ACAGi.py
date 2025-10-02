@@ -18,6 +18,7 @@ import argparse
 import base64
 import copy
 import ctypes
+import configparser
 import difflib
 import hashlib
 import importlib
@@ -55,6 +56,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     MutableMapping,
     Optional,
     Sequence,
@@ -146,6 +148,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QAbstractItemView,
+    QStatusBar,
 )
 from memory_manager import RepositoryIndex
 from safety import SafetyViolation, manager as safety_manager
@@ -516,6 +519,258 @@ def _agent_subdir(name: str) -> Path:
 
 def agent_images_dir() -> Path:
     return _agent_subdir("images")
+
+
+# ============================================================================
+# Settings loader
+# ============================================================================
+
+CONFIG_FILENAME = "acagi.ini"
+CONFIG_PATH = BOOT_ENV.agent_subdir("config") / CONFIG_FILENAME
+
+DEFAULT_RUNTIME_CONFIG = {
+    "ui": {
+        "status_variant": "detailed",
+        "status_refresh_seconds": "15",
+    },
+    "mode": {
+        "offline": "false",
+        "sandbox": "restricted",
+    },
+    "limits": {
+        "share_limit": "5",
+        "event_rate_per_minute": "120",
+    },
+    "policy": {
+        "sentinel": "strict",
+        "auto_approve": "false",
+    },
+    "remote": {
+        "event_bus": "",
+        "sentinel": "",
+    },
+}
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSettings:
+    """Runtime configuration parsed from :mod:`acagi.ini`.
+
+    Schema overview:
+        ``[ui]``
+            ``status_variant`` – ``minimal`` or ``detailed`` controls the status bar text.
+            ``status_refresh_seconds`` – poll cadence for UI refresh helpers.
+        ``[mode]``
+            ``offline`` – boolean toggle gating remote integrations and telemetry.
+            ``sandbox`` – sandbox profile (``isolated``, ``restricted``, ``trusted``).
+        ``[limits]``
+            ``share_limit`` – default context-sharing cap for reference sharing widgets.
+            ``event_rate_per_minute`` – soft cap for remote event fan-out.
+        ``[policy]``
+            ``sentinel`` – label describing the active safety posture (``strict``/``monitor``).
+            ``auto_approve`` – allow sentinel to auto-confirm risky commands in trusted mode.
+        ``[remote]``
+            ``event_bus`` – optional URL for remote event replication.
+            ``sentinel`` – optional URL for a remote safety controller endpoint.
+    """
+
+    status_variant: str = "detailed"
+    status_refresh_seconds: int = 15
+    offline: bool = False
+    sandbox: str = "restricted"
+    share_limit: int = 5
+    event_rate_per_minute: int = 120
+    sentinel_policy: str = "strict"
+    auto_approve: bool = False
+    remote_event_bus: str = ""
+    remote_sentinel: str = ""
+
+
+class SettingsLoader:
+    """Persist ACAGi runtime defaults while tolerating absent or corrupt files."""
+
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        defaults: Optional[Mapping[str, Mapping[str, str]]] = None,
+    ) -> None:
+        self.path = path or CONFIG_PATH
+        self.defaults: Mapping[str, Mapping[str, str]] = (
+            defaults if defaults is not None else copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
+        )
+        self._parser = configparser.ConfigParser()
+
+    # ------------------------------------------------------------------
+    def load(self) -> RuntimeSettings:
+        parser = configparser.ConfigParser()
+        parser.read_dict(self.defaults)
+        if self.path.exists():
+            try:
+                parser.read(self.path, encoding="utf-8")
+            except (configparser.Error, OSError) as exc:
+                logging.getLogger(__name__).warning(
+                    "Failed to parse %s: %s – using defaults", self.path, exc
+                )
+        else:
+            self._persist_defaults()
+        self._parser = parser
+        settings = self._coerce(parser)
+        if not self.path.exists():
+            self.save(settings)
+        return settings
+
+    # ------------------------------------------------------------------
+    def save(self, settings: RuntimeSettings) -> None:
+        payload = configparser.ConfigParser()
+        payload.read_dict(DEFAULT_RUNTIME_CONFIG)
+        payload["ui"]["status_variant"] = settings.status_variant
+        payload["ui"]["status_refresh_seconds"] = str(settings.status_refresh_seconds)
+        payload["mode"]["offline"] = str(settings.offline).lower()
+        payload["mode"]["sandbox"] = settings.sandbox
+        payload["limits"]["share_limit"] = str(settings.share_limit)
+        payload["limits"]["event_rate_per_minute"] = str(settings.event_rate_per_minute)
+        payload["policy"]["sentinel"] = settings.sentinel_policy
+        payload["policy"]["auto_approve"] = str(settings.auto_approve).lower()
+        payload["remote"]["event_bus"] = settings.remote_event_bus
+        payload["remote"]["sentinel"] = settings.remote_sentinel
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as fh:
+            payload.write(fh)
+
+    # ------------------------------------------------------------------
+    def snapshot(self) -> Mapping[str, Mapping[str, str]]:
+        parser = self._parser if self._parser.sections() else self._fresh_parser()
+        data: Dict[str, Dict[str, str]] = {}
+        for section in parser.sections():
+            data[section] = {key: value for key, value in parser.items(section)}
+        return data
+
+    # ------------------------------------------------------------------
+    def _coerce(self, parser: configparser.ConfigParser) -> RuntimeSettings:
+        def get(section: str, option: str, fallback: str) -> str:
+            try:
+                return parser.get(section, option)
+            except (configparser.Error, ValueError):
+                return fallback
+
+        def get_int(section: str, option: str, fallback: int) -> int:
+            try:
+                return int(parser.get(section, option))
+            except (configparser.Error, ValueError, TypeError):
+                return fallback
+
+        def get_bool(section: str, option: str, fallback: bool) -> bool:
+            try:
+                return parser.getboolean(section, option)
+            except (configparser.Error, ValueError, TypeError):
+                return fallback
+
+        status_variant = get("ui", "status_variant", "detailed").strip().lower()
+        if status_variant not in {"minimal", "detailed"}:
+            status_variant = "detailed"
+
+        sandbox = get("mode", "sandbox", "restricted").strip().lower()
+        if sandbox not in {"isolated", "restricted", "trusted"}:
+            sandbox = "restricted"
+
+        sentinel_policy = get("policy", "sentinel", "strict").strip().lower()
+        if sentinel_policy not in {"strict", "monitor"}:
+            sentinel_policy = "strict"
+
+        remote_event_bus = get("remote", "event_bus", "").strip()
+        remote_sentinel = get("remote", "sentinel", "").strip()
+
+        return RuntimeSettings(
+            status_variant=status_variant,
+            status_refresh_seconds=max(1, get_int("ui", "status_refresh_seconds", 15)),
+            offline=get_bool("mode", "offline", False),
+            sandbox=sandbox,
+            share_limit=max(1, get_int("limits", "share_limit", 5)),
+            event_rate_per_minute=max(1, get_int("limits", "event_rate_per_minute", 120)),
+            sentinel_policy=sentinel_policy,
+            auto_approve=get_bool("policy", "auto_approve", False),
+            remote_event_bus=remote_event_bus,
+            remote_sentinel=remote_sentinel,
+        )
+
+    # ------------------------------------------------------------------
+    def _persist_defaults(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        parser = configparser.ConfigParser()
+        parser.read_dict(DEFAULT_RUNTIME_CONFIG)
+        with self.path.open("w", encoding="utf-8") as fh:
+            parser.write(fh)
+
+    # ------------------------------------------------------------------
+    def _fresh_parser(self) -> configparser.ConfigParser:
+        parser = configparser.ConfigParser()
+        parser.read_dict(DEFAULT_RUNTIME_CONFIG)
+        return parser
+
+
+SETTINGS_LOADER = SettingsLoader()
+RUNTIME_SETTINGS = SETTINGS_LOADER.load()
+_SENTINEL_LOGGER = logging.getLogger("sentinel")
+_SENTINEL_NOTIFIER_TOKEN: Optional[str] = None
+
+
+def configure_safety_sentinel(settings: RuntimeSettings) -> None:
+    """Align the safety manager with sandbox and policy runtime toggles."""
+
+    global _SENTINEL_NOTIFIER_TOKEN
+
+    try:
+        safety_manager.install_file_guard()
+    except Exception:
+        _SENTINEL_LOGGER.exception("Failed to install file guard")
+
+    if hasattr(safety_manager, "clear_protected"):
+        try:
+            safety_manager.clear_protected()
+        except Exception:
+            _SENTINEL_LOGGER.debug("Unable to clear protected paths", exc_info=True)
+
+    protected_roots: List[Path] = []
+    if settings.sandbox == "isolated":
+        protected_roots = [workspace_root(), Path.home()]
+    elif settings.sandbox == "restricted":
+        protected_roots = [workspace_root()]
+
+    for root in protected_roots:
+        if not hasattr(safety_manager, "add_protected_directory"):
+            break
+        try:
+            safety_manager.add_protected_directory(root)
+        except Exception:
+            _SENTINEL_LOGGER.debug("Failed to protect directory: %s", root, exc_info=True)
+
+    if _SENTINEL_NOTIFIER_TOKEN and hasattr(safety_manager, "remove_notifier"):
+        try:
+            safety_manager.remove_notifier(_SENTINEL_NOTIFIER_TOKEN)
+        except Exception:
+            _SENTINEL_LOGGER.debug("Could not detach sentinel notifier", exc_info=True)
+        _SENTINEL_NOTIFIER_TOKEN = None
+
+    if hasattr(safety_manager, "add_notifier"):
+
+        def _dispatch(message: str) -> None:
+            _SENTINEL_LOGGER.info("%s", message)
+            try:
+                publish(
+                    "system.metrics",
+                    {
+                        "kind": "sentinel",
+                        "message": message,
+                        "meta": {"policy": settings.sentinel_policy},
+                    },
+                )
+            except Exception:
+                _SENTINEL_LOGGER.debug("Unable to emit sentinel event", exc_info=True)
+
+        try:
+            _SENTINEL_NOTIFIER_TOKEN = safety_manager.add_notifier(_dispatch)
+        except Exception:
+            _SENTINEL_LOGGER.debug("Failed to attach sentinel notifier", exc_info=True)
 
 
 def agent_sessions_dir() -> Path:
@@ -1015,6 +1270,11 @@ _WILDCARD_TOPIC = "task.*"
 _BUS_LOGGER = logging.getLogger("tasks.bus")
 _SUBSCRIBERS: MutableMapping[str, List[Subscriber]] = defaultdict(list)
 _BUS_LOCK = RLock()
+_EVENT_RATE_WINDOW = 60.0
+_EVENT_RATE_LIMIT = max(1, RUNTIME_SETTINGS.event_rate_per_minute)
+_EVENT_RATE_HISTORY: Deque[float] = deque()
+_EVENT_REMOTE_URL = RUNTIME_SETTINGS.remote_event_bus
+_EVENT_REMOTE_ENABLED = bool(_EVENT_REMOTE_URL and not RUNTIME_SETTINGS.offline)
 
 
 class Subscription:
@@ -1079,15 +1339,44 @@ def publish(topic: str, payload: dict) -> None:
         raise TypeError("payload must be a dictionary")
     _validate_topic(topic)
 
+    enriched_payload = dict(payload)
+    meta = dict(enriched_payload.get("meta", {}))
+    meta.setdefault("offline", RUNTIME_SETTINGS.offline)
+    meta.setdefault("sandbox", RUNTIME_SETTINGS.sandbox)
+    meta.setdefault("share_limit", RUNTIME_SETTINGS.share_limit)
+    meta.setdefault("sentinel_policy", RUNTIME_SETTINGS.sentinel_policy)
+    enriched_payload["meta"] = meta
+
     with _BUS_LOCK:
         listeners = list(_SUBSCRIBERS.get(topic, ()))
         wildcard_listeners = list(_SUBSCRIBERS.get(_WILDCARD_TOPIC, ()))
 
     for callback in (*listeners, *wildcard_listeners):
         try:
-            callback(payload)
+            callback(enriched_payload)
         except Exception:  # pragma: no cover - defensive logging
             _BUS_LOGGER.exception("Error dispatching %s to %r", topic, callback)
+
+    if _EVENT_REMOTE_ENABLED:
+        now = time.monotonic()
+        with _BUS_LOCK:
+            while _EVENT_RATE_HISTORY and now - _EVENT_RATE_HISTORY[0] > _EVENT_RATE_WINDOW:
+                _EVENT_RATE_HISTORY.popleft()
+            if len(_EVENT_RATE_HISTORY) >= _EVENT_RATE_LIMIT:
+                _BUS_LOGGER.warning(
+                    "Remote event bus limit reached (%s/min) – dropping %s", _EVENT_RATE_LIMIT, topic
+                )
+                return
+            _EVENT_RATE_HISTORY.append(now)
+        _BUS_LOGGER.debug(
+            "Remote fan-out to %s suppressed=%s payload_keys=%s",
+            _EVENT_REMOTE_URL,
+            RUNTIME_SETTINGS.offline,
+            list(enriched_payload.keys()),
+        )
+
+
+configure_safety_sentinel(RUNTIME_SETTINGS)
 
 
 # -- Diff capture -----------------------------------------------------------
@@ -8632,6 +8921,7 @@ def _default_settings() -> Dict[str, Any]:
         "reference_case_sensitive": DEFAULT_SETTINGS.get("reference_case_sensitive", False),
         "reference_token_guard": DEFAULT_SETTINGS.get("reference_token_guard", True),
         "reference_token_headroom": DEFAULT_SETTINGS.get("reference_token_headroom", 80),
+        "share_limit": RUNTIME_SETTINGS.share_limit,
         "scan_roots": [],
         "shells": {
             "cmd": True,
@@ -8661,8 +8951,11 @@ class MainWindow(QMainWindow):
 
         self.ollama = OllamaClient()
         self.lex_mgr = LexiconManager(lexicons_dir())
+        self.feature_flags = RUNTIME_SETTINGS
+        configure_safety_sentinel(self.feature_flags)
 
         self.settings = _default_settings()
+        self.settings.setdefault("share_limit", self.feature_flags.share_limit)
         saved_codex = load_codex_settings()
         if isinstance(saved_codex, dict):
             self.settings["enable_interpreter"] = bool(
@@ -8723,6 +9016,8 @@ class MainWindow(QMainWindow):
             self.desktop = TerminalDesktop(theme, self.chat, self)
             self.setCentralWidget(self.desktop)
         safety_manager.set_confirmer(self._confirm_risky_command)
+        self.status_indicator: QStatusBar = self.statusBar()
+        self._refresh_status_bar()
 
         self._init_menu()
         self._init_shortcuts()
@@ -8768,6 +9063,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ollama", f"Ollama Not found: {msg}")
 
     def _confirm_risky_command(self, prompt: str, command: Sequence[str]) -> bool:
+        if self.feature_flags.auto_approve and self.feature_flags.sandbox == "trusted":
+            shared_logger().info(
+                "Sentinel auto-approved command under trusted sandbox: %s",
+                shlex.join(command),
+            )
+            return True
+
         if QApplication.instance() is None:
             return False
         joined = shlex.join(command)
@@ -8783,6 +9085,25 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         return result == QMessageBox.Yes
+
+    def _refresh_status_bar(self) -> None:
+        if not hasattr(self, "status_indicator"):
+            return
+        offline_state = "Offline" if self.feature_flags.offline else "Online"
+        sandbox_state = self.feature_flags.sandbox.capitalize()
+        limit = self.settings.get("share_limit", self.feature_flags.share_limit)
+        policy = self.feature_flags.sentinel_policy.capitalize()
+        remote_flag = "Remote bus linked" if self.feature_flags.remote_event_bus else "Local events"
+        summary = " • ".join(
+            [
+                offline_state,
+                f"Sandbox: {sandbox_state}",
+                f"Share limit: {limit}",
+                f"Policy: {policy}",
+                remote_flag,
+            ]
+        )
+        self.status_indicator.showMessage(summary)
 
     # ------------------------------------------------------------------
     def _handle_exception(self, exc_type, exc, tb) -> None:
@@ -8929,6 +9250,8 @@ class MainWindow(QMainWindow):
             else:
                 self.desktop = TerminalDesktop(self.theme, self.chat, self)
                 self.setCentralWidget(self.desktop)
+            configure_safety_sentinel(self.feature_flags)
+            self._refresh_status_bar()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if hasattr(self, "chat") and hasattr(self.chat, "detach_safety_notifier"):

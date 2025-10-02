@@ -1,2 +1,5 @@
 {"id": "2025-10-01-001", "title": "Draft Sentinel troubleshooting runbook", "status": "pending", "notes": "Expand Agent manual with failure recovery steps for codex-pr-sentinel."}
 {"id": "2025-10-01-002", "title": "Define Dev Logic proposal template", "status": "pending", "notes": "Create reusable markdown template in Dev_Logic for future design proposals."}
+{"id": "2025-10-04-001", "title": "Expose runtime flags in settings dialog", "status": "pending", "notes": "Hook offline, sandbox, and remote URLs into the preferences UI backed by the new SettingsLoader."}
+{"id": "2025-10-04-002", "title": "Test SettingsLoader parsing", "status": "pending", "notes": "Add unit coverage for INI defaults, override parsing, and error handling."}
+{"id": "2025-10-04-003", "title": "Handle workspace config rebinding", "status": "pending", "notes": "Reload runtime settings when the workspace override adjusts BootEnvironment paths."}

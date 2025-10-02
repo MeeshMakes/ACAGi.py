@@ -1,5 +1,12 @@
 # Changelog
 
+# [0.1.5] - 2025-10-04
+### Added
+- Added a structured runtime settings loader (`acagi.ini`) that materializes defaults, documents config sections, and persists boolean/limit flags for offline, sandbox, and remote integrations.
+
+### Changed
+- Routed runtime feature flags into the event bus metadata, remote throttling, safety sentinel, and UI status bar so operators immediately see offline/sandbox context and configured rate limits.
+
 ## [0.1.4] - 2025-10-03
 ### Added
 - Introduced a Boot & Environment bootstrap in `ACAGi.py` that centralizes DPI policy, workspace/transit resolution, shared logging (`vd_system.log`), and the BrainShell crash dialog.
