@@ -22909,7 +22909,12 @@ def _ensure_windows_elevation(logger: Optional[logging.Logger] = None) -> None:
         "Administrative privileges required; relaunching ACAGi with elevation.",
     )
 
-    params = " ".join(sys.argv[1:])
+    # ``ShellExecuteW`` expects a single command-line string that mirrors the way
+    # Windows shells parse arguments. Building this value manually via string
+    # joins loses quoting for arguments that contain spaces or other shell
+    # metacharacters. ``subprocess.list2cmdline`` centralises those quoting
+    # semantics so any spaced argument survives the elevation hop intact.
+    params = subprocess.list2cmdline(sys.argv[1:])
     os.environ["ACAGI_ELEVATED"] = "1"
 
     try:
