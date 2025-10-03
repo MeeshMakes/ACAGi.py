@@ -11,9 +11,6 @@ Windows 10+ for the bridge runtime.
 
 from __future__ import annotations
 
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtCore import Qt
-
 import argparse
 import ast
 import audioop
@@ -76,7 +73,7 @@ from typing import (
 
 # Optional dependencies are resolved via runtime checks instead of guarded imports
 _REQUESTS_MODULE_NAME = "requests"
-_PILLOW_MODULE_NAME = "PIL.Image"
+_PILLOW_MODULE_NAME = "PIL"
 _NUMPY_MODULE_NAME = "numpy"
 _SOUNDDEVICE_MODULE_NAME = "sounddevice"
 _PYTTSX3_MODULE_NAME = "pyttsx3"
@@ -112,7 +109,36 @@ if importlib.util.find_spec(_WHISPER_MODULE_NAME):
 else:
     whisper = None  # type: ignore[assignment]
 
+_PYSIDE6_MODULE_NAME = "PySide6"
+
+if importlib.util.find_spec(_PYSIDE6_MODULE_NAME) is None:
+    def _main_missing_pyside6() -> int:
+        """Emit a clear bootstrap error when PySide6 is unavailable.
+
+        The governance charter requires graceful handling of optional
+        dependencies. Instead of allowing the interpreter to raise a
+        `ModuleNotFoundError`, we log the corrective steps so operators can
+        install GUI requirements or fall back to headless automation flows.
+        """
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("acagi.bootstrap")
+        logger.error(
+            "PySide6 is not installed, preventing the ACAGi desktop from launching."
+        )
+        logger.info(
+            "Install PySide6>=6.6 (e.g. `pip install PySide6`) or run headless"
+            " automation commands via Codex_Terminal.py."
+        )
+        return 1
+
+    _EXIT_CODE = _main_missing_pyside6()
+    if __name__ == "__main__":
+        sys.exit(_EXIT_CODE)
+    raise SystemExit(_EXIT_CODE)
+
 from PySide6.QtCore import (
+    Qt,
     QRect,
     QRectF,
     QTimer,
@@ -134,6 +160,7 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QDesktopServices,
+    QGuiApplication,
     QFont,
     QKeyEvent,
     QKeySequence,

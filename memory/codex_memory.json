@@ -193,6 +193,16 @@
         "introduced": "2025-10-16",
         "notes": "Fallback on environment variables when the guard detects an existing Qt instance."
       }
+    },
+    {
+      "id": "pyside6-bootstrap-guard",
+      "title": "PySide6 Bootstrap Guard",
+      "summary": "ACAGi.py now checks for PySide6 at import time and logs installation guidance before exiting so headless automation remains usable when the GUI dependency is missing.",
+      "applies_to": "acagi-boot",
+      "metadata": {
+        "introduced": "2025-10-17",
+        "notes": "Re-run `pip install PySide6` or leverage Codex_Terminal.py for CLI workflows when the guard triggers."
+      }
     }
   ],
   "procedures": [
