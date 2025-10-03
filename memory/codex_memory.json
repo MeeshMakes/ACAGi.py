@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-14",
+  "last_updated": "2025-10-15",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -149,6 +149,11 @@
       "title": "Remote Access Dispatcher Boot Order",
       "summary": "Instantiate the RemoteAccessController only after the EventDispatcher is available so module import order keeps Codex Terminal and Virtual Desktop integrations stable and prevents NameError exceptions during startup.",
       "applies_to": "remote-control"
+    },
+    {
+      "title": "Sentinel Flush Ordering",
+      "summary": "Invoke `flush_pending_sentinel_events()` only after its definition is available so sentinel history replay during import avoids NameError exceptions while still running immediately after dispatcher setup.",
+      "applies_to": "safety-monitoring"
     }
   ],
   "procedures": [
