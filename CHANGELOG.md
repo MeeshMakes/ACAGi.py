@@ -1,4 +1,14 @@
 # Changelog
+## [0.1.38] - 2025-10-18
+### Added
+- Introduced a Windows elevation helper that relaunches ACAGi with the
+  ``runas`` verb when administrative privileges are missing, guarding against
+  infinite recursion with the ``ACAGI_ELEVATED`` environment flag and logging
+  bootstrap decisions for operators.
+
+### Validation
+- `python -m compileall ACAGi.py`
+
 ## [0.1.37] - 2025-10-18
 ### Fixed
 - Reused ACAGi's guarded DPI helper inside `Codex_Terminal.py` so both

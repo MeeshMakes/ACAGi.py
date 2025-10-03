@@ -22790,6 +22790,90 @@ def locate_styles_json() -> str:
     p = styles_path()
     return str(p) if p.is_file() else ""
 
+
+def _ensure_windows_elevation(logger: Optional[logging.Logger] = None) -> None:
+    """Guarantee ACAGi runs with administrative privileges on Windows hosts.
+
+    Windows builds rely on elevated privileges to interact with the virtual
+    desktop bridge and shell integrations. When the operator double-clicks the
+    executable, the interpreter may start without elevation. This helper checks
+    the current privileges via ``IsUserAnAdmin`` and, when missing, relaunches
+    the script with ``runas`` using ``ShellExecuteW``. The ``ACAGI_ELEVATED``
+    environment variable acts as a recursion guard so the relaunched process can
+    continue bootstrapping without repeatedly invoking the elevation routine.
+    """
+
+    if not sys.platform.startswith("win"):
+        return
+
+    effective_logger = logger or logging.getLogger("acagi.bootstrap")
+
+    if os.environ.get("ACAGI_ELEVATED") == "1":
+        effective_logger.debug(
+            "Elevation flag detected; continuing without requesting elevation "
+            "again.",
+        )
+        return
+
+    try:
+        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+    except AttributeError:
+        effective_logger.warning(
+            "Windows shell32 dispatch is unavailable; skipping elevation check.",
+        )
+        return
+
+    try:
+        is_admin = bool(shell32.IsUserAnAdmin())
+    except Exception as exc:  # pragma: no cover - defensive guard for ctypes
+        effective_logger.warning(
+            "Failed to query administrative privileges via IsUserAnAdmin: %s",
+            exc,
+        )
+        return
+
+    if is_admin:
+        os.environ["ACAGI_ELEVATED"] = "1"
+        effective_logger.debug(
+            "Process already has administrative privileges; marking elevation "
+            "flag.",
+        )
+        return
+
+    effective_logger.info(
+        "Administrative privileges required; relaunching ACAGi with elevation.",
+    )
+
+    params = " ".join(sys.argv[1:])
+    os.environ["ACAGI_ELEVATED"] = "1"
+
+    try:
+        result = shell32.ShellExecuteW(
+            None,
+            "runas",
+            sys.executable,
+            params,
+            None,
+            1,
+        )
+    except Exception:
+        os.environ.pop("ACAGI_ELEVATED", None)
+        effective_logger.exception(
+            "ShellExecuteW failed while attempting to relaunch ACAGi with elevation.",
+        )
+        raise SystemExit(1)
+
+    if result <= 32:
+        os.environ.pop("ACAGI_ELEVATED", None)
+        effective_logger.error(
+            "ShellExecuteW returned failure code %s during elevation request.",
+            result,
+        )
+        raise SystemExit(1)
+
+    sys.exit(0)
+
+
 def main():
     logger = shared_logger()
     logger.info("ACAGi starting up (pid=%s)", os.getpid())
@@ -22798,6 +22882,8 @@ def main():
             handler.flush()
         except Exception:
             continue
+
+    _ensure_windows_elevation(logger)
 
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument(
