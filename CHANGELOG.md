@@ -1,4 +1,28 @@
 # Changelog
+## [0.1.27] - 2025-10-12
+### Added
+- Introduced a status bar **Self-Implementation Mode** toggle that wires a new
+  autonomy controller into the Rationalizer, task bucket pipeline, and sentinel
+  event streams.
+- Added telemetry publishing on `autonomy.self_impl` and appended session notes
+  for every autonomous cycle so operators can audit generated tasks.
+
+### Changed
+- Updated `policies.json` with a dedicated `self_impl` operation enforcing
+  serialized execution, 900 s watchdogs, and network denial; sentinel events now
+  pause the mode on quota or loop violations.
+- Documented the new workflow and manual observation steps in `README.md` and
+  refreshed status panel UX to surface the toggle state.
+- Emitted explicit `autonomy.self_impl` sub-events when sentinel policies pause
+  the controller so observers can correlate cycle history with energy or loop
+  enforcement in real time.
+
+### Validation
+- `python -m compileall ACAGi.py`
+- Manual: enable Self-Implementation Mode, observe `autonomy.self_impl` and
+  sentinel events in the Log Observatory, and confirm the status bar pauses when
+  energy or loop policies trigger.
+
 ## [0.1.26] - 2025-10-12
 ### Added
 - Introduced reusable helpers to load and persist `policies.json`, regenerating

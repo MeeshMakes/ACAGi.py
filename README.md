@@ -52,7 +52,40 @@ pip install -r requirements.txt
 
 ## Usage
 
-[Provide basic usage instructions or code examples here.]
+### Self-Implementation Mode
+
+The status bar now exposes a **Self-Implementation Mode** toggle that enables
+ACAGi to autonomously survey durable memory, dataset anchors, and the logic
+inbox. When active, the controller dispatches Rationalizer intent segmentation
+jobs, spawns exploratory task buckets, and appends a session note summarising
+every cycle.
+
+Sentinel policies remain in control of energy quotas and loop detection:
+
+- `policies.json` defines a `self_impl` operation with a single concurrent slot,
+  a 900 s watchdog, and denied network access.
+- The controller emits `autonomy.energy_quota` and `autonomy.loop_detected`
+  sentinel events whenever quotas or digest repeats trigger a pause.
+- The status bar button is disabled automatically when Sentinel blocks further
+  cycles.
+
+#### Manual Observation Steps
+
+1. Launch ACAGi and open the **Log Observatory** dock to tail the shared log.
+2. Toggle **Self-Implementation** on from the status bar telemetry panel.
+3. Monitor the log for `autonomy.self_impl` events that describe survey inputs,
+   generated bucket IDs, and associated task anchors. Expect additional
+   sub-events (`energy_violation`, `loop_violation`, `sentinel_blocked`) when
+   the controller pauses itself.
+4. Inspect the **system.sentinel** feed (Log Observatory or chat stream) for
+   `autonomy.energy_quota` or `autonomy.loop_detected` warnings. The status bar
+   button will pause automatically and surface the sentinel reason when a
+   violation fires.
+5. Review `logs/session_<date>.md` for the appended session note summarising
+   each Self-Implementation cycle and sentinel pause.
+
+Disable the toggle to return to manual control or investigate sentinel
+warnings before re-enabling autonomous cycles.
 
 ## Contributing
 

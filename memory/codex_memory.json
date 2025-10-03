@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-11",
+  "last_updated": "2025-10-12",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -124,6 +124,15 @@
       "metadata": {
         "introduced": "2025-10-11",
         "notes": "Ensure new inbox entries include action/topic metadata when special handling is required."
+      }
+    },
+    {
+      "title": "Self-Implementation Sentinels",
+      "summary": "Self-Implementation Mode emits autonomy.self_impl telemetry, including sentinel_blocked/energy_violation/loop_violation events, obeys the self_impl policy guard, pauses when sentinel warnings fire, and records each cycle in the session log.",
+      "applies_to": "autonomy",
+      "metadata": {
+        "introduced": "2025-10-12",
+        "notes": "Monitor the Log Observatory and sentinel feeds whenever the status bar toggle is active; the status bar now mirrors sentinel pause reasons."
       }
     },
     {

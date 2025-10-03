@@ -121,6 +121,7 @@ from PySide6.QtCore import (
     QSize,
     QEvent,
     QObject,
+    QMetaObject,
     QMimeData,
     QPoint,
     QUrl,
@@ -4329,6 +4330,7 @@ DEFAULT_EVENT_TOPICS: Set[str] = {
     "task.bucket.stage",
     "task.bucket.error",
     "task.bucket.telemetry",
+    "autonomy.self_impl",
     # System coordination and metrics feeds.
     "system.metrics",
     "system.process",
@@ -7940,6 +7942,824 @@ def trigger_manual_immune_response(
 
 
 configure_safety_sentinel(RUNTIME_SETTINGS)
+
+
+@dataclass(slots=True)
+class SelfImplementationState:
+    """Runtime state for the Self-Implementation Mode controller."""
+
+    active: bool
+    blocked: bool
+    reason: str
+    last_cycle_at: Optional[float] = None
+
+    def to_payload(self) -> Dict[str, Any]:
+        payload = {
+            "active": self.active,
+            "blocked": self.blocked,
+            "reason": self.reason,
+        }
+        if self.last_cycle_at is not None:
+            payload["last_cycle_at"] = float(self.last_cycle_at)
+        return payload
+
+
+@dataclass(slots=True)
+class SelfImplementationContext:
+    """Snapshot of the material surveyed during an autonomy cycle."""
+
+    dataset_samples: List[Tuple[str, str]]
+    lesson_samples: List[Tuple[str, str]]
+    inbox_samples: List[Tuple[str, str]]
+    prompt: str
+    digest: str
+
+    def to_payload(self) -> Dict[str, Any]:
+        def _entries(values: Sequence[Tuple[str, str]]) -> List[Dict[str, str]]:
+            return [
+                {"anchor": anchor, "summary": summary}
+                for anchor, summary in values
+            ]
+
+        return {
+            "dataset": _entries(self.dataset_samples),
+            "lessons": _entries(self.lesson_samples),
+            "inbox": _entries(self.inbox_samples),
+            "digest": self.digest,
+        }
+
+
+class SelfImplementationController(QObject):
+    """Coordinate the Self-Implementation autonomous Rationalizer loop."""
+
+    stateChanged = Signal(dict)
+
+    def __init__(
+        self,
+        dataset: "DatasetManager",
+        memory: MemoryServices,
+        *,
+        settings: Mapping[str, Any],
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._dataset = dataset
+        self._memory = memory
+        self._rationalizer = rationalizer_manager()
+        self._logger = logging.getLogger(f"{VD_LOGGER_NAME}.autonomy.self_impl")
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._run_cycle)
+        self._lock = RLock()
+        config = dict(settings.get("self_impl", {}))
+        self._survey_interval = float(config.get("survey_interval_seconds", 180.0))
+        self._survey_interval = max(30.0, self._survey_interval)
+        self._energy_window = float(config.get("energy_window_seconds", 900.0))
+        self._energy_window = max(120.0, self._energy_window)
+        self._energy_quota = int(config.get("energy_quota", 3))
+        self._energy_quota = max(1, self._energy_quota)
+        loop_window = int(config.get("loop_window", 6))
+        loop_window = max(3, loop_window)
+        self._dataset_sample = int(config.get("dataset_sample", 3))
+        self._dataset_sample = max(1, self._dataset_sample)
+        self._lesson_sample = int(config.get("lesson_sample", 2))
+        self._lesson_sample = max(1, self._lesson_sample)
+        self._inbox_sample = int(config.get("inbox_sample", 2))
+        self._inbox_sample = max(1, self._inbox_sample)
+        self._recent_context_hashes: Deque[str] = deque(maxlen=loop_window)
+        self._pending_jobs: Dict[str, Dict[str, Any]] = {}
+        self._pending_intent_payloads: Deque[Dict[str, Any]] = deque()
+        self._intent_pending = False
+        self._pending_sentinel_payloads: Deque[Dict[str, Any]] = deque()
+        self._sentinel_pending = False
+        self._intent_subscription: Optional[Subscription] = None
+        self._sentinel_subscription: Optional[Subscription] = None
+        self._active = False
+        self._policy_blocked = False
+        self._state = SelfImplementationState(
+            active=False,
+            blocked=False,
+            reason="Self-Implementation Mode is idle.",
+        )
+        self._violation_reason = ""
+        self._last_cycle_ts: Optional[float] = None
+        self._window_start = time.monotonic()
+        self._cycles_in_window = 0
+
+    @property
+    def state(self) -> SelfImplementationState:
+        """Return a snapshot of the current controller state."""
+
+        with self._lock:
+            return SelfImplementationState(
+                active=self._state.active,
+                blocked=self._state.blocked,
+                reason=self._state.reason,
+                last_cycle_at=self._state.last_cycle_at,
+            )
+
+    # ------------------------------------------------------------------
+    def start(self) -> bool:
+        """Activate the autonomy loop if the Rationalizer is available."""
+
+        if self._active:
+            return True
+        manager = rationalizer_manager()
+        if manager is None:
+            message = (
+                "Rationalizer manager unavailable; cannot start Self-Implementation"
+            )
+            self._logger.warning(message)
+            self._update_state(active=False, blocked=True, reason=message)
+            return False
+        self._rationalizer = manager
+        self._policy_blocked = False
+        self._violation_reason = ""
+        self._recent_context_hashes.clear()
+        self._pending_jobs.clear()
+        self._window_start = time.monotonic()
+        self._cycles_in_window = 0
+        if not self._install_subscriptions():
+            return False
+        self._active = True
+        self._schedule_next_cycle(0.1)
+        self._update_state(
+            active=True,
+            blocked=False,
+            reason="Self-Implementation Mode engaged.",
+        )
+        self._publish_event({
+            "event": "activated",
+            "state": self._state.to_payload(),
+        })
+        return True
+
+    # ------------------------------------------------------------------
+    def stop(self, *, blocked: bool = False, reason: Optional[str] = None) -> None:
+        """Disable the autonomy loop and clear outstanding state."""
+
+        if not self._active and not blocked:
+            return
+        self._timer.stop()
+        self._active = False
+        self._policy_blocked = blocked
+        self._teardown_subscriptions()
+        message = reason or (
+            "Self-Implementation Mode paused." if not blocked else "Self-Implementation Mode blocked."
+        )
+        self._update_state(active=False, blocked=blocked, reason=message)
+        self._publish_event({
+            "event": "deactivated",
+            "blocked": blocked,
+            "state": self._state.to_payload(),
+        })
+
+    # ------------------------------------------------------------------
+    def update_dataset(self, dataset: "DatasetManager") -> None:
+        """Refresh the dataset handle when the chat card is rebuilt."""
+
+        with self._lock:
+            self._dataset = dataset
+
+    # ------------------------------------------------------------------
+    def _schedule_next_cycle(self, delay: float) -> None:
+        if not self._active:
+            return
+        interval_ms = max(100, int(delay * 1000))
+        self._timer.start(interval_ms)
+
+    # ------------------------------------------------------------------
+    def _install_subscriptions(self) -> bool:
+        try:
+            self._intent_subscription = subscribe(
+                "cortex.intent", self._handle_intent_event
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to subscribe to Rationalizer results for Self-Implementation"
+            )
+            self._update_state(
+                active=False,
+                blocked=True,
+                reason="Unable to subscribe to Rationalizer results.",
+            )
+            return False
+        try:
+            self._sentinel_subscription = subscribe(
+                "system.sentinel", self._handle_sentinel_event
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to subscribe to sentinel events for Self-Implementation"
+            )
+            if self._intent_subscription is not None:
+                self._intent_subscription.unsubscribe()
+                self._intent_subscription = None
+            self._update_state(
+                active=False,
+                blocked=True,
+                reason="Unable to subscribe to sentinel events.",
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def _teardown_subscriptions(self) -> None:
+        for subscription in (self._intent_subscription, self._sentinel_subscription):
+            if subscription is not None:
+                try:
+                    subscription.unsubscribe()
+                except Exception:
+                    self._logger.debug(
+                        "Failed to unsubscribe Self-Implementation hook", exc_info=True
+                    )
+        self._intent_subscription = None
+        self._sentinel_subscription = None
+
+    # ------------------------------------------------------------------
+    def _handle_intent_event(self, payload: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._pending_intent_payloads.append(dict(payload))
+            should_schedule = not self._intent_pending
+            self._intent_pending = True
+        if should_schedule:
+            QMetaObject.invokeMethod(
+                self,
+                "_drain_intent_events",
+                Qt.QueuedConnection,
+            )
+
+    # ------------------------------------------------------------------
+    @Slot()
+    def _drain_intent_events(self) -> None:
+        payloads: List[Dict[str, Any]] = []
+        with self._lock:
+            while self._pending_intent_payloads:
+                payloads.append(self._pending_intent_payloads.popleft())
+            self._intent_pending = False
+        for payload in payloads:
+            self._process_intent_payload(payload)
+
+    # ------------------------------------------------------------------
+    def _process_intent_payload(self, payload: Mapping[str, Any]) -> None:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id or job_id not in self._pending_jobs:
+            return
+        job_meta = self._pending_jobs.pop(job_id)
+        status = str(payload.get("status") or "").strip().lower()
+        if status != "success":
+            self._logger.warning(
+                "Self-Implementation Rationalizer job failed job=%s status=%s",
+                job_id,
+                status,
+            )
+            detail = str(payload.get("error") or payload.get("detail") or "")
+            if detail:
+                self._logger.info("Rationalizer failure detail: %s", detail)
+            return
+
+        result = payload.get("result") or {}
+        segments = []
+        if isinstance(result, Mapping):
+            raw_segments = result.get("segments")
+            if isinstance(raw_segments, Sequence):
+                for entry in raw_segments:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    text = str(entry.get("text") or "").strip()
+                    if not text:
+                        continue
+                    label = str(entry.get("label") or "Insight").strip()
+                    segments.append(
+                        {
+                            "label": label,
+                            "text": text,
+                            "span": entry.get("span") or {},
+                        }
+                    )
+
+        self._materialise_cycle(job_meta, segments)
+
+    # ------------------------------------------------------------------
+    def _handle_sentinel_event(self, payload: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._pending_sentinel_payloads.append(dict(payload))
+            should_schedule = not self._sentinel_pending
+            self._sentinel_pending = True
+        if should_schedule:
+            QMetaObject.invokeMethod(
+                self,
+                "_drain_sentinel_events",
+                Qt.QueuedConnection,
+            )
+
+    # ------------------------------------------------------------------
+    @Slot()
+    def _drain_sentinel_events(self) -> None:
+        payloads: List[Dict[str, Any]] = []
+        with self._lock:
+            while self._pending_sentinel_payloads:
+                payloads.append(self._pending_sentinel_payloads.popleft())
+            self._sentinel_pending = False
+        for payload in payloads:
+            self._process_sentinel_payload(payload)
+
+    # ------------------------------------------------------------------
+    def _process_sentinel_payload(self, payload: Mapping[str, Any]) -> None:
+        kind = str(payload.get("kind") or "").strip()
+        metadata = payload.get("metadata") or {}
+        operation = str(metadata.get("operation") or "").strip().lower()
+        triggered = False
+        if operation == "self_impl" and kind.startswith("operation."):
+            self._violation_reason = str(
+                payload.get("summary")
+                or "Sentinel blocked Self-Implementation."
+            )
+            self._policy_blocked = True
+            triggered = True
+        elif kind in {"autonomy.energy_quota", "autonomy.loop_detected"}:
+            self._violation_reason = str(
+                payload.get("summary")
+                or "Sentinel paused Self-Implementation."
+            )
+            self._policy_blocked = True
+            triggered = True
+        if triggered:
+            meta_snapshot = dict(metadata) if isinstance(metadata, Mapping) else {}
+            self._publish_event(
+                {
+                    "event": "sentinel_blocked",
+                    "kind": kind,
+                    "metadata": meta_snapshot,
+                    "reason": self._violation_reason,
+                    "state": self._state.to_payload(),
+                }
+            )
+            self._logger.warning(
+                "Sentinel blocked Self-Implementation event=%s metadata=%s reason=%s",
+                kind,
+                meta_snapshot,
+                self._violation_reason,
+            )
+        if self._policy_blocked and self._active:
+            reason = (
+                self._violation_reason
+                or "Self-Implementation Mode blocked by Sentinel."
+            )
+            self.stop(blocked=True, reason=reason)
+
+    # ------------------------------------------------------------------
+    def _run_cycle(self) -> None:
+        if not self._active or self._policy_blocked:
+            return
+        try:
+            with safety_manager.operation_guard("self_impl"):
+                if not self._check_energy_budget():
+                    reason = (
+                        self._violation_reason
+                        or "Self-Implementation energy quota reached."
+                    )
+                    self.stop(blocked=True, reason=reason)
+                    return
+                context = self._survey_context()
+                if context is None:
+                    self._logger.debug(
+                        "Self-Implementation survey yielded no actionable context"
+                    )
+                    self._schedule_next_cycle(self._survey_interval)
+                    return
+                if not self._record_context(context):
+                    reason = (
+                        self._violation_reason
+                        or "Self-Implementation detected a repeating survey loop."
+                    )
+                    self.stop(blocked=True, reason=reason)
+                    return
+                assert self._rationalizer is not None
+                cycle_id = uuid.uuid4().hex
+                bucket_id = (
+                    f"sib_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                )
+                job_id = self._rationalizer.queue_intent_segmentation(
+                    context.prompt,
+                    conversation_id=f"self_impl::{cycle_id}",
+                    metadata={
+                        "origin": "self_impl",
+                        "cycle_id": cycle_id,
+                        "bucket_id": bucket_id,
+                    },
+                )
+                self._pending_jobs[job_id] = {
+                    "cycle_id": cycle_id,
+                    "bucket_id": bucket_id,
+                    "context": context,
+                    "submitted_at": time.time(),
+                }
+                self._cycles_in_window += 1
+                self._last_cycle_ts = time.time()
+                self._update_state(
+                    active=True,
+                    blocked=False,
+                    reason="Self-Implementation survey queued for Rationalizer processing.",
+                    last_cycle_at=self._last_cycle_ts,
+                )
+                self._publish_event(
+                    {
+                        "event": "cycle_queued",
+                        "cycle_id": cycle_id,
+                        "bucket_id": bucket_id,
+                        "job_id": job_id,
+                        "context": context.to_payload(),
+                        "state": self._state.to_payload(),
+                    }
+                )
+        except SafetyViolation as exc:
+            message = f"Self-Implementation blocked by safety policy: {exc}"
+            self._logger.warning(message)
+            self.stop(blocked=True, reason=message)
+            return
+        except Exception as exc:
+            self._logger.exception("Self-Implementation cycle failed")
+            emit_sentinel_event(
+                "autonomy.cycle_error",
+                severity="error",
+                summary="Self-Implementation cycle crashed",
+                detail=str(exc),
+                recovery=(
+                    "Review the vd_system log for stack traces, resolve the failure, "
+                    "and re-enable Self-Implementation Mode."
+                ),
+                source="autonomy.self_impl",
+                metadata={},
+            )
+            self.stop(
+                blocked=True,
+                reason="Self-Implementation cycle crashed; review sentinel logs.",
+            )
+            return
+
+        self._schedule_next_cycle(self._survey_interval)
+
+    # ------------------------------------------------------------------
+    def _check_energy_budget(self) -> bool:
+        now = time.monotonic()
+        if now - self._window_start > self._energy_window:
+            self._window_start = now
+            self._cycles_in_window = 0
+        if self._cycles_in_window >= self._energy_quota:
+            self._raise_energy_violation()
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def _survey_context(self) -> Optional[SelfImplementationContext]:
+        dataset_samples = self._collect_dataset_samples()
+        lesson_samples = self._collect_lesson_samples()
+        inbox_samples = self._collect_inbox_samples()
+        if not dataset_samples and not lesson_samples and not inbox_samples:
+            return None
+        prompt = self._build_prompt(
+            dataset_samples, lesson_samples, inbox_samples
+        )
+        digest = self._compute_digest(
+            dataset_samples, lesson_samples, inbox_samples
+        )
+        return SelfImplementationContext(
+            dataset_samples=dataset_samples,
+            lesson_samples=lesson_samples,
+            inbox_samples=inbox_samples,
+            prompt=prompt,
+            digest=digest,
+        )
+
+    # ------------------------------------------------------------------
+    def _collect_dataset_samples(self) -> List[Tuple[str, str]]:
+        samples: Deque[Tuple[str, str]] = deque(maxlen=self._dataset_sample)
+        try:
+            for node in self._dataset.persistence.iter_nodes():
+                anchor = str(node.anchor or "").strip()
+                text = str(node.core.get("text") or "").strip()
+                if not text:
+                    text = str(node.core.get("title") or "").strip()
+                summary = " ".join(text.split())
+                if len(summary) > 240:
+                    summary = f"{summary[:237]}…"
+                samples.append((anchor or uuid.uuid4().hex, summary))
+        except Exception:
+            self._logger.exception("Dataset survey failed during Self-Implementation")
+            return []
+        return list(samples)
+
+    # ------------------------------------------------------------------
+    def _collect_lesson_samples(self) -> List[Tuple[str, str]]:
+        try:
+            lessons = self._memory.lessons.list_lessons()
+        except Exception:
+            self._logger.exception("Failed to read durable lessons for Self-Implementation")
+            return []
+        if not lessons:
+            return []
+        selected = lessons[-self._lesson_sample :]
+        samples: List[Tuple[str, str]] = []
+        for lesson in selected:
+            summary = " ".join(lesson.summary.split())
+            if len(summary) > 240:
+                summary = f"{summary[:237]}…"
+            samples.append((lesson.anchor, summary))
+        return samples
+
+    # ------------------------------------------------------------------
+    def _collect_inbox_samples(self) -> List[Tuple[str, str]]:
+        try:
+            items = self._memory.inbox.list_items()
+        except Exception:
+            self._logger.exception("Failed to read logic inbox for Self-Implementation")
+            return []
+        if not items:
+            return []
+        selected = items[: self._inbox_sample]
+        samples: List[Tuple[str, str]] = []
+        for item in selected:
+            summary = f"{item.title.strip()} [{item.status.strip()}]"
+            samples.append((item.id, summary))
+        return samples
+
+    # ------------------------------------------------------------------
+    def _build_prompt(
+        self,
+        dataset_samples: Sequence[Tuple[str, str]],
+        lesson_samples: Sequence[Tuple[str, str]],
+        inbox_samples: Sequence[Tuple[str, str]],
+    ) -> str:
+        lines = [
+            "You are ACAGi's Self-Implementation Rationalizer.",
+            (
+                "Survey durable lessons, dataset anchors, and logic inbox entries, then "
+                "suggest concrete implementation tasks that improve the workspace."
+            ),
+            "Describe each idea in one sentence with clear outcomes.",
+        ]
+        if dataset_samples:
+            lines.append("Dataset survey:")
+            for anchor, summary in dataset_samples:
+                lines.append(f"- [{anchor}] {summary}")
+        if lesson_samples:
+            lines.append("Durable lessons:")
+            for anchor, summary in lesson_samples:
+                lines.append(f"- [{anchor}] {summary}")
+        if inbox_samples:
+            lines.append("Logic inbox focus:")
+            for anchor, summary in inbox_samples:
+                lines.append(f"- [{anchor}] {summary}")
+        lines.append(
+            "Return actionable segments that can be executed autonomously without human clarification."
+        )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    def _compute_digest(
+        self,
+        dataset_samples: Sequence[Tuple[str, str]],
+        lesson_samples: Sequence[Tuple[str, str]],
+        inbox_samples: Sequence[Tuple[str, str]],
+    ) -> str:
+        hasher = hashlib.sha256()
+        for anchor, summary in (*dataset_samples, *lesson_samples, *inbox_samples):
+            hasher.update(anchor.encode("utf-8", "ignore"))
+            hasher.update(summary.encode("utf-8", "ignore"))
+        return hasher.hexdigest()
+
+    # ------------------------------------------------------------------
+    def _record_context(self, context: SelfImplementationContext) -> bool:
+        if context.digest in self._recent_context_hashes:
+            self._raise_loop_violation(context)
+            return False
+        self._recent_context_hashes.append(context.digest)
+        return True
+
+    # ------------------------------------------------------------------
+    def _materialise_cycle(
+        self, job_meta: Mapping[str, Any], segments: Sequence[Mapping[str, Any]]
+    ) -> None:
+        cycle_id = str(job_meta.get("cycle_id") or uuid.uuid4().hex)
+        bucket_id = str(job_meta.get("bucket_id") or uuid.uuid4().hex)
+        context: SelfImplementationContext = job_meta.get("context")  # type: ignore[assignment]
+        if not isinstance(context, SelfImplementationContext):
+            self._logger.debug("Self-Implementation missing context for cycle %s", cycle_id)
+            return
+        tasks: List[Task] = []
+        timestamp = time.time()
+        for index, segment in enumerate(segments, start=1):
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            label = str(segment.get("label") or "Insight").strip()
+            title = f"[Self-Implementation] {label.title()}"
+            if len(title) > 96:
+                title = f"{title[:93]}…"
+            task_id = (
+                f"tsk_auto_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            )
+            task = Task(
+                id=task_id,
+                title=title,
+                status="open",
+                created_ts=timestamp,
+                updated_ts=timestamp,
+                session_id="self_impl",
+                source="self_impl",
+                labels=["self_impl", label.lower()],
+            )
+            try:
+                append_task(task)
+                append_event(
+                    TaskEvent(
+                        ts=timestamp,
+                        task_id=task_id,
+                        event="created",
+                        by="self_impl",
+                    )
+                )
+                publish("task.created", task.to_dict())
+                publish("task.updated", task.to_dict())
+            except Exception:
+                self._logger.exception(
+                    "Failed to persist self-implementation task %s", task_id
+                )
+                continue
+            tasks.append(task)
+
+        bucket = TaskBucket(identifier=bucket_id)
+        metadata = {
+            "origin": "self_impl",
+            "cycle_id": cycle_id,
+            "dataset_anchors": [anchor for anchor, _ in context.dataset_samples],
+            "lesson_anchors": [anchor for anchor, _ in context.lesson_samples],
+            "inbox_ids": [anchor for anchor, _ in context.inbox_samples],
+        }
+        bucket.add_touched_files([])
+        bucket.update_metadata(metadata)
+        for task in tasks:
+            bucket.add_task(task)
+        bucket.mark_stage_running(TaskBucketStage.CAPTURE)
+        bucket.apply_stage_result(
+            TaskBucketStage.CAPTURE,
+            TaskBucketStageResult(metadata=metadata),
+        )
+        bucket.mark_stage_completed(TaskBucketStage.CAPTURE)
+        note_lines = [
+            f"Self-Implementation cycle {cycle_id} generated {len(tasks)} task(s).",
+        ]
+        if tasks:
+            for task in tasks:
+                note_lines.append(f"- {task.id}: {task.title}")
+        else:
+            note_lines.append("- No actionable segments returned by the Rationalizer.")
+        note_lines.append(f"Context digest: {context.digest}")
+        bucket.apply_stage_result(
+            TaskBucketStage.NOTE,
+            TaskBucketStageResult(note="\n".join(note_lines), metadata=metadata),
+        )
+        bucket.mark_stage_completed(TaskBucketStage.NOTE)
+        bucket.mark_stage_completed(TaskBucketStage.BUCKETIZE)
+        try:
+            publish("task.bucket", bucket.to_payload())
+        except Exception:
+            self._logger.exception(
+                "Failed to publish self-implementation bucket %s", bucket_id
+            )
+
+        session_note_lines = [
+            f"Self-Implementation bucket {bucket_id} (cycle {cycle_id}).",
+            f"Dataset anchors: {', '.join(metadata['dataset_anchors']) or 'none'}.",
+            f"Durable lessons: {', '.join(metadata['lesson_anchors']) or 'none'}.",
+            f"Inbox references: {', '.join(metadata['inbox_ids']) or 'none'}.",
+        ]
+        if tasks:
+            session_note_lines.append("Generated tasks:")
+            for task in tasks:
+                session_note_lines.append(f"- {task.id}: {task.title}")
+        else:
+            session_note_lines.append("No new tasks were produced; review Rationalizer context.")
+        note_entry = append_session_note("\n".join(session_note_lines))
+
+        self._publish_event(
+            {
+                "event": "cycle_completed",
+                "cycle_id": cycle_id,
+                "bucket_id": bucket_id,
+                "tasks": [task.id for task in tasks],
+                "note": note_entry,
+                "context": context.to_payload(),
+                "state": self._state.to_payload(),
+            }
+        )
+
+    # ------------------------------------------------------------------
+    def _update_state(
+        self,
+        *,
+        active: Optional[bool] = None,
+        blocked: Optional[bool] = None,
+        reason: Optional[str] = None,
+        last_cycle_at: Optional[float] = None,
+    ) -> None:
+        with self._lock:
+            self._state = SelfImplementationState(
+                active=self._state.active if active is None else active,
+                blocked=self._state.blocked if blocked is None else blocked,
+                reason=self._state.reason if reason is None else reason,
+                last_cycle_at=(
+                    self._state.last_cycle_at
+                    if last_cycle_at is None
+                    else last_cycle_at
+                ),
+            )
+        self.stateChanged.emit(self._state.to_payload())
+
+    # ------------------------------------------------------------------
+    def _publish_event(self, payload: Mapping[str, Any]) -> None:
+        try:
+            publish("autonomy.self_impl", dict(payload))
+        except Exception:
+            self._logger.debug(
+                "Failed to publish autonomy event", exc_info=True
+            )
+
+    # ------------------------------------------------------------------
+    def _raise_energy_violation(self) -> None:
+        summary = "Self-Implementation energy quota reached"
+        detail = (
+            f"Performed {self._cycles_in_window} cycle(s) within the configured "
+            f"{int(self._energy_window)}s window."
+        )
+        emit_sentinel_event(
+            "autonomy.energy_quota",
+            severity="warning",
+            summary=summary,
+            detail=detail,
+            recovery=(
+                "Allow the quota window to reset or raise the energy limits in the "
+                "Self-Implementation settings block before retrying."
+            ),
+            source="autonomy.self_impl",
+            metadata={
+                "window_seconds": int(self._energy_window),
+                "cycles": int(self._cycles_in_window),
+            },
+        )
+        state_snapshot = self._state.to_payload()
+        self._publish_event(
+            {
+                "event": "energy_violation",
+                "detail": detail,
+                "state": state_snapshot,
+            }
+        )
+        self._logger.warning(
+            "Self-Implementation energy quota exhausted window=%s cycles=%s",
+            int(self._energy_window),
+            int(self._cycles_in_window),
+        )
+        self._violation_reason = summary
+        self._policy_blocked = True
+
+    # ------------------------------------------------------------------
+    def _raise_loop_violation(self, context: SelfImplementationContext) -> None:
+        summary = "Self-Implementation detected a repeating survey loop"
+        detail = (
+            "The current survey digest matches a recent cycle, indicating repeated "
+            "analysis with no new context."
+        )
+        emit_sentinel_event(
+            "autonomy.loop_detected",
+            severity="warning",
+            summary=summary,
+            detail=detail,
+            recovery=(
+                "Adjust dataset or memory inputs before re-enabling Self-Implementation "
+                "Mode to avoid redundant cycles."
+            ),
+            source="autonomy.self_impl",
+            metadata={
+                "digest": context.digest,
+                "dataset": [anchor for anchor, _ in context.dataset_samples],
+                "lessons": [anchor for anchor, _ in context.lesson_samples],
+            },
+        )
+        state_snapshot = self._state.to_payload()
+        self._publish_event(
+            {
+                "event": "loop_violation",
+                "digest": context.digest,
+                "state": state_snapshot,
+            }
+        )
+        self._logger.warning(
+            "Self-Implementation detected survey loop digest=%s", context.digest
+        )
+        self._violation_reason = summary
+        self._policy_blocked = True
 
 
 # -- Diff capture -----------------------------------------------------------
@@ -15381,6 +16201,15 @@ DEFAULT_SETTINGS = {
         "rationalizer_limit": 2,
         "queue_limit": 16,
     },
+    "self_impl": {
+        "survey_interval_seconds": 180,
+        "energy_window_seconds": 900,
+        "energy_quota": 3,
+        "dataset_sample": 3,
+        "lesson_sample": 2,
+        "inbox_sample": 2,
+        "loop_window": 6,
+    },
 }
 
 
@@ -20560,6 +21389,7 @@ class StatusBarTelemetryPanel(QFrame):
     """Compact status bar cluster fed by Gate/Scheduler telemetry."""
 
     remoteToggled = Signal(bool)
+    selfImplementationToggled = Signal(bool)
 
     def __init__(
         self,
@@ -20577,6 +21407,19 @@ class StatusBarTelemetryPanel(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(8)
+
+        self._self_impl_button = QToolButton(self)
+        self._self_impl_button.setObjectName("StatusSelfImplementation")
+        self._self_impl_button.setCheckable(True)
+        self._self_impl_button.setAutoRaise(True)
+        self._self_impl_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._self_impl_button.setSizePolicy(
+            QSizePolicy.Maximum, QSizePolicy.Preferred
+        )
+        self._self_impl_button.toggled.connect(
+            self._handle_self_impl_toggled
+        )
+        layout.addWidget(self._self_impl_button)
 
         self._remote_button = QToolButton(self)
         self._remote_button.setObjectName("StatusRemoteToggle")
@@ -20623,6 +21466,10 @@ class StatusBarTelemetryPanel(QFrame):
 
         layout.addStretch(1)
 
+        self._self_impl_reason = (
+            "Self-Implementation Mode is idle and awaiting activation."
+        )
+        self._sync_self_impl_button(False)
         self.update_runtime(runtime, remote_snapshot)
 
     # ------------------------------------------------------------------
@@ -20651,6 +21498,7 @@ class StatusBarTelemetryPanel(QFrame):
             f"Share limit: {runtime.share_limit}",
         ]
         self._sandbox_label.setToolTip("\n".join(sandbox_tip))
+        self._sync_self_impl_button(self._self_impl_button.isChecked())
 
     # ------------------------------------------------------------------
     def update_metrics(self, metrics: Mapping[str, Any]) -> None:
@@ -20753,6 +21601,42 @@ class StatusBarTelemetryPanel(QFrame):
         ]
         tooltip.extend(self._tooling_tooltip_lines())
         self._remote_button.setToolTip("\n".join(tooltip))
+
+    # ------------------------------------------------------------------
+    def set_self_impl_state(
+        self,
+        active: bool,
+        *,
+        enabled: bool = True,
+        reason: str = "",
+    ) -> None:
+        """Update the Self-Implementation toggle state and tooltip."""
+
+        self._self_impl_reason = (
+            reason.strip()
+            or "Self-Implementation Mode is idle and awaiting activation."
+        )
+        self._self_impl_button.blockSignals(True)
+        self._self_impl_button.setEnabled(enabled)
+        self._self_impl_button.setChecked(active)
+        self._self_impl_button.blockSignals(False)
+        self._sync_self_impl_button(active)
+
+    # ------------------------------------------------------------------
+    def _handle_self_impl_toggled(self, checked: bool) -> None:
+        self._sync_self_impl_button(checked)
+        self.selfImplementationToggled.emit(checked)
+
+    # ------------------------------------------------------------------
+    def _sync_self_impl_button(self, active: bool) -> None:
+        label = "Self-Implementing" if active else "Self-Implementation"
+        self._self_impl_button.setText(label)
+        tooltip = [
+            "Enable to allow ACAGi to survey memory and spawn exploratory tasks.",
+            f"Status: {self._self_impl_reason}",
+            f"Toggle available: {self._self_impl_button.isEnabled()}",
+        ]
+        self._self_impl_button.setToolTip("\n".join(tooltip))
 
     # ------------------------------------------------------------------
     def _update_meter(
@@ -20999,6 +21883,10 @@ class MainWindow(QMainWindow):
             self.settings["sandbox"] = copy.deepcopy(DEFAULT_SETTINGS.get("sandbox", {}))
             self.settings["scan_roots"] = []
 
+        self.settings.setdefault(
+            "self_impl", copy.deepcopy(DEFAULT_SETTINGS.get("self_impl", {}))
+        )
+
         voice_settings = self.settings.setdefault(
             "voice", copy.deepcopy(DEFAULT_VOICE_CONFIG)
         )
@@ -21067,6 +21955,9 @@ class MainWindow(QMainWindow):
         self._status_panel.remoteToggled.connect(
             self._on_remote_toggle_requested
         )
+        self._status_panel.selfImplementationToggled.connect(
+            self._toggle_self_impl_mode
+        )
         self.status_indicator.addPermanentWidget(self._status_panel, 0)
         self._status_subscriptions: List[Subscription] = []
         try:
@@ -21078,6 +21969,23 @@ class MainWindow(QMainWindow):
         else:
             self._status_subscriptions.append(metrics_handle)
         self._refresh_status_bar()
+
+        self._autonomy_controller = SelfImplementationController(
+            self.chat.dataset,
+            MEMORY_SERVICES,
+            settings=self.settings,
+            parent=self,
+        )
+        self._autonomy_controller.stateChanged.connect(
+            self._on_self_impl_state_changed
+        )
+        controller_state = self._autonomy_controller.state
+        self._self_impl_last_reason: str = ""
+        self._status_panel.set_self_impl_state(
+            controller_state.active,
+            enabled=not controller_state.blocked,
+            reason=controller_state.reason,
+        )
 
         self._palette_logger = logging.getLogger(f"{VD_LOGGER_NAME}.palette.ui")
         self._palette_dialog: Optional[CommandPaletteDialog] = None
@@ -21467,6 +22375,63 @@ class MainWindow(QMainWindow):
         self.status_indicator.showMessage(summary)
 
     # ------------------------------------------------------------------
+    def _toggle_self_impl_mode(self, enabled: bool) -> None:
+        """Enable or disable Self-Implementation Mode from the status bar."""
+
+        controller = getattr(self, "_autonomy_controller", None)
+        if controller is None:
+            if hasattr(self, "_status_panel"):
+                self._status_panel.set_self_impl_state(
+                    False,
+                    enabled=False,
+                    reason="Self-Implementation controller unavailable.",
+                )
+            return
+        if enabled:
+            started = controller.start()
+            if not started:
+                state = controller.state
+                if hasattr(self, "_status_panel"):
+                    self._status_panel.set_self_impl_state(
+                        state.active,
+                        enabled=not state.blocked,
+                        reason=state.reason,
+                    )
+                QMessageBox.warning(
+                    self,
+                    "Self-Implementation Mode",
+                    state.reason or "Unable to start Self-Implementation Mode.",
+                )
+        else:
+            controller.stop(
+                blocked=False,
+                reason="Self-Implementation Mode paused by operator.",
+            )
+
+    # ------------------------------------------------------------------
+    @Slot(dict)
+    def _on_self_impl_state_changed(self, payload: Mapping[str, Any]) -> None:
+        """Synchronise the status panel with controller state updates."""
+
+        active = bool(payload.get("active"))
+        blocked = bool(payload.get("blocked"))
+        reason = str(payload.get("reason") or "")
+        if hasattr(self, "_status_panel"):
+            self._status_panel.set_self_impl_state(
+                active,
+                enabled=not blocked,
+                reason=reason,
+            )
+        if reason:
+            self.status_indicator.showMessage(reason, 15000)
+        if blocked and reason:
+            if reason != self._self_impl_last_reason:
+                QMessageBox.warning(self, "Self-Implementation Mode", reason)
+                self._self_impl_last_reason = reason
+        elif not blocked:
+            self._self_impl_last_reason = ""
+
+    # ------------------------------------------------------------------
     def _on_remote_toggle_requested(self, enabled: bool) -> None:
         """Handle remote fan-out toggles emitted from the status panel."""
 
@@ -21528,6 +22493,8 @@ class MainWindow(QMainWindow):
         else:
             self.desktop = TerminalDesktop(self.theme, self.chat, self)
             self.setCentralWidget(self.desktop)
+        if hasattr(self, "_autonomy_controller"):
+            self._autonomy_controller.update_dataset(self.chat.dataset)
         if hasattr(self, "dataset_dock"):
             self.dataset_dock.set_chat_card(self.chat)
         if hasattr(self, "virtual_desktop_dock"):
@@ -21662,6 +22629,8 @@ class MainWindow(QMainWindow):
             self.chat = ChatCard(self.theme, self.ollama, self.settings, self.lex_mgr, self)
             self.desktop = None
             self.setCentralWidget(self.chat)
+            if hasattr(self, "_autonomy_controller"):
+                self._autonomy_controller.update_dataset(self.chat.dataset)
             if hasattr(self, "dataset_dock"):
                 self.dataset_dock.set_chat_card(self.chat)
             if hasattr(self, "virtual_desktop_dock"):
@@ -21696,6 +22665,11 @@ class MainWindow(QMainWindow):
         if self._orig_excepthook is not None:
             sys.excepthook = self._orig_excepthook
             self._orig_excepthook = None
+        if hasattr(self, "_autonomy_controller"):
+            self._autonomy_controller.stop(
+                blocked=False,
+                reason="Self-Implementation Mode paused for shutdown.",
+            )
         super().closeEvent(event)
 
 # --------------------------------------------------------------------------------------
