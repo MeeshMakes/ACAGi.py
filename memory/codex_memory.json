@@ -154,6 +154,15 @@
       "title": "Sentinel Flush Ordering",
       "summary": "Invoke `flush_pending_sentinel_events()` only after its definition is available so sentinel history replay during import avoids NameError exceptions while still running immediately after dispatcher setup.",
       "applies_to": "safety-monitoring"
+    },
+    {
+      "title": "High DPI Policy Guard",
+      "summary": "Wrap the Qt high-DPI rounding configuration in a runtime guard so embedded hosts that already own a QGuiApplication skip the setter without crashing.",
+      "applies_to": "acagi-boot",
+      "metadata": {
+        "introduced": "2025-10-16",
+        "notes": "Fallback on environment variables when the guard detects an existing Qt instance."
+      }
     }
   ],
   "procedures": [
