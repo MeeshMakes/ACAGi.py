@@ -1,0 +1,145 @@
+{
+  "metadata": {
+    "description": "Policies used by the safety manager to gate coder and tester operations.",
+    "generated": "repository default",
+    "updated": "2025-10-12"
+  },
+  "operations": {
+    "coder": {
+      "allow": [
+        "python",
+        "pip",
+        "pip3",
+        "pytest",
+        "ruff",
+        "black",
+        "mypy",
+        "npm",
+        "yarn",
+        "pnpm",
+        "node",
+        "cargo",
+        "go",
+        "mvn",
+        "gradle",
+        "make",
+        "git"
+      ],
+      "approval": [
+        "git"
+      ],
+      "deny": [
+        "rm",
+        "sudo",
+        "chmod",
+        "chown",
+        "mkfs"
+      ],
+      "limits": {
+        "max_duration_seconds": 900,
+        "max_parallel_tasks": 2,
+        "network": "deny",
+        "network_blocklist": [
+          "aria2c",
+          "curl",
+          "ftp",
+          "netcat",
+          "nc",
+          "ping",
+          "rsync",
+          "scp",
+          "sftp",
+          "ssh",
+          "telnet",
+          "traceroute",
+          "wget"
+        ]
+      },
+      "notes": "Coder operations must run in restricted sandboxes and request approval before mutating repositories.",
+      "sandbox_modes": [
+        "isolated",
+        "restricted"
+      ]
+    },
+    "self_impl": {
+      "allow": [],
+      "approval": [],
+      "deny": [],
+      "limits": {
+        "max_duration_seconds": 900,
+        "max_parallel_tasks": 1,
+        "network": "deny",
+        "network_blocklist": [
+          "aria2c",
+          "curl",
+          "ftp",
+          "netcat",
+          "nc",
+          "ping",
+          "rsync",
+          "scp",
+          "sftp",
+          "ssh",
+          "telnet",
+          "traceroute",
+          "wget"
+        ]
+      },
+      "notes": "Self-Implementation Mode cycles must remain serialized and offline to avoid runaway automation.",
+      "sandbox_modes": [
+        "isolated",
+        "restricted"
+      ]
+    },
+    "test": {
+      "allow": [
+        "python",
+        "pytest",
+        "tox",
+        "npm",
+        "yarn",
+        "pnpm",
+        "bun",
+        "go",
+        "cargo",
+        "mvn",
+        "gradle",
+        "node",
+        "make"
+      ],
+      "approval": [],
+      "deny": [
+        "rm",
+        "sudo",
+        "mkfs"
+      ],
+      "limits": {
+        "max_duration_seconds": 1800,
+        "max_parallel_tasks": 3,
+        "network": "deny",
+        "network_blocklist": [
+          "aria2c",
+          "curl",
+          "ftp",
+          "netcat",
+          "nc",
+          "ping",
+          "rsync",
+          "scp",
+          "sftp",
+          "ssh",
+          "telnet",
+          "traceroute",
+          "wget"
+        ]
+      },
+      "notes": "Test operations focus on non-destructive tooling; destructive commands remain blocked.",
+      "sandbox_modes": [
+        "isolated",
+        "restricted",
+        "trusted"
+      ]
+    }
+  },
+  "version": "0.1.0"
+}

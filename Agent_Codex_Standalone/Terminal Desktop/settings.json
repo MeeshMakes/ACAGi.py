@@ -1,0 +1,66 @@
+{
+  "default_launch_mode": "bridge",
+  "working_folder": "C:\\Users\\Art PC\\Desktop\\ACAGi.py\\Agent_Codex_Standalone\\Terminal Desktop",
+  "model": "qwen3:8b",
+  "enable_interpreter": false,
+  "reference_embed_contents": true,
+  "reference_case_sensitive": false,
+  "reference_token_guard": true,
+  "reference_token_headroom": 80,
+  "scan_roots": [],
+  "terminal_desktop": {
+    "width": 980,
+    "height": 620,
+    "x": -1,
+    "y": -1,
+    "icon_size": "medium",
+    "sort_mode": "name",
+    "icon_positions": {},
+    "background": {
+      "mode": "solid",
+      "source": "",
+      "fit": "fill",
+      "loop": true,
+      "mute": true,
+      "playback_rate": 1.0
+    }
+  },
+  "sandbox": {
+    "level": "restricted",
+    "approval_policy": "require_approval",
+    "full_auto": false,
+    "encryption_enabled": false,
+    "access_control_enforced": false
+  },
+  "voice": {
+    "enable_asr": true,
+    "enable_tts": true,
+    "asr_model": "base",
+    "language": "en",
+    "sample_rate": 16000,
+    "chunk_ms": 30,
+    "silence_duration": 0.8,
+    "partial_interval": 0.9,
+    "vad_threshold": 550,
+    "default_priority": 0.7,
+    "speaker_label": "user",
+    "speaker_bias": {
+      "user": 0.9,
+      "assistant": 0.4,
+      "system": 0.2
+    }
+  },
+  "cerebellum": {
+    "rationalizer_limit": 2,
+    "queue_limit": 16
+  },
+  "self_impl": {
+    "survey_interval_seconds": 180,
+    "energy_window_seconds": 900,
+    "energy_quota": 3,
+    "dataset_sample": 3,
+    "lesson_sample": 2,
+    "inbox_sample": 2,
+    "loop_window": 6
+  }
+}

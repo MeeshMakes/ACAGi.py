@@ -3,121 +3,145 @@
   "last_updated": "2025-10-15",
   "stable_lessons": [
     {
+      "id": "verbose-implementation-standard",
       "title": "Verbose Implementation Standard",
       "summary": "All code and documentation must include rationale-rich commentary and explicit edge-case considerations.",
       "applies_to": "repository-wide"
     },
     {
+      "id": "session-logging-discipline",
       "title": "Session Logging Discipline",
       "summary": "Every working session must produce a log in logs/session_<date>.md capturing objectives, context, and follow-up prompts.",
       "applies_to": "workflow"
     },
     {
+      "id": "runtime-optional-dependency-checks",
       "title": "Runtime Optional Dependency Checks",
       "summary": "Handle optional libraries by importing them normally and relying on runtime capability helpers to emit user-facing warnings when dependencies are missing.",
       "applies_to": "python-optional-deps"
     },
     {
+      "id": "acagi-monolithic-ownership",
       "title": "ACAGi Monolithic Ownership",
       "summary": "Core task management, background rendering, error console, and repository helper logic now live directly in ACAGi.py; future changes should edit the single file sections instead of Dev_Logic modules.",
       "applies_to": "acagi-architecture"
     },
     {
+      "id": "boot-environment-initialization",
       "title": "Boot Environment Initialization",
       "summary": "ACAGi.py now centralizes DPI policy, workspace/transit resolution, shared logging, and BrainShell crash handling within a BootEnvironment manager; extend that section when adjusting startup flows.",
       "applies_to": "acagi-boot"
     },
     {
+      "id": "dev-logic-path-constant",
       "title": "Dev Logic Path Constant",
       "summary": "Use the DEV_LOGIC_ROOT constant within ACAGi.py when referencing prompts, datasets, or other assets migrated from Dev_Logic modules so paths remain stable after inlining.",
       "applies_to": "acagi-architecture"
     },
     {
+      "id": "event-dispatcher-telemetry",
       "title": "Event Dispatcher Telemetry",
       "summary": "Route new pub/sub topics through the unified EventDispatcher so queue backpressure, logging, and remote fan-out remain consistent across observation, note, and task streams.",
       "applies_to": "acagi-events"
     },
     {
+      "id": "hippocampus-dataset-dock",
       "title": "Hippocampus Dataset Dock",
       "summary": "Use the DatasetManagerDock to ingest tagged files or directories so Hippocampus can run OCR/embeddings, persist dataset nodes, and update the brain map registry.",
       "applies_to": "dataset-ingestion"
     },
     {
+      "id": "sentinel-event-monitoring",
       "title": "Sentinel Event Monitoring",
       "summary": "SentinelMonitorHub listens to task.status/task.diff/task.updated topics, detects loops, regressions, and stalls, and publishes immune responses on system.immune.",
       "applies_to": "safety-monitoring"
     },
     {
+      "id": "sentinel-event-broadcasts",
       "title": "Sentinel Event Broadcasts",
       "summary": "system.sentinel events capture bridge loss, sandbox corruption repairs, and repeated regressions; UI consumers must replay sentinel_history_payloads() on startup to surface pending alerts.",
       "applies_to": "safety-monitoring"
     },
     {
+      "id": "operation-policy-enforcement",
       "title": "Operation Policy Enforcement",
       "summary": "SafetyManager consumes policies.json to enforce coder/test allowlists, denylists, approval prompts, and sandbox requirements via run_checked helpers.",
       "applies_to": "operation-safety"
     },
     {
+      "id": "operation-policy-runtime-limits",
       "title": "Operation Policy Runtime Limits",
       "summary": "Operation policies now define max_duration_seconds, max_parallel_tasks, and network bans that SafetyManager enforces with sentinel events while run_checked clamps timeouts and strips network proxies.",
       "applies_to": "operation-safety"
     },
     {
+      "id": "terminal-health-transcript-capture",
       "title": "Terminal Health & Transcript Capture",
       "summary": "The terminal widget now drives the bridge LED through a TerminalHealthState machine and lets transcript taps store Hippocampus-backed anchors while logging session JSONL notices.",
       "applies_to": "terminal-ui"
     },
     {
+      "id": "virtual-desktop-dock-integration",
       "title": "Virtual Desktop Dock Integration",
       "summary": "Virtual Desktop features now live in a dockable widget that lazily instantiates consoles, Dev Space tabs, and OCR overlays while consuming event bus updates for tasks, logs, and datasets.",
       "applies_to": "ui-virtual-desktop"
     },
     {
+      "id": "brain-map-dock",
       "title": "Brain Map Dock",
       "summary": "ACAGi includes a BrainMapDock that lazily renders Hippocampus nodes and typed edges with energy/salience overlays and Dev Space focus callbacks when nodes are selected.",
       "applies_to": "ui-brain-map"
     },
     {
+      "id": "command-palette-dispatch-pattern",
       "title": "Command Palette Dispatch Pattern",
       "summary": "Palette-triggered commands and macros must register PaletteEntry descriptors, run safety_manager.ensure_action_allowed before publishing to the event bus, and log manual macro notes for follow-up review.",
       "applies_to": "ui-command-palette"
     },
     {
+      "id": "status-bar-telemetry-panel",
       "title": "Status Bar Telemetry Panel",
       "summary": "The main window status bar now embeds a StatusBarTelemetryPanel that consumes system.metrics telemetry to display remote fan-out state, sandbox posture, CPU/RAM meters, attention mix, and OCR duty cycle readings while exposing a remote pause/resume toggle.",
       "applies_to": "ui-status-bar"
     },
     {
+      "id": "speech-orchestrator-and-amygdala-salience",
       "title": "Speech Orchestrator and Amygdala Salience",
       "summary": "Local ASR/TTS adapters now publish speech activity, partial/final transcripts, and TTS telemetry on dedicated event bus topics while the Amygdala component weights diarization metadata and emits system.salience scores.",
       "applies_to": "voice-interface"
     },
     {
+      "id": "cerebellum-rationalizer-quotas",
       "title": "Cerebellum Rationalizer Quotas",
       "summary": "Rationalizer jobs are dispatched through the Cerebellum scheduler which enforces Gate quotas, publishes cortex.intent and cortex.reference events, and surfaces telemetry on system.metrics; future cognitive workflows should integrate with ensure_rationalizer_manager rather than spawning ad-hoc threads.",
       "applies_to": "cortex-rationalizer"
     },
     {
+      "id": "task-bucket-serialization-discipline",
       "title": "Task Bucket Serialization Discipline",
       "summary": "Task buckets advance through capture→note→bucketize→assemble→apply→test→verify→promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
       "applies_to": "task-orchestration"
     },
     {
+      "id": "task-bucket-failure-rationalization-loop",
       "title": "Task Bucket Failure Rationalization Loop",
       "summary": "When a task bucket stage fails ACAGi queues a Rationalizer job with the failure context and updates the durable memory snapshot with the latest telemetry so follow-up runs start with concrete remediation clues.",
       "applies_to": "task-orchestration"
     },
     {
+      "id": "scriptspeak-command-dispatch",
       "title": "ScriptSpeak Command Dispatch",
       "summary": "ScriptSpeak commands are parsed into structured events on the script.command topic, mirrored into session logs, and reused by macros and Rationalizer outputs for auditable automation.",
       "applies_to": "scriptspeak"
     },
     {
+      "id": "remote-access-controller-toggle",
       "title": "Remote Access Controller Toggle",
       "summary": "Remote fan-out must route through the RemoteAccessController so UI state, safety policies, and ScriptSpeak notifications stay synchronised whenever remote actions are enabled or paused.",
       "applies_to": "remote-control"
     },
     {
+      "id": "logic-inbox-startup-dispatch",
       "title": "Logic Inbox Startup Dispatch",
       "summary": "During boot ACAGi scans memory/logic_inbox.jsonl, publishing events or scheduling buckets for actionable items while leaving deferred work persisted for later review.",
       "applies_to": "workflow",
@@ -127,6 +151,7 @@
       }
     },
     {
+      "id": "self-implementation-sentinels",
       "title": "Self-Implementation Sentinels",
       "summary": "Self-Implementation Mode emits autonomy.self_impl telemetry, including sentinel_blocked/energy_violation/loop_violation events, obeys the self_impl policy guard, pauses when sentinel warnings fire, and records each cycle in the session log.",
       "applies_to": "autonomy",
@@ -136,26 +161,31 @@
       }
     },
     {
+      "id": "coordinated-shutdown-procedure",
       "title": "Coordinated Shutdown Procedure",
       "summary": "Use the ShutdownCoordinator to flush event queues, persist durable memory stores, and append a session summary; crash handlers now call it so new services should follow the same pattern when registering exit hooks.",
       "applies_to": "acagi-runtime"
     },
     {
+      "id": "logger-constant-ordering",
       "title": "Logger Constant Ordering",
       "summary": "Define module-level logging identifiers before constructing classes that reference them at import time so SafetyManager and similar boot guards can initialise without NameError exceptions.",
       "applies_to": "logging-initialisation"
     },
     {
+      "id": "remote-access-dispatcher-boot-order",
       "title": "Remote Access Dispatcher Boot Order",
       "summary": "Instantiate the RemoteAccessController only after the EventDispatcher is available so module import order keeps Codex Terminal and Virtual Desktop integrations stable and prevents NameError exceptions during startup.",
       "applies_to": "remote-control"
     },
     {
+      "id": "sentinel-flush-ordering",
       "title": "Sentinel Flush Ordering",
       "summary": "Invoke `flush_pending_sentinel_events()` only after its definition is available so sentinel history replay during import avoids NameError exceptions while still running immediately after dispatcher setup.",
       "applies_to": "safety-monitoring"
     },
     {
+      "id": "high-dpi-policy-guard",
       "title": "High DPI Policy Guard",
       "summary": "Wrap the Qt high-DPI rounding configuration in a runtime guard so embedded hosts that already own a QGuiApplication skip the setter without crashing.",
       "applies_to": "acagi-boot",
@@ -183,5 +213,7 @@
       "tools/codex_pr_sentinel.py",
       "tools/logic_inbox.py"
     ]
-  }
+  },
+  "sessions": [],
+  "work_items": []
 }

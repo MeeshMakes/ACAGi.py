@@ -1,0 +1,36 @@
+2025-10-02 22:22:23,899 [INFO] Event published topic=system.metrics subscribers=0 keys=['kind', 'message', 'meta']
+2025-10-02 22:22:23,948 [INFO] ACAGi starting up (pid=58488)
+2025-10-02 22:22:23,950 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:23,951 [INFO] Logic inbox published event item_id=2025-10-01-001 topic=note
+2025-10-02 22:22:23,954 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:23,954 [INFO] Logic inbox published event item_id=2025-10-01-002 topic=note
+2025-10-02 22:22:23,957 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:23,957 [INFO] Logic inbox published event item_id=2025-10-04-001 topic=note
+2025-10-02 22:22:23,960 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:23,960 [INFO] Logic inbox published event item_id=2025-10-04-002 topic=note
+2025-10-02 22:22:23,962 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:23,962 [INFO] Logic inbox published event item_id=2025-10-04-003 topic=note
+2025-10-02 22:22:23,964 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:23,964 [INFO] Logic inbox published event item_id=2025-10-12-001 topic=note
+2025-10-02 22:22:23,969 [INFO] Logic inbox startup processing completed total=6 dispatched=6 scheduled=0
+2025-10-02 22:22:24,026 [INFO] Event published topic=system.metrics subscribers=0 keys=['kind', 'message', 'meta']
+2025-10-02 22:22:24,225 [INFO] Local ASR adapter started (sample_rate=16000 chunk_ms=30)
+2025-10-02 22:22:24,335 [INFO] Shutdown coordination completed reason=atexit queued_before={'total_queued': 0, 'total_drops': 0, 'topics': {}} queued_after={'total_queued': 0, 'total_drops': 0, 'topics': {}}
+2025-10-02 22:22:38,300 [INFO] Event published topic=system.metrics subscribers=0 keys=['kind', 'message', 'meta']
+2025-10-02 22:22:38,355 [INFO] ACAGi starting up (pid=62196)
+2025-10-02 22:22:38,357 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:38,357 [INFO] Logic inbox published event item_id=2025-10-01-001 topic=note
+2025-10-02 22:22:38,361 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:38,361 [INFO] Logic inbox published event item_id=2025-10-01-002 topic=note
+2025-10-02 22:22:38,364 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:38,364 [INFO] Logic inbox published event item_id=2025-10-04-001 topic=note
+2025-10-02 22:22:38,367 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:38,367 [INFO] Logic inbox published event item_id=2025-10-04-002 topic=note
+2025-10-02 22:22:38,369 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:38,369 [INFO] Logic inbox published event item_id=2025-10-04-003 topic=note
+2025-10-02 22:22:38,372 [INFO] Event published topic=note subscribers=0 keys=['inbox_id', 'title', 'notes', 'status', 'anchor', 'meta']
+2025-10-02 22:22:38,372 [INFO] Logic inbox published event item_id=2025-10-12-001 topic=note
+2025-10-02 22:22:38,376 [INFO] Logic inbox startup processing completed total=6 dispatched=6 scheduled=0
+2025-10-02 22:22:38,435 [INFO] Event published topic=system.metrics subscribers=0 keys=['kind', 'message', 'meta']
+2025-10-02 22:22:38,635 [INFO] Local ASR adapter started (sample_rate=16000 chunk_ms=30)
+2025-10-02 22:22:38,740 [INFO] Shutdown coordination completed reason=atexit queued_before={'total_queued': 0, 'total_drops': 0, 'topics': {}} queued_after={'total_queued': 0, 'total_drops': 0, 'topics': {}}

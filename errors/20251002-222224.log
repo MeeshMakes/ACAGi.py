@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "C:\Users\Art PC\Desktop\ACAGi.py\ACAGi.py", line 22799, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\Art PC\Desktop\ACAGi.py\ACAGi.py", line 22781, in main
+    widget, _ = build_widget()
+                ~~~~~~~~~~~~^^
+  File "C:\Users\Art PC\Desktop\ACAGi.py\ACAGi.py", line 22728, in build_widget
+    window = MainWindow(theme, parent=parent, embedded=embedded)
+  File "C:\Users\Art PC\Desktop\ACAGi.py\ACAGi.py", line 22042, in __init__
+    self._palette_subscriptions.append(subscribe("system.command", self._on_command_event))
+                                       ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Art PC\Desktop\ACAGi.py\ACAGi.py", line 4740, in subscribe
+    return EVENT_DISPATCHER.subscribe(topic, callback, max_pending=max_pending)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Art PC\Desktop\ACAGi.py\ACAGi.py", line 4526, in subscribe
+    raise ValueError(f"Unsupported topic: {topic!r}")
+ValueError: Unsupported topic: 'system.command'
