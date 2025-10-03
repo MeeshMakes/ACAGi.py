@@ -6,6 +6,10 @@ code paths, and deterministic output so that future maintainers understand the
 system without guesswork.
 """
 
+from tools.python_runtime import ensure_supported_python
+
+ensure_supported_python()
+
 import argparse
 import json
 import logging

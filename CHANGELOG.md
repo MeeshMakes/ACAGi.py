@@ -1,4 +1,24 @@
 # Changelog
+## [0.1.40] - 2025-10-19
+### Added
+- Introduced `tools/python_runtime.py` to centralise supported interpreter
+  ranges, read optional overrides from environment variables or
+  `python-runtime.json`, and relaunch entry points when operators choose a
+  different executable.
+
+### Changed
+- Updated ACAGi, Codex Terminal, and automation scripts to invoke the shared
+  runtime check before importing heavy dependencies so every launcher obeys the
+  same interpreter policy.
+
+### Documentation
+- Documented the new Python runtime configuration workflow in `README.md` so
+  operators can adjust interpreter paths or version ranges without editing
+  scripts.
+
+### Validation
+- `python -m compileall ACAGi.py Codex_Terminal.py tools`
+
 ## [0.1.39] - 2025-10-18
 ### Added
 - Implemented an import-time dependency bootstrapper that auto-installs

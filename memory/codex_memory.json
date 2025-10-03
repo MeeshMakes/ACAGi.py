@@ -125,7 +125,7 @@
     {
       "id": "task-bucket-serialization-discipline",
       "title": "Task Bucket Serialization Discipline",
-      "summary": "Task buckets advance through capture→note→bucketize→assemble→apply→test→verify→promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
+      "summary": "Task buckets advance through capture\u2192note\u2192bucketize\u2192assemble\u2192apply\u2192test\u2192verify\u2192promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
       "applies_to": "task-orchestration"
     },
     {
@@ -219,6 +219,12 @@
         "introduced": "2025-10-17",
         "notes": "Re-run `pip install PySide6` or leverage Codex_Terminal.py for CLI workflows when the guard triggers."
       }
+    },
+    {
+      "id": "python-runtime-selection",
+      "title": "Python Runtime Selection",
+      "summary": "All launchers import tools.python_runtime.ensure_supported_python to validate interpreter versions, honour ACAGI_PYTHON_INTERPRETER, and relaunch via python-runtime.json overrides before heavy imports.",
+      "applies_to": "python-runtime"
     }
   ],
   "procedures": [

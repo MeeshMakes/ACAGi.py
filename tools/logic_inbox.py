@@ -1,5 +1,9 @@
 """Utilities for maintaining the Codex logic inbox and memory schema."""
 
+from tools.python_runtime import ensure_supported_python
+
+ensure_supported_python()
+
 import argparse
 import json
 import logging

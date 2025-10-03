@@ -50,6 +50,32 @@ cd ACAGi.py
 pip install -r requirements.txt
 ```
 
+### Python runtime configuration
+
+ACAGi entry points now validate the running interpreter before loading heavy
+dependencies.  By default the toolchain targets CPython 3.10–3.12.  Operators
+can steer launches to a specific interpreter without editing scripts in two
+ways:
+
+- Export ``ACAGI_PYTHON_INTERPRETER`` with the absolute path to the preferred
+  Python binary.
+- Create ``python-runtime.json`` inside the Codex agent config directory
+  (``Agent_Codex_Standalone/.codex_agent/config/`` by default) or point
+  ``ACAGI_PYTHON_RUNTIME_CONFIG`` at a custom location.  The JSON payload can
+  include ``python_interpreter``, ``min_version``, and ``max_version`` fields,
+  for example:
+
+  ```json
+  {
+    "python_interpreter": "/usr/local/bin/python3.11",
+    "min_version": "3.10",
+    "max_version": "3.12"
+  }
+  ```
+
+When a mismatch is detected ACAGi relaunches itself using the configured
+interpreter, keeping all entry points aligned with the shared policy.
+
 ## Usage
 
 ### Self-Implementation Mode
