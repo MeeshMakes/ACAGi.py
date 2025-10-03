@@ -207,6 +207,25 @@ DEV_LOGIC_ROOT = Path(__file__).resolve().parent / "Dev_Logic"
 
 
 # ============================================================================
+# Global Application Constants
+# ============================================================================
+
+# Centralise the logging identifiers near the top of the module so any
+# subsystem initialisers (notably SafetyManager) can safely reference them
+# during import time without risking NameError exceptions.
+APP_NAME = "Agent Virtual Desktop — Codex-Terminal"
+VD_LOGGER_NAME = "VirtualDesktop"
+VD_LOG_FILENAME = "vd_system.log"
+VD_LOG_PATH: Path = Path()
+MEMORY_SERVICES: "MemoryServices" | None = None
+Excepthook = Callable[
+    [type[BaseException], BaseException, Optional[TracebackType]],
+    None,
+]
+_ORIGINAL_EXCEPTHOOK: Optional[Excepthook] = None
+
+
+# ============================================================================
 # Token Budget Utilities (Inlined from Dev_Logic/token_budget.py)
 # ============================================================================
 
@@ -1817,18 +1836,6 @@ class RepositoryIndex:
 # ============================================================================
 # Boot & Environment
 # ============================================================================
-
-APP_NAME = "Agent Virtual Desktop — Codex-Terminal"
-VD_LOGGER_NAME = "VirtualDesktop"
-VD_LOG_FILENAME = "vd_system.log"
-VD_LOG_PATH: Path = Path()
-MEMORY_SERVICES: MemoryServices | None = None
-Excepthook = Callable[
-    [type[BaseException], BaseException, Optional[TracebackType]],
-    None,
-]
-_ORIGINAL_EXCEPTHOOK: Optional[Excepthook] = None
-
 
 def _ensure_high_dpi_rounding_policy() -> None:
     """Apply pass-through DPI rounding before any QApplication is created."""

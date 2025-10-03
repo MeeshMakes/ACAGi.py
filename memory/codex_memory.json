@@ -139,6 +139,11 @@
       "title": "Coordinated Shutdown Procedure",
       "summary": "Use the ShutdownCoordinator to flush event queues, persist durable memory stores, and append a session summary; crash handlers now call it so new services should follow the same pattern when registering exit hooks.",
       "applies_to": "acagi-runtime"
+    },
+    {
+      "title": "Logger Constant Ordering",
+      "summary": "Define module-level logging identifiers before constructing classes that reference them at import time so SafetyManager and similar boot guards can initialise without NameError exceptions.",
+      "applies_to": "logging-initialisation"
     }
   ],
   "procedures": [
