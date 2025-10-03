@@ -1,4 +1,14 @@
 # Changelog
+## [0.1.33] - 2025-10-17
+### Fixed
+- Added a boot-time PySide6 availability guard that logs installation guidance
+  instead of throwing `ModuleNotFoundError`, allowing headless workflows to
+  continue running automation helpers.
+
+### Validation
+- `python ACAGi.py` *(logs missing PySide6 guidance; exits with code 1)*
+- `python -m py_compile ACAGi.py`
+
 ## [0.1.32] - 2025-10-16
 ### Fixed
 - Hardened the high-DPI rounding policy guard so embedded Qt hosts log and skip
