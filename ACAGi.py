@@ -4141,20 +4141,6 @@ class RemoteAccessController:
             )
 
 
-def remote_access_controller() -> RemoteAccessController:
-    """Return the process-wide remote access controller."""
-
-    if REMOTE_ACCESS is None:
-        raise RuntimeError("Remote access controller is not initialised")
-    return REMOTE_ACCESS
-
-
-def remote_access_snapshot() -> RemoteAccessSnapshot:
-    """Return the latest remote access snapshot."""
-
-    return remote_access_controller().snapshot()
-
-
 def _dataset_root(candidate: Optional[Path]) -> Path:
     return Path(candidate) if candidate else TASKS_DATA_ROOT
 
@@ -4740,6 +4726,22 @@ def is_remote_fanout_enabled() -> bool:
     """Return the dispatcher remote fan-out flag for UI consumers."""
 
     return EVENT_DISPATCHER.remote_enabled()
+
+
+# NOTE: These helpers follow the dispatcher singletons so the guard executes
+# with a fully initialised EventDispatcher, preserving the documented boot order.
+def remote_access_controller() -> RemoteAccessController:
+    """Return the process-wide remote access controller."""
+
+    if REMOTE_ACCESS is None:
+        raise RuntimeError("Remote access controller is not initialised")
+    return REMOTE_ACCESS
+
+
+def remote_access_snapshot() -> RemoteAccessSnapshot:
+    """Return the latest remote access snapshot."""
+
+    return remote_access_controller().snapshot()
 
 
 class TaskBucketStageStatus(str, Enum):
