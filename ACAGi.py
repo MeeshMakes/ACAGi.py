@@ -153,6 +153,7 @@ from PySide6.QtCore import (
     QUrl,
     QThread,
     QFileSystemWatcher,
+    QCoreApplication,
 )
 from PySide6.QtGui import (
     QAction,
@@ -1865,18 +1866,26 @@ class RepositoryIndex:
 # Boot & Environment
 # ============================================================================
 
-def _ensure_high_dpi_rounding_policy() -> None:
-    """Configure Qt's high-DPI rounding while avoiding host application crashes.
+_HIGH_DPI_POLICY_APPLIED = False
 
-    When ACAGi runs standalone we can safely request pass-through rounding before
-    constructing :class:`QApplication`.  However, ACAGi is also embedded inside
-    other Qt processes (for example, file watchers or test harnesses) that may
-    have already created a ``QGuiApplication`` instance.  Invoking
-    :func:`QGuiApplication.setHighDpiScaleFactorRoundingPolicy` in that
-    situation raises ``RuntimeError`` and terminates the host.  The guard below
-    applies the policy when possible and logs an informative skip otherwise so
-    external hosts remain stable.
+
+def _ensure_high_dpi_rounding_policy() -> None:
+    """Configure Qt's high-DPI rounding without tripping Qt's fatal guardrails.
+
+    Qt 6.7 tightened the contract around
+    :func:`QGuiApplication.setHighDpiScaleFactorRoundingPolicy`: the call must
+    occur *before* any :class:`QGuiApplication` **or** :class:`QCoreApplication`
+    instance exists or the library terminates the process.  The helper keeps the
+    behaviour ergonomic for standalone launches while ensuring embedded hosts
+    (who already booted a Qt runtime) are left untouched.  We also short-circuit
+    repeat invocations so downstream code can call the helper defensively
+    without risk.
     """
+
+    global _HIGH_DPI_POLICY_APPLIED
+
+    if _HIGH_DPI_POLICY_APPLIED:
+        return
 
     policy = getattr(Qt.HighDpiScaleFactorRoundingPolicy, "PassThrough", None)
     if policy is None:
@@ -1885,11 +1894,19 @@ def _ensure_high_dpi_rounding_policy() -> None:
         )
         return
 
-    existing_app = QGuiApplication.instance()
-    if existing_app is not None:
+    existing_gui_app = QGuiApplication.instance()
+    if existing_gui_app is not None:
         BOOT_LOGGER.debug(
-            "Qt application already active; skipping DPI rounding policy update.",
-            extra={"qt_app": type(existing_app).__name__},
+            "Qt GUI application already active; host controls DPI rounding.",
+            extra={"qt_app": type(existing_gui_app).__name__},
+        )
+        return
+
+    existing_core_app = QCoreApplication.instance()
+    if existing_core_app is not None:
+        BOOT_LOGGER.debug(
+            "Qt core application already active; deferring DPI rounding policy.",
+            extra={"qt_app": type(existing_core_app).__name__},
         )
         return
 
@@ -1905,6 +1922,8 @@ def _ensure_high_dpi_rounding_policy() -> None:
         BOOT_LOGGER.exception(
             "Unexpected failure while applying the DPI rounding policy.",
         )
+    else:
+        _HIGH_DPI_POLICY_APPLIED = True
 
 
 _ensure_high_dpi_rounding_policy()

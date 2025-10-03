@@ -1,4 +1,13 @@
 # Changelog
+## [0.1.35] - 2025-10-17
+### Fixed
+- Hardened the high-DPI rounding helper to bail out when a Qt core application
+  already exists, preventing Qt's fatal "must be called before creating the
+  QGuiApplication" shutdown during ACAGi startup.
+
+### Validation
+- `python -m compileall ACAGi.py`
+
 ## [0.1.34] - 2025-10-17
 ### Fixed
 - Updated the ACAGi main window to embed the chat view inside the draggable
