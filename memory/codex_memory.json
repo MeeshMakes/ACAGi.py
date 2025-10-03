@@ -125,7 +125,7 @@
     {
       "id": "task-bucket-serialization-discipline",
       "title": "Task Bucket Serialization Discipline",
-      "summary": "Task buckets advance through capture→note→bucketize→assemble→apply→test→verify→promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
+      "summary": "Task buckets advance through capture\u2192note\u2192bucketize\u2192assemble\u2192apply\u2192test\u2192verify\u2192promote with Apply/Test/Verify serialized via file-touch leases so concurrent buckets do not race on shared paths.",
       "applies_to": "task-orchestration"
     },
     {
@@ -219,6 +219,12 @@
         "introduced": "2025-10-17",
         "notes": "Re-run `pip install PySide6` or leverage Codex_Terminal.py for CLI workflows when the guard triggers."
       }
+    },
+    {
+      "id": "acagi-isolated-function-testing",
+      "title": "Isolated Function Compilation for Tests",
+      "summary": "When unit testing ACAGi.py helpers, parse and compile the target function in isolation to avoid triggering heavy runtime dependency bootstrapping during import.",
+      "applies_to": "testing"
     }
   ],
   "procedures": [

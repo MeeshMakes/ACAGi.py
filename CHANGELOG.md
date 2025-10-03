@@ -1,4 +1,15 @@
 # Changelog
+## [0.1.40] - 2025-10-19
+### Fixed
+- Updated the Windows elevation relaunch helper to build its command string
+  with ``subprocess.list2cmdline`` so arguments containing spaces survive the
+  privilege escalation hop without corruption.
+- Added a Windows-only regression test that validates spaced arguments remain
+  quoted when `_ensure_windows_elevation` reinvokes the interpreter.
+
+### Validation
+- `pytest Dev_Logic/tests/test_windows_elevation.py`
+
 ## [0.1.39] - 2025-10-18
 ### Added
 - Implemented an import-time dependency bootstrapper that auto-installs
