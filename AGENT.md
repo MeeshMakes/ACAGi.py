@@ -1,4 +1,4 @@
-# ACAGi Codex Operating Manual (v0.1.0)
+# ACAGi Codex Operating Manual (v0.1.1)
 
 ## Mission Charter
 - Codify an extensible, local-first autonomous workspace for ACAGi.
@@ -35,6 +35,18 @@
 - Each module defines a `main()` entry point guarded by `if __name__ == "__main__":` when runnable.
 - Never wrap imports in `try/except` blocks.
 - Maintain 88-character line limit (Black-compatible) unless explicit reason documented in code comments.
+
+## Autonomous Operation Guidelines
+- The status bar **Self-Implementation Mode** toggle must only be used when
+  sentinel policies for `self_impl` remain in force (single parallel slot,
+  900 s max duration, no network access).
+- Always monitor the Log Observatory for `autonomy.self_impl` events and ensure
+  session notes capture every autonomous cycle.
+- If sentinel emits `autonomy.energy_quota` or `autonomy.loop_detected`, leave
+  the mode paused, investigate root cause, and document findings in the current
+  session log before re-enabling automation.
+- Update documentation and durable memory whenever Self-Implementation behaviour
+  changes so operators retain a tested runbook.
 
 ## Commit Protocol
 1. Sync with `origin/main` (fetch + rebase) before modifications whenever a remote exists.

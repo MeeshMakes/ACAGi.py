@@ -105,6 +105,36 @@
           "wget"
         ]
       }
+    },
+    "self_impl": {
+      "allow": [],
+      "deny": [],
+      "approval": [],
+      "sandbox_modes": [
+        "isolated",
+        "restricted"
+      ],
+      "notes": "Self-Implementation Mode cycles must remain serialized and offline to avoid runaway automation.",
+      "limits": {
+        "max_duration_seconds": 900,
+        "max_parallel_tasks": 1,
+        "network": "deny",
+        "network_blocklist": [
+          "aria2c",
+          "curl",
+          "ftp",
+          "netcat",
+          "nc",
+          "ping",
+          "rsync",
+          "scp",
+          "sftp",
+          "ssh",
+          "telnet",
+          "traceroute",
+          "wget"
+        ]
+      }
     }
   },
   "metadata": {
