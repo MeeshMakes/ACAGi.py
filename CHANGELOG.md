@@ -1,4 +1,15 @@
 # Changelog
+## [0.1.29] - 2025-10-14
+### Fixed
+- Reordered `RemoteAccessController` initialisation to occur after the event
+  dispatcher is created so ACAGi boots without raising `NameError` and the
+  Codex Terminal / Virtual Desktop wiring stays intact.
+- Logged session context in `logs/session_2025-10-14.md` to document the
+  remediation path and uphold archival policy.
+
+### Validation
+- `python -m py_compile ACAGi.py`
+
 ## [0.1.28] - 2025-10-13
 ### Changed
 - Hoisted `APP_NAME`, `VD_LOGGER_NAME`, and log sink constants to the top of
