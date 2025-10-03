@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "last_updated": "2025-10-12",
+  "last_updated": "2025-10-14",
   "stable_lessons": [
     {
       "title": "Verbose Implementation Standard",
@@ -144,6 +144,11 @@
       "title": "Logger Constant Ordering",
       "summary": "Define module-level logging identifiers before constructing classes that reference them at import time so SafetyManager and similar boot guards can initialise without NameError exceptions.",
       "applies_to": "logging-initialisation"
+    },
+    {
+      "title": "Remote Access Dispatcher Boot Order",
+      "summary": "Instantiate the RemoteAccessController only after the EventDispatcher is available so module import order keeps Codex Terminal and Virtual Desktop integrations stable and prevents NameError exceptions during startup.",
+      "applies_to": "remote-control"
     }
   ],
   "procedures": [

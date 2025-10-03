@@ -4155,14 +4155,6 @@ def remote_access_snapshot() -> RemoteAccessSnapshot:
     return remote_access_controller().snapshot()
 
 
-if REMOTE_ACCESS is None:
-    REMOTE_ACCESS = RemoteAccessController(
-        EVENT_DISPATCHER,
-        safety_manager,
-        RUNTIME_SETTINGS,
-    )
-
-
 def _dataset_root(candidate: Optional[Path]) -> Path:
     return Path(candidate) if candidate else TASKS_DATA_ROOT
 
@@ -4704,6 +4696,17 @@ EVENT_DISPATCHER = EventDispatcher(
     wildcard_topic=_WILDCARD_TOPIC,
     logger=logging.getLogger(f"{VD_LOGGER_NAME}.events"),
 )
+
+
+if REMOTE_ACCESS is None:
+    # Initialise the remote access controller only after the dispatcher exists.
+    # This preserves import order so Codex Terminal and Virtual Desktop wiring
+    # stays intact during startup.
+    REMOTE_ACCESS = RemoteAccessController(
+        EVENT_DISPATCHER,
+        safety_manager,
+        RUNTIME_SETTINGS,
+    )
 
 
 def register_topic(topic: str) -> None:
