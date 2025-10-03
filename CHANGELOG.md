@@ -1,4 +1,13 @@
 # Changelog
+## [0.1.28] - 2025-10-13
+### Changed
+- Rebased `ACAGi.py` on the original Codex-Terminal implementation while retaining governance-driven optional dependency checks and DPI handling.
+- Restored bridge controls, dataset persistence, and terminal UI parity with the Codex-Terminal reference script.
+- Clarified README guidance to emphasise Codex-Terminal feature parity within the unified ACAGi monolith.
+
+### Validation
+- `python -m compileall ACAGi.py`
+
 ## [0.1.27] - 2025-10-12
 ### Added
 - Introduced a status bar **Self-Implementation Mode** toggle that wires a new

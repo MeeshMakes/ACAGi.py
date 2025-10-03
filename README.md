@@ -20,8 +20,13 @@ Welcome to **ACAGi.py** — a project maintained by MeeshMakes.
 
 ## Overview
 
-ACAGi.py is a Python-based repository focused on [insert brief description of project purpose or functionality here].
-It leverages Python’s flexibility and simplicity to achieve [insert one or two goals or key features].
+ACAGi.py is a Python-based repository focused on unifying the Agent Virtual Desktop (Codex-Terminal) tooling into a single,
+governance-compliant script. It bundles the bright-blue virtual desktop canvas, Codex bridge controls, dataset persistence,
+and task orchestration previously delivered by the standalone Codex-Terminal reference implementation.
+
+It delivers a local-first agent workspace featuring chat, terminal mirroring, dataset capture, and safety-aware
+workflow automation.
+It leverages Python’s flexibility to orchestrate UI docks, sentinel governance, and Codex bridge utilities.
 
 ### Voice pipeline highlights
 
