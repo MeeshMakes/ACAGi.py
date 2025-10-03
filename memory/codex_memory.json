@@ -201,6 +201,16 @@
       }
     },
     {
+      "id": "shared-dpi-helper-reuse",
+      "title": "Shared DPI Helper Reuse",
+      "summary": "Codex_Terminal.py now imports ACAGi's guarded high-DPI helper so future entrypoints reuse the shared guard instead of duplicating Qt policy setup.",
+      "applies_to": "acagi-boot",
+      "metadata": {
+        "introduced": "2025-10-18",
+        "notes": "Call the helper immediately before constructing QApplication to honour hosts that already instantiated Qt."
+      }
+    },
+    {
       "id": "pyside6-bootstrap-guard",
       "title": "PySide6 Bootstrap Guard",
       "summary": "ACAGi.py now checks for PySide6 at import time and logs installation guidance before exiting so headless automation remains usable when the GUI dependency is missing.",
