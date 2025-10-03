@@ -50,6 +50,10 @@ cd ACAGi.py
 pip install -r requirements.txt
 ```
 
+### Visual Theme Assets
+
+- The Codex Terminal palette ships in `Styles/advanced_styles.json`. Both `ACAGi.py` and `Codex_Terminal.py` load this file on startup so the desktop launches with the bright-blue Codex gradient without additional setup.
+
 ### Pinning the Python Interpreter
 
 All entrypoints now import `tools.python_runtime.ensure_desired_interpreter()`

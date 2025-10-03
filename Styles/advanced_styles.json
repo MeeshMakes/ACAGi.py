@@ -1,0 +1,22 @@
+{
+  "desktop_top": "#0f58ff",
+  "desktop_mid": "#2f7cff",
+  "desktop_edge_glow": "#70c3ff",
+  "card_bg": "#0e1624",
+  "card_border": "#2B3B4C",
+  "card_radius": 12,
+  "header_bg": "#111b2b",
+  "header_text": "#eaf2ff",
+  "user_bubble": "#0d3a84",
+  "user_text": "#eaf2ff",
+  "ai_bubble": "#0f1a2d",
+  "ai_text": "#ffffff",
+  "think_text": "#6fb2b2",
+  "model_name": "#00a7a7",
+  "accent": "#1E5AFF",
+  "accent_hover": "#2f72ff",
+  "muted": "#1c2a3b",
+  "live_ok": "#00d17a",
+  "live_warn": "#ffb300",
+  "live_err": "#ff3b30"
+}

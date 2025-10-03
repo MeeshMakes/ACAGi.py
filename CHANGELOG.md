@@ -1,4 +1,11 @@
 # Changelog
+## [0.1.42] - 2025-10-21
+### Added
+- Bundled the Codex Terminal `advanced_styles.json` under `Styles/` so ACAGi.py and Codex_Terminal.py launch with the shared bright-blue desktop theme by default.
+
+### Validation
+- `python -m compileall ACAGi.py Codex_Terminal.py`
+
 ## [0.1.41] - 2025-10-20
 ### Added
 - Introduced `tools/python_runtime.py`, a reusable helper that inspects
