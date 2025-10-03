@@ -1,4 +1,14 @@
 # Changelog
+## [0.1.39] - 2025-10-18
+### Added
+- Implemented an import-time dependency bootstrapper that auto-installs
+  PySide6, networking, and media packages via pip so first-run launches can
+  self-provision prerequisites and surface actionable errors when installation
+  fails.
+
+### Validation
+- `python -m compileall ACAGi.py`
+
 ## [0.1.38] - 2025-10-18
 ### Added
 - Introduced a Windows elevation helper that relaunches ACAGi with the
