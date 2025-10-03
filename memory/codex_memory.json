@@ -87,6 +87,12 @@
       "applies_to": "ui-virtual-desktop"
     },
     {
+      "id": "terminal-desktop-default-launch",
+      "title": "Terminal Desktop Default Launch",
+      "summary": "Standalone launches of ACAGi should wrap the chat card in the Terminal Desktop canvas so operators land inside the virtual desktop layout instead of a bare chat view.",
+      "applies_to": "acagi-boot"
+    },
+    {
       "id": "brain-map-dock",
       "title": "Brain Map Dock",
       "summary": "ACAGi includes a BrainMapDock that lazily renders Hippocampus nodes and typed edges with energy/salience overlays and Dev Space focus callbacks when nodes are selected.",

@@ -1,4 +1,13 @@
 # Changelog
+## [0.1.34] - 2025-10-17
+### Fixed
+- Updated the ACAGi main window to embed the chat view inside the draggable
+  Terminal Desktop canvas when running standalone so startup mirrors the
+  Codex Terminal experience instead of displaying a bare chat pane.
+
+### Validation
+- `python -m py_compile ACAGi.py`
+
 ## [0.1.33] - 2025-10-17
 ### Fixed
 - Added a boot-time PySide6 availability guard that logs installation guidance
