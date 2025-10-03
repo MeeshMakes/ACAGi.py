@@ -78,6 +78,73 @@ _NUMPY_MODULE_NAME = "numpy"
 _SOUNDDEVICE_MODULE_NAME = "sounddevice"
 _PYTTSX3_MODULE_NAME = "pyttsx3"
 _WHISPER_MODULE_NAME = "whisper"
+_PYSIDE6_MODULE_NAME = "PySide6"
+
+# The dependency bootstrapper keeps first-run experiences smooth when the
+# application is launched by double-clicking the script on a workstation that
+# has not yet provisioned Python packages.  By installing requirements on the
+# fly we avoid cryptic import errors and allow the GUI to surface actionable
+# messaging if pip itself fails.
+DEPENDENCY_LOGGER = logging.getLogger("acagi.bootstrap")
+
+_RUNTIME_DEPENDENCIES: Tuple[Tuple[str, str], ...] = (
+    (_PYSIDE6_MODULE_NAME, "PySide6>=6.6"),
+    (_REQUESTS_MODULE_NAME, "requests"),
+    (_PILLOW_MODULE_NAME, "Pillow"),
+    (_NUMPY_MODULE_NAME, "numpy"),
+    (_SOUNDDEVICE_MODULE_NAME, "sounddevice"),
+    (_PYTTSX3_MODULE_NAME, "pyttsx3"),
+    (_WHISPER_MODULE_NAME, "whisper"),
+)
+
+
+def ensure_runtime_dependencies() -> None:
+    """Install missing runtime packages before optional imports execute."""
+
+    missing_packages: List[Tuple[str, str]] = []
+    for module_name, package_spec in _RUNTIME_DEPENDENCIES:
+        if importlib.util.find_spec(module_name) is None:
+            missing_packages.append((module_name, package_spec))
+
+    if not missing_packages:
+        DEPENDENCY_LOGGER.debug(
+            "Runtime dependency check complete; all packages already installed.",
+        )
+        return
+
+    for module_name, package_spec in missing_packages:
+        DEPENDENCY_LOGGER.info(
+            "Installing missing runtime dependency '%s' via pip package '%s'.",
+            module_name,
+            package_spec,
+        )
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", package_spec]
+            )
+        except subprocess.CalledProcessError as exc:
+            error_message = (
+                "ACAGi could not install the required dependency "
+                f"'{package_spec}' for module '{module_name}'."
+            )
+            DEPENDENCY_LOGGER.exception(error_message)
+            raise RuntimeError(error_message) from exc
+
+    importlib.invalidate_caches()
+
+    for module_name, package_spec in missing_packages:
+        if importlib.util.find_spec(module_name) is None:
+            error_message = (
+                "A runtime dependency remained unavailable after installation: "
+                f"module '{module_name}' (pip package '{package_spec}')."
+            )
+            DEPENDENCY_LOGGER.error(error_message)
+            raise RuntimeError(error_message)
+
+    DEPENDENCY_LOGGER.info("Runtime dependency bootstrap completed successfully.")
+
+
+ensure_runtime_dependencies()
 
 if importlib.util.find_spec(_REQUESTS_MODULE_NAME):
     import requests  # type: ignore  # noqa: F401
@@ -108,8 +175,6 @@ if importlib.util.find_spec(_WHISPER_MODULE_NAME):
     import whisper  # type: ignore  # noqa: F401
 else:
     whisper = None  # type: ignore[assignment]
-
-_PYSIDE6_MODULE_NAME = "PySide6"
 
 if importlib.util.find_spec(_PYSIDE6_MODULE_NAME) is None:
     def _main_missing_pyside6() -> int:
