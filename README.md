@@ -50,6 +50,31 @@ cd ACAGi.py
 pip install -r requirements.txt
 ```
 
+### Pinning the Python Interpreter
+
+All entrypoints now import `tools.python_runtime.ensure_desired_interpreter()`
+before they touch heavyweight dependencies. The helper reloads the script under
+an operator-specified Python runtime so GUI and CLI launches stay aligned with
+your preferred interpreter version.
+
+You can declare the desired interpreter in several ways (highest priority
+first):
+
+1. Set `ACAGI_PYTHON_EXECUTABLE` to the absolute path of the interpreter.
+2. Provide a dotted version string (for example `3.11`) via
+   `ACAGI_PYTHON_VERSION`. The helper attempts to locate a matching binary on
+   `PATH` when no explicit executable is supplied.
+3. Create a workspace-scoped config file inside
+   `<workspace>/.codex_agent/config/`:
+   - `python_runtime.json` containing `{"executable": "/path/to/python"}`
+     and/or `{"version": "3.11"}`.
+   - `python_runtime.ini` with a `[python]` section using the same keys.
+
+The workspace defaults to `Agent_Codex_Standalone/`, mirroring the boot logic,
+but respects the `CODEX_WORKSPACE` override when you relocate Codex assets. Set
+`ACAGI_PYTHON_CONFIG` to point at a specific config file if you prefer to keep
+the interpreter declaration elsewhere.
+
 ## Usage
 
 ### Self-Implementation Mode

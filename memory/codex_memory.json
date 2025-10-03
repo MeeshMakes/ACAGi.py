@@ -225,6 +225,16 @@
       "title": "Isolated Function Compilation for Tests",
       "summary": "When unit testing ACAGi.py helpers, parse and compile the target function in isolation to avoid triggering heavy runtime dependency bootstrapping during import.",
       "applies_to": "testing"
+    },
+    {
+      "id": "python-runtime-normalisation",
+      "title": "Python Runtime Normalisation",
+      "summary": "Entry scripts import tools.python_runtime.ensure_desired_interpreter to relaunch under the configured interpreter, honouring ACAGI_PYTHON_* overrides and workspace config files before continuing startup.",
+      "applies_to": "acagi-boot",
+      "metadata": {
+        "introduced": "2025-10-20",
+        "notes": "Operators can pin a runtime via environment variables, python_runtime.json, or python_runtime.ini inside .codex_agent/config."
+      }
     }
   ],
   "procedures": [
