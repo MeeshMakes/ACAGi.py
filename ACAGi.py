@@ -11,6 +11,10 @@ Windows 10+ for the bridge runtime.
 
 from __future__ import annotations
 
+from tools.python_runtime import ensure_desired_interpreter
+
+ensure_desired_interpreter(__file__)
+
 import argparse
 import ast
 import audioop

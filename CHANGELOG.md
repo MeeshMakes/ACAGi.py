@@ -1,4 +1,19 @@
 # Changelog
+## [0.1.41] - 2025-10-20
+### Added
+- Introduced `tools/python_runtime.py`, a reusable helper that inspects
+  environment variables and workspace config files to relaunch entrypoints
+  under an operator-selected interpreter.
+- Documented interpreter pinning options in the README and mirrored the
+  guidance in durable memory and the logic inbox.
+
+### Changed
+- ACAGi.py and Codex_Terminal.py import the runtime helper before other
+  imports so CLI and GUI launches normalise onto the configured interpreter.
+
+### Validation
+- `python -m compileall tools/python_runtime.py ACAGi.py Codex_Terminal.py`
+
 ## [0.1.40] - 2025-10-19
 ### Fixed
 - Updated the Windows elevation relaunch helper to build its command string

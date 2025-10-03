@@ -6,3 +6,4 @@
 {"id": "2025-10-12-001", "title": "Author sentinel policy enforcement tests", "status": "dispatched", "notes": "Add automated coverage that mocks emit_sentinel_event to assert parallel-limit, timeout, and network-ban metadata when policies trip."}
 {"id": "2025-10-18-001", "title": "Smoke test embedded Qt launch path", "status": "new", "notes": "Manually launch ACAGi from a host already running QApplication to verify the early-return log and ensure no duplicate windows spawn."}
 {"id": "2025-10-18-002", "title": "Factor Qt bootstrap helper", "status": "completed", "notes": "Codex_Terminal now imports the guarded helper from ACAGi.py and invokes it immediately before QApplication startup."}
+{"id": "2025-10-20-001", "title": "Document interpreter normalization workflow", "status": "completed", "notes": "README explains ACAGI_PYTHON_* overrides and workspace config files; entry scripts import tools.python_runtime to enforce the selected interpreter."}

@@ -18,6 +18,10 @@ Requires: PySide6>=6.6, requests, Pillow (optional), local ollama, Windows 10+ f
 
 from __future__ import annotations
 
+from tools.python_runtime import ensure_desired_interpreter
+
+ensure_desired_interpreter(__file__)
+
 # --- DPI policy MUST be set before QApplication is created ---
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import Qt
