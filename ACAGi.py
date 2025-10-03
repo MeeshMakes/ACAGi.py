@@ -218,6 +218,7 @@ VD_LOGGER_NAME = "VirtualDesktop"
 VD_LOG_FILENAME = "vd_system.log"
 VD_LOG_PATH: Path = Path()
 MEMORY_SERVICES: "MemoryServices" | None = None
+BOOT_LOGGER = logging.getLogger(f"{VD_LOGGER_NAME}.boot")
 Excepthook = Callable[
     [type[BaseException], BaseException, Optional[TracebackType]],
     None,
@@ -1838,13 +1839,45 @@ class RepositoryIndex:
 # ============================================================================
 
 def _ensure_high_dpi_rounding_policy() -> None:
-    """Apply pass-through DPI rounding before any QApplication is created."""
+    """Configure Qt's high-DPI rounding while avoiding host application crashes.
 
-    if QGuiApplication.instance() is not None:
+    When ACAGi runs standalone we can safely request pass-through rounding before
+    constructing :class:`QApplication`.  However, ACAGi is also embedded inside
+    other Qt processes (for example, file watchers or test harnesses) that may
+    have already created a ``QGuiApplication`` instance.  Invoking
+    :func:`QGuiApplication.setHighDpiScaleFactorRoundingPolicy` in that
+    situation raises ``RuntimeError`` and terminates the host.  The guard below
+    applies the policy when possible and logs an informative skip otherwise so
+    external hosts remain stable.
+    """
+
+    policy = getattr(Qt.HighDpiScaleFactorRoundingPolicy, "PassThrough", None)
+    if policy is None:
+        BOOT_LOGGER.debug(
+            "High DPI rounding policy enum unavailable; leaving Qt defaults.",
+        )
         return
-    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
+
+    existing_app = QGuiApplication.instance()
+    if existing_app is not None:
+        BOOT_LOGGER.debug(
+            "Qt application already active; skipping DPI rounding policy update.",
+            extra={"qt_app": type(existing_app).__name__},
+        )
+        return
+
+    try:
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(policy)
+    except RuntimeError:
+        BOOT_LOGGER.warning(
+            "Qt rejected DPI rounding update because an application instance "
+            "was detected. Falling back to environment configuration.",
+            exc_info=False,
+        )
+    except Exception:
+        BOOT_LOGGER.exception(
+            "Unexpected failure while applying the DPI rounding policy.",
+        )
 
 
 _ensure_high_dpi_rounding_policy()

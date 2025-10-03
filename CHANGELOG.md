@@ -1,4 +1,12 @@
 # Changelog
+## [0.1.32] - 2025-10-16
+### Fixed
+- Hardened the high-DPI rounding policy guard so embedded Qt hosts log and skip
+  the setter instead of crashing when a `QGuiApplication` already exists.
+
+### Validation
+- `python -m py_compile ACAGi.py`
+
 ## [0.1.31] - 2025-10-15
 ### Fixed
 - Deferred the `flush_pending_sentinel_events()` invocation until after its
