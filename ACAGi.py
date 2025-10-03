@@ -21996,7 +21996,14 @@ class MainWindow(QMainWindow):
 
         self.desktop: Optional[TerminalDesktop] = None
         self.chat = ChatCard(self.theme, self.ollama, self.settings, self.lex_mgr, self)
-        self.setCentralWidget(self.chat)
+        # The standalone launch path mirrors Codex_Terminal by wrapping the chat
+        # card in the draggable Terminal Desktop canvas so operators land in the
+        # familiar virtual desktop instead of a bare chat widget.
+        if self._embedded:
+            self.setCentralWidget(self.chat)
+        else:
+            self.desktop = TerminalDesktop(self.theme, self.chat, self)
+            self.setCentralWidget(self.desktop)
         self.dataset_dock = DatasetManagerDock(self.chat, self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dataset_dock)
         self.dataset_dock.hide()
