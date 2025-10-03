@@ -7,3 +7,4 @@
 {"id": "2025-10-18-001", "title": "Smoke test embedded Qt launch path", "status": "new", "notes": "Manually launch ACAGi from a host already running QApplication to verify the early-return log and ensure no duplicate windows spawn."}
 {"id": "2025-10-18-002", "title": "Factor Qt bootstrap helper", "status": "completed", "notes": "Codex_Terminal now imports the guarded helper from ACAGi.py and invokes it immediately before QApplication startup."}
 {"id": "2025-10-20-001", "title": "Document interpreter normalization workflow", "status": "completed", "notes": "README explains ACAGI_PYTHON_* overrides and workspace config files; entry scripts import tools.python_runtime to enforce the selected interpreter."}
+{"id": "2025-10-03-004", "title": "Factor shared theme helper", "status": "new", "notes": "Extract the Theme dataclass and style loaders into a reusable module so Codex_Terminal and ACAGi.py stay in lockstep without duplicating definitions."}

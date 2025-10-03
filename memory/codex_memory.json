@@ -235,6 +235,16 @@
         "introduced": "2025-10-20",
         "notes": "Operators can pin a runtime via environment variables, python_runtime.json, or python_runtime.ini inside .codex_agent/config."
       }
+    },
+    {
+      "id": "codex-style-asset",
+      "title": "Bundled Codex Style Asset",
+      "summary": "Styles/advanced_styles.json now ships with the repository so ACAGi.py and Codex_Terminal.py share the same bright-blue desktop theme without manual setup.",
+      "applies_to": "ui-theme",
+      "metadata": {
+        "introduced": "2025-10-21",
+        "notes": "Keep the JSON in sync with Theme defaults or future palette updates to avoid regressions across entrypoints."
+      }
     }
   ],
   "procedures": [
