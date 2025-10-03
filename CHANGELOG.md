@@ -1,4 +1,14 @@
 # Changelog
+## [0.1.30] - 2025-10-15
+### Fixed
+- Relocated the `EVENT_DISPATCHER` singleton above the remote access guard so
+  module import no longer risks a `NameError` before the dispatcher exists.
+- Repositioned the remote access helpers to follow the dispatcher utilities,
+  keeping inline documentation accurate about boot ordering expectations.
+
+### Validation
+- `python ACAGi.py` *(fails: missing `PySide6` in container; dispatcher ordering validated up to import stage)*
+
 ## [0.1.29] - 2025-10-14
 ### Fixed
 - Reordered `RemoteAccessController` initialisation to occur after the event
