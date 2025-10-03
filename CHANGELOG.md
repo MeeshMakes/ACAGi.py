@@ -1,4 +1,15 @@
 # Changelog
+## [0.1.28] - 2025-10-13
+### Changed
+- Hoisted `APP_NAME`, `VD_LOGGER_NAME`, and log sink constants to the top of
+  `ACAGi.py` so `SafetyManager` and other boot-time subsystems can initialise
+  loggers without encountering `NameError` exceptions during module import.
+- Recorded the associated session plan in `logs/session_2025-10-13.md` for
+  traceability per governance requirements.
+
+### Validation
+- `python -m compileall ACAGi.py`
+
 ## [0.1.27] - 2025-10-12
 ### Added
 - Introduced a status bar **Self-Implementation Mode** toggle that wires a new
