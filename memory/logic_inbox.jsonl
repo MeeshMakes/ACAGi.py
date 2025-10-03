@@ -4,3 +4,5 @@
 {"id": "2025-10-04-002", "title": "Test SettingsLoader parsing", "status": "dispatched", "notes": "Add unit coverage for INI defaults, override parsing, and error handling."}
 {"id": "2025-10-04-003", "title": "Handle workspace config rebinding", "status": "dispatched", "notes": "Reload runtime settings when the workspace override adjusts BootEnvironment paths."}
 {"id": "2025-10-12-001", "title": "Author sentinel policy enforcement tests", "status": "dispatched", "notes": "Add automated coverage that mocks emit_sentinel_event to assert parallel-limit, timeout, and network-ban metadata when policies trip."}
+{"id": "2025-10-18-001", "title": "Smoke test embedded Qt launch path", "status": "new", "notes": "Manually launch ACAGi from a host already running QApplication to verify the early-return log and ensure no duplicate windows spawn."}
+{"id": "2025-10-18-002", "title": "Factor Qt bootstrap helper", "status": "new", "notes": "Evaluate consolidating environment and DPI configuration into a reusable function shared by future entrypoints."}

@@ -1892,6 +1892,7 @@ def _ensure_high_dpi_rounding_policy() -> None:
         BOOT_LOGGER.debug(
             "High DPI rounding policy enum unavailable; leaving Qt defaults.",
         )
+        _HIGH_DPI_POLICY_APPLIED = True
         return
 
     existing_gui_app = QGuiApplication.instance()
@@ -1900,6 +1901,7 @@ def _ensure_high_dpi_rounding_policy() -> None:
             "Qt GUI application already active; host controls DPI rounding.",
             extra={"qt_app": type(existing_gui_app).__name__},
         )
+        _HIGH_DPI_POLICY_APPLIED = True
         return
 
     existing_core_app = QCoreApplication.instance()
@@ -1908,6 +1910,7 @@ def _ensure_high_dpi_rounding_policy() -> None:
             "Qt core application already active; deferring DPI rounding policy.",
             extra={"qt_app": type(existing_core_app).__name__},
         )
+        _HIGH_DPI_POLICY_APPLIED = True
         return
 
     try:
@@ -1922,11 +1925,8 @@ def _ensure_high_dpi_rounding_policy() -> None:
         BOOT_LOGGER.exception(
             "Unexpected failure while applying the DPI rounding policy.",
         )
-    else:
+    finally:
         _HIGH_DPI_POLICY_APPLIED = True
-
-
-_ensure_high_dpi_rounding_policy()
 
 
 def here() -> Path:
@@ -22816,10 +22816,6 @@ def main():
                 handler.flush()
             except Exception:
                 continue
-    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
-    os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
-
-    _ensure_high_dpi_rounding_policy()
 
     inbox_summary: Optional[Dict[str, Any]] = None
     try:
@@ -22828,6 +22824,20 @@ def main():
         logger.exception("Startup logic inbox processing failed")
 
     sys.argv = [sys.argv[0]] + qt_args
+
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+    os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
+
+    _ensure_high_dpi_rounding_policy()
+
+    existing_app = QApplication.instance()
+    if existing_app is not None:
+        logger.info(
+            "Existing QApplication detected; skipping duplicate ACAGi launch.",
+            extra={"qt_app": type(existing_app).__name__},
+        )
+        return
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 

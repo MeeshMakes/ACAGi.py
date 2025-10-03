@@ -1,4 +1,18 @@
 # Changelog
+## [0.1.36] - 2025-10-18
+### Fixed
+- Removed the module-level DPI policy invocation and now invoke the guard only
+  immediately before `QApplication` creation so embedded hosts can opt out while
+  standalone launches still configure Qt as early as possible.
+- Ensured the high-DPI helper records `_HIGH_DPI_POLICY_APPLIED` for skip
+  branches and after execution, preventing redundant retries when multiple
+  entrypoints attempt to configure Qt within the same process.
+- Added an early-return path in `main()` when a `QApplication` already exists
+  so ACAGi avoids constructing duplicate application instances.
+
+### Validation
+- `python -m compileall ACAGi.py`
+
 ## [0.1.35] - 2025-10-17
 ### Fixed
 - Hardened the high-DPI rounding helper to bail out when a Qt core application
