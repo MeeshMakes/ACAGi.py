@@ -22,18 +22,9 @@ from __future__ import annotations
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import Qt
 
-
-def _ensure_high_dpi_rounding_policy() -> None:
-    """Apply the pass-through rounding policy before a QApplication exists."""
-
-    if QGuiApplication.instance() is not None:
-        return
-    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-
-
-_ensure_high_dpi_rounding_policy()
+# Reuse ACAGi's guarded DPI helper so standalone and bundled entry points
+# respect the same idempotent guard and Qt instance detection logic.
+from ACAGi import _ensure_high_dpi_rounding_policy
 
 import argparse
 import base64
@@ -6272,9 +6263,10 @@ def main():
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
-    _ensure_high_dpi_rounding_policy()
-
     sys.argv = [sys.argv[0]] + qt_args
+    # Apply the shared DPI rounding guard immediately before constructing
+    # QApplication so we never touch Qt after an instance already exists.
+    _ensure_high_dpi_rounding_policy()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 

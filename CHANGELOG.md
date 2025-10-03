@@ -1,4 +1,18 @@
 # Changelog
+## [0.1.37] - 2025-10-18
+### Fixed
+- Reused ACAGi's guarded DPI helper inside `Codex_Terminal.py` so both
+  entrypoints share the same idempotent Qt bootstrap and avoid import-time
+  configuration.
+- Moved the helper invocation to the QApplication construction path to prevent
+  late calls after Qt has already been initialised by an embedding host.
+- Marked the logic inbox task for factoring the Qt bootstrap helper as
+  completed now that the entrypoints share the guard.
+
+### Validation
+- `python -m compileall Codex_Terminal.py`
+- `python -m compileall ACAGi.py/Codex_Terminal.py`
+
 ## [0.1.36] - 2025-10-18
 ### Fixed
 - Removed the module-level DPI policy invocation and now invoke the guard only
