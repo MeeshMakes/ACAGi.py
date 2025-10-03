@@ -4713,9 +4713,6 @@ def publish(topic: str, payload: dict) -> None:
     EVENT_DISPATCHER.publish(topic, payload)
 
 
-flush_pending_sentinel_events()
-
-
 def set_remote_fanout_enabled(enabled: bool) -> None:
     """Toggle remote event propagation on the dispatcher."""
 
@@ -7611,6 +7608,9 @@ def flush_pending_sentinel_events() -> None:
                 "Failed to flush pending sentinel event",
                 extra={"kind": event.kind, "source": event.source},
             )
+
+
+flush_pending_sentinel_events()
 
 
 def sentinel_history_payloads() -> List[Dict[str, Any]]:

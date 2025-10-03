@@ -1,4 +1,15 @@
 # Changelog
+## [0.1.31] - 2025-10-15
+### Fixed
+- Deferred the `flush_pending_sentinel_events()` invocation until after its
+  definition so sentinel history replay no longer raises a module-import
+  `NameError`.
+
+### Validation
+- `python ACAGi.py` *(fails: missing `PySide6`; import still exercises sentinel
+  flush without raising `NameError`)*
+- `python -m py_compile ACAGi.py`
+
 ## [0.1.30] - 2025-10-15
 ### Fixed
 - Relocated the `EVENT_DISPATCHER` singleton above the remote access guard so
