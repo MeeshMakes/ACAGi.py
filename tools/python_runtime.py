@@ -110,9 +110,11 @@ def _executable_from_env() -> Optional[Path]:
     raw = os.environ.get(EXECUTABLE_ENV, "").strip()
     if not raw:
         return None
-    candidate = Path(raw)
+
+    candidate = Path(raw).expanduser()
     if candidate.exists():
         return candidate
+
     LOGGER.warning(
         "Preferred interpreter %s from %s does not exist.", raw, EXECUTABLE_ENV
     )
@@ -158,7 +160,7 @@ def _load_config_preferences() -> dict[str, Optional[Path | Tuple[int, ...]]]:
         raw_version = payload.get("version") or payload.get("python_version")
 
         if raw_exec and not executable:
-            candidate = Path(raw_exec)
+            candidate = _resolve_configured_path(raw_exec, base=path.parent)
             if candidate.exists():
                 executable = candidate
             else:
@@ -182,7 +184,7 @@ def _config_candidates() -> Iterable[Path]:
 
     env_override = os.environ.get(CONFIG_ENV, "").strip()
     if env_override:
-        yield Path(env_override)
+        yield _resolve_configured_path(env_override, base=Path.cwd())
 
     workspace = _workspace_root()
     config_root = workspace / ".codex_agent" / "config"
@@ -199,6 +201,15 @@ def _workspace_root() -> Path:
             return Path(override).expanduser()
     repo_root = Path(__file__).resolve().parent.parent
     return repo_root / "Agent_Codex_Standalone"
+
+
+def _resolve_configured_path(raw: str, *, base: Optional[Path] = None) -> Path:
+    """Return a normalised path for configuration-provided entries."""
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute() and base is not None:
+        candidate = (base / candidate).resolve()
+    return candidate
 
 
 def _read_config_file(path: Path) -> dict[str, str]:
